@@ -52,6 +52,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use fabro_workflow::run_tools::GatherWait;
 pub use petri_execution::controls::ControlError;
 use petri_execution::controls::{ControlService, LiveTurns};
 use petri_execution::{
@@ -230,6 +231,15 @@ pub(crate) struct SchedulerWait {
     admission: SchedulerAdmission,
     execution: ExecutionId,
     firing:    FiringId,
+}
+
+#[async_trait::async_trait]
+impl GatherWait for SchedulerWait {
+    async fn readmit(self: Box<Self>) {
+        let admission = self.admission.clone();
+        drop(self);
+        admission.before_attempt().await;
+    }
 }
 
 impl Drop for SchedulerWait {

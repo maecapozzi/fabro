@@ -3,17 +3,49 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use pebble_agent::ToolScheduling;
 use pebble_coding_agent::tools::{RegisteredTool, ToolError, ToolSource};
 use serde::de::DeserializeOwned;
 
 use crate::services::FabroRunToolServices;
 
+/// A scheduler wait opened around `fabro_run_gather`.
+///
+/// The gather result is withheld from the agent until `readmit` has
+/// reacquired execution capacity. Dropping a wait cancels the wait without
+/// allowing more work to run.
+#[async_trait]
+pub trait GatherWait: Send {
+    async fn readmit(self: Box<Self>);
+}
+
+/// Native execution admission for one agent stage.
+pub trait GatherAdmission: Send + Sync {
+    fn wait(&self) -> Box<dyn GatherWait>;
+}
+
 /// Every Fabro run tool, bound to `services`.
 #[must_use]
 pub fn register_fabro_run_tools(services: &FabroRunToolServices) -> Vec<RegisteredTool> {
+    register_fabro_run_tools_with_gather_admission(services, None)
+}
+
+/// Every Fabro run tool, with an optional native admission wait around gather.
+#[must_use]
+pub fn register_fabro_run_tools_with_gather_admission(
+    services: &FabroRunToolServices,
+    gather_admission: Option<&Arc<dyn GatherAdmission>>,
+) -> Vec<RegisteredTool> {
     fabro_tool::tool_definitions()
         .iter()
-        .map(|definition| fabro_run_tool(definition, services.clone()))
+        .map(|definition| {
+            fabro_run_tool(
+                definition,
+                services.clone(),
+                gather_admission.map(Arc::clone),
+            )
+        })
         .collect()
 }
 
@@ -29,34 +61,49 @@ pub fn register_named_fabro_run_tools(
     fabro_tool::tool_definitions()
         .iter()
         .filter(|definition| names.contains(&definition.name))
-        .map(|definition| fabro_run_tool(definition, services.clone()))
+        .map(|definition| fabro_run_tool(definition, services.clone(), None))
         .collect()
 }
 
 fn fabro_run_tool(
     definition: &fabro_tool::ToolDefinition,
     services: FabroRunToolServices,
+    gather_admission: Option<Arc<dyn GatherAdmission>>,
 ) -> RegisteredTool {
     let name = definition.name.to_string();
+    let is_gather = name == fabro_tool::FABRO_RUN_GATHER_TOOL_NAME;
+    let waits_for_admission = is_gather && gather_admission.is_some();
     let services = Arc::new(services);
-    RegisteredTool::function(
+    let tool = RegisteredTool::function(
         name.clone(),
         definition.description.to_string(),
         definition.parameters.clone(),
         move |_context, arguments| {
             let name = name.clone();
             let services = Arc::clone(&services);
+            let gather_admission = gather_admission.as_ref().map(Arc::clone);
             async move {
-                execute_fabro_run_tool(&name, arguments, &services)
-                    .await
-                    .map_err(|error| ToolError::execution(error.to_string()))
+                let wait = gather_admission.map(|admission| admission.wait());
+                let result = execute_fabro_run_tool(&name, arguments, &services).await;
+                if let Some(wait) = wait {
+                    wait.readmit().await;
+                }
+                result.map_err(|error| ToolError::execution(error.to_string()))
             }
         },
     )
-    .with_source(ToolSource::Application)
-    // A subagent spawned by a workflow stage does the same work under the
-    // same run, so it keeps the same view of the run tree.
-    .allow_in_subagents()
+    .with_source(ToolSource::Application);
+    // A gather carrying scheduler admission must be the only call in its
+    // tool round: only then is the parent genuinely quiescent while it waits.
+    let tool = if waits_for_admission {
+        tool.with_scheduling(ToolScheduling::ExclusiveRound)
+    } else {
+        tool
+    };
+    tool
+        // A subagent spawned by a workflow stage does the same work under the
+        // same run, so it keeps the same view of the run tree.
+        .allow_in_subagents()
 }
 
 pub(crate) async fn execute_fabro_run_tool(

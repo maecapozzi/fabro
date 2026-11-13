@@ -25,6 +25,7 @@ fabro-auth = { path = "../../foundation/fabro-auth" }
 fabro-config = { path = "../../foundation/fabro-config" }
 sandbox-driver.workspace = true
 pebble-coding-agent.workspace = true
+pebble-agent.workspace = true
 fabro-github = { path = "../fabro-github" }
 fabro-tool = { path = "../fabro-tool" }
 fabro-util = { path = "../../foundation/fabro-util" }

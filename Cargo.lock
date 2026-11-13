@@ -2975,6 +2975,7 @@ dependencies = [
  "hex",
  "httpmock",
  "lithos-llm",
+ "pebble-agent",
  "pebble-coding-agent",
  "sandbox-driver",
  "sandbox-driver-host",

@@ -56,7 +56,8 @@ const CHILD_DOT: &str = r#"digraph Child {
     say [shape=parallelogram, script="echo hello from the child", max_retries=0]
     start -> say -> exit
 }"#;
-const CHILD_SETTINGS: &str = "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n";
+const CHILD_SETTINGS: &str =
+    "_version = 1\n\n[workflow]\nname = \"Scheduler Child\"\ngraph = \"workflow.fabro\"\n";
 
 /// A `[[run.hooks]]` entry that blocks every `fabro_run_search` call.
 const BLOCKING_HOOK: &str = r#"
@@ -307,6 +308,98 @@ async fn an_agent_starts_a_child_run_with_a_run_tool_inside_a_petri_run() {
         inputs[1].contains(&child_id),
         "the model read the tool's answer naming the child run: {}",
         inputs[1]
+    );
+    server.shutdown();
+}
+
+/// With one shared slot, a parent gathering its approved child releases the
+/// slot, then waits for readmission before its agent consumes the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_gathering_its_child_makes_progress_with_one_scheduler_slot() {
+    let context = test_context!();
+    let twin = twin_openai().await;
+    let namespace = format!("{}::{}", module_path!(), line!());
+    let server = RunningServer::start_with_env(
+        &format!(
+            "\n[llm.providers.openai]\nbase_url = \"{}\"\n\n\
+             [server.scheduler]\nmax_concurrent_runs = 1\n",
+            twin.base_url
+        ),
+        &[(EnvVars::OPENAI_API_KEY, namespace.as_str())],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let child_version = register_child_version(&server).await;
+    let child_workspace = context.temp_dir.join("gather-child-workspace");
+    std::fs::create_dir_all(&child_workspace).expect("the child workspace creates");
+    TwinScenarios::new(namespace.clone())
+        .scenario(run_stage_scenario().tool_call(TwinToolCall::new(
+            "fabro_run_create",
+            json!({
+                "runs": [{
+                    "workflow_version_id": child_version,
+                    "target": {"kind": "folder", "path": child_workspace},
+                    "environment_id": "local",
+                    "args": {"auto_approve": true},
+                }],
+            }),
+        )))
+        .scenario(run_stage_scenario().tool_call(TwinToolCall::new(
+            "fabro_run_gather",
+            json!({
+                "run_ids": ["Scheduler Child"],
+                "timeout_seconds": 60,
+                "poll_interval_seconds": 5,
+            }),
+        )))
+        .scenario(run_stage_scenario().text("The child finished."))
+        .load(twin)
+        .await;
+    let workspace = write_agent_workspace(&context, "");
+    let parent_id = run_detached_with(&context, &server, &workspace, RUN_ARGS);
+
+    let children = wait_for_children(&server, &parent_id).await;
+    assert_eq!(children.len(), 1, "one child run: {children:?}");
+    let child_id = children[0]["id"]
+        .as_str()
+        .expect("the child run has an id")
+        .to_string();
+    assert_eq!(
+        children[0]["lifecycle"]["status"]["reason"], "approval_required",
+        "the scheduler fix must preserve the child's approval boundary"
+    );
+    approve_run(&server, &child_id).await;
+
+    let child_status = wait_for_status(&server, &child_id, &["succeeded", "failed"]).await;
+    assert_eq!(
+        child_status,
+        "succeeded",
+        "child: {}\nserver stderr:\n{}",
+        run_json(&server, &format!("runs/{child_id}")).await,
+        server.stderr_text()
+    );
+    let parent_status = wait_for_status(&server, &parent_id, &["succeeded", "failed"]).await;
+    assert_eq!(
+        parent_status,
+        "succeeded",
+        "parent: {}\nserver stderr:\n{}",
+        run_json(&server, &format!("runs/{parent_id}")).await,
+        server.stderr_text()
+    );
+
+    let gather_calls = recorded_calls(&server, &parent_id, "fabro_run_gather").await;
+    assert_eq!(gather_calls.len(), 1, "{gather_calls:?}");
+    assert_eq!(
+        gather_calls[0].payload["is_error"], false,
+        "{:?}",
+        gather_calls[0].payload
+    );
+    let inputs = request_inputs(twin, &namespace).await;
+    assert_eq!(inputs.len(), 3, "{inputs:?}");
+    assert!(
+        inputs[2].contains(&child_id),
+        "the parent was readmitted and received the gathered child: {}",
+        inputs[2]
     );
     server.shutdown();
 }

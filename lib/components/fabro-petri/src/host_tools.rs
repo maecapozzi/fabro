@@ -36,18 +36,31 @@
 //! logged as an error and the session gets no run tools rather than the
 //! wrong ones.
 
-use fabro_workflow::run_tools::register_fabro_run_tools;
+use std::sync::Arc;
+
+use fabro_workflow::run_tools::{
+    GatherAdmission, GatherWait, register_fabro_run_tools_with_gather_admission,
+};
 use fabro_workflow::services::FabroRunToolServices;
 use pebble_coding_agent::tools::RegisteredTool;
 use petri_attractor_steps::host_tools::{HostToolContext, HostTools};
+use petri_execution::ExecutionId;
+use petri_runtime::ir::FiringId;
 use tracing::{debug, error};
+
+use crate::controls::SchedulerAdmission;
 
 /// The `HostTools` capability that gives every native agent session of the
 /// run Fabro's run tools, bound to `services`. Register it on the runtime
 /// the run executes with; `RuntimeSpec::run_tools` does.
 #[must_use]
-pub fn capability(services: FabroRunToolServices) -> HostTools {
-    HostTools::new().with(move |context| tools_for_stage(&services, context))
+pub fn capability(
+    services: FabroRunToolServices,
+    scheduler_admission: Option<SchedulerAdmission>,
+) -> HostTools {
+    HostTools::new().with(move |context| {
+        tools_for_stage_with_admission(&services, context, scheduler_admission.clone())
+    })
 }
 
 /// The run tools for the session `context` names: what
@@ -57,6 +70,14 @@ pub fn capability(services: FabroRunToolServices) -> HostTools {
 pub fn tools_for_stage(
     services: &FabroRunToolServices,
     context: &HostToolContext,
+) -> Vec<RegisteredTool> {
+    tools_for_stage_with_admission(services, context, None)
+}
+
+fn tools_for_stage_with_admission(
+    services: &FabroRunToolServices,
+    context: &HostToolContext,
+    scheduler_admission: Option<SchedulerAdmission>,
 ) -> Vec<RegisteredTool> {
     let run_id = services.current_run_id.to_string();
     if context.run.as_str() != run_id {
@@ -77,7 +98,26 @@ pub fn tools_for_stage(
         attempt = ?context.attempt,
         "registering Fabro's run tools on a Petri agent session"
     );
-    register_fabro_run_tools(services)
+    let gather_admission = scheduler_admission.map(|admission| {
+        Arc::new(StageGatherAdmission {
+            admission,
+            execution: context.execution,
+            firing: context.firing,
+        }) as Arc<dyn GatherAdmission>
+    });
+    register_fabro_run_tools_with_gather_admission(services, gather_admission.as_ref())
+}
+
+struct StageGatherAdmission {
+    admission: SchedulerAdmission,
+    execution: ExecutionId,
+    firing:    FiringId,
+}
+
+impl GatherAdmission for StageGatherAdmission {
+    fn wait(&self) -> Box<dyn GatherWait> {
+        Box::new(self.admission.wait(self.execution, self.firing))
+    }
 }
 
 /// What a test reads back from a Petri run's record about the run tools,

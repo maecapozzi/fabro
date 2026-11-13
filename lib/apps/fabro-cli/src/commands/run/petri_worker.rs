@@ -210,6 +210,9 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
         &worker.run_state,
         worker.fabro_home.clone(),
         run_tools,
+        worker
+            .scheduler_admission
+            .then(|| controls.scheduler_admission()),
     )
     .await?;
     let client = worker.client.clone_for_reuse();
@@ -767,6 +770,7 @@ async fn runtime_spec(
     run_state: &RunProjection,
     fabro_home: Option<PathBuf>,
     run_tools: Option<FabroRunToolServices>,
+    scheduler_admission: Option<fabro_petri::controls::SchedulerAdmission>,
 ) -> Result<RuntimeSpec> {
     let credentials: Arc<dyn CredentialProvider> =
         Arc::new(VaultCredentialSource::new(Arc::clone(vault)));
@@ -796,5 +800,6 @@ async fn runtime_spec(
         dry_run: run_state.spec.settings.run.execution.mode == RunMode::DryRun,
         fabro_home,
         run_tools,
+        scheduler_admission,
     })
 }
