@@ -1069,6 +1069,199 @@ async fn a_human_gate_in_the_worker_is_answered_through_the_api() {
     server.shutdown();
 }
 
+/// The production subprocess path uses the same one-slot release/readmission
+/// protocol as the in-process scheduler tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_human_gate_reacquires_one_shared_scheduler_slot() {
+    let context = test_context!();
+    let server = RunningServer::start_with_env(
+        "\n[server.scheduler]\nmax_concurrent_runs = 1\n",
+        &[],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let settings = run_json(&server, "settings").await;
+    assert_eq!(
+        settings["server"]["scheduler"]["max_concurrent_runs"], 1,
+        "the foreground server must actually run with one slot"
+    );
+    let markers = context.temp_dir.join("scheduler-markers");
+    std::fs::create_dir_all(&markers).expect("the marker dir creates");
+    let workspace = write_petri_workflow(&context, &gate_dot(&markers, ""));
+    let waiting_run = run_detached_with(&context, &server, &workspace, &[]);
+    let pending = wait_for_questions(&server, &waiting_run, 1).await;
+    let question_id = pending[0]["id"].as_str().expect("an id").to_string();
+
+    let occupied = markers.join("occupied");
+    let release = markers.join("release");
+    let command = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        occupied.display(),
+        release.display()
+    );
+    let workspace = write_petri_workspace(&context, &command);
+    let occupying_run = run_detached_with(&context, &server, &workspace, &[]);
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    while !occupied.exists() {
+        assert!(Instant::now() < deadline, "the occupying run should start");
+        tokio::time::sleep(POLL).await;
+    }
+
+    let mut url = fabro_http::Url::parse(&format!(
+        "{}/api/v1/runs/{waiting_run}/questions",
+        server.api_base_url
+    ))
+    .expect("the API base URL parses");
+    url.path_segments_mut()
+        .expect("the API URL has a path")
+        .push(&question_id)
+        .push("answer");
+    let answer_task = tokio::spawn(async move {
+        fabro_test::test_http_client()
+            .post(url)
+            .bearer_auth(TEST_DEV_TOKEN)
+            .json(&serde_json::json!({ "kind": "yes" }))
+            .send()
+            .await
+            .expect("the answer sends")
+    });
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !markers.join("yes").exists(),
+        "the waiting worker must not resume while the slot is occupied"
+    );
+
+    std::fs::write(&release, "go").expect("the occupying run releases");
+    assert_eq!(
+        wait_for_status(&server, &occupying_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    let response = answer_task.await.expect("the answer task joins");
+    assert_eq!(response.status(), fabro_http::StatusCode::NO_CONTENT);
+    assert_eq!(
+        wait_for_status(&server, &waiting_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert!(markers.join("yes").exists());
+    server.shutdown();
+}
+
+/// A paused worker releases its slot only after active work drains, then
+/// reacquires capacity before unpause lets the next attempt run.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_idle_pause_reacquires_one_shared_scheduler_slot() {
+    let context = test_context!();
+    let server = RunningServer::start_with_env(
+        "\n[server.scheduler]\nmax_concurrent_runs = 1\n",
+        &[],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let settings = run_json(&server, "settings").await;
+    assert_eq!(
+        settings["server"]["scheduler"]["max_concurrent_runs"], 1,
+        "the foreground server must actually run with one slot"
+    );
+    let markers = context.temp_dir.join("pause-scheduler-markers");
+    std::fs::create_dir_all(&markers).expect("the marker dir creates");
+    let first_started = markers.join("first-started");
+    let release_first = markers.join("release-first");
+    let second_started = markers.join("second-started");
+    let workflow = format!(
+        r#"digraph Paused {{
+    graph [goal="Pause between commands", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    first [shape=parallelogram, script="touch {first_started}; while [ ! -f {release_first} ]; do sleep 0.05; done"]
+    second [shape=parallelogram, script="touch {second_started}"]
+    start -> first -> second -> exit
+}}"#,
+        first_started = first_started.display(),
+        release_first = release_first.display(),
+        second_started = second_started.display(),
+    );
+    let workspace = write_petri_workflow(&context, &workflow);
+    let paused_run = run_detached_with(&context, &server, &workspace, &[]);
+    wait_for_path(&first_started, "the first command should start").await;
+
+    post_run_action(&server, &paused_run, "pause").await;
+    std::fs::write(&release_first, "go").expect("the first command releases");
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    loop {
+        let info = run_json(&server, "system/info").await;
+        let slots = info["runs"]["scheduler_slots_used"]
+            .as_i64()
+            .expect("scheduler slot count");
+        if slots == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the quiescent paused run should release its slot"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    assert!(
+        !second_started.exists(),
+        "pause must hold the next command at native admission"
+    );
+
+    let occupied = markers.join("occupied");
+    let release_occupant = markers.join("release-occupant");
+    let occupant = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        occupied.display(),
+        release_occupant.display()
+    );
+    let workspace = write_petri_workspace(&context, &occupant);
+    let occupying_run = run_detached_with(&context, &server, &workspace, &[]);
+    wait_for_path(&occupied, "the occupying command should start").await;
+
+    post_run_action(&server, &paused_run, "unpause").await;
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !second_started.exists(),
+        "unpause must wait for scheduler readmission"
+    );
+
+    std::fs::write(&release_occupant, "go").expect("the occupying command releases");
+    assert_eq!(
+        wait_for_status(&server, &occupying_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert_eq!(
+        wait_for_status(&server, &paused_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert!(second_started.exists());
+    server.shutdown();
+}
+
+async fn wait_for_path(path: &Path, expectation: &str) {
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{expectation}");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn post_run_action(server: &RunningServer, run_id: &str, action: &str) {
+    let response = fabro_test::test_http_client()
+        .post(format!(
+            "{}/api/v1/runs/{run_id}/{action}",
+            server.api_base_url
+        ))
+        .bearer_auth(TEST_DEV_TOKEN)
+        .send()
+        .await
+        .expect("the run action sends");
+    assert_eq!(
+        response.status(),
+        fabro_http::StatusCode::OK,
+        "POST /api/v1/runs/{run_id}/{action}"
+    );
+}
+
 /// Two branches of a parallel node ask at once; each answer, given through
 /// the API in the other order, binds to its own branch.
 #[tokio::test(flavor = "multi_thread")]

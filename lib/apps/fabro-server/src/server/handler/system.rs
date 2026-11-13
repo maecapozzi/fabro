@@ -77,7 +77,7 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
             .count();
         let scheduler_slots_used = runs
             .values()
-            .filter(|run| counts_toward_scheduler_capacity(run.status))
+            .filter(|run| counts_toward_scheduler_capacity(run))
             .count();
         (runs.len(), active, scheduler_slots_used)
     };

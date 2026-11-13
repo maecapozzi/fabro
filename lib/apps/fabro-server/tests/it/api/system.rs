@@ -97,19 +97,45 @@ async fn wait_for_question(app: &axum::Router, run_id: &str) -> serde_json::Valu
     panic!("question should have appeared for {run_id}");
 }
 
-async fn load_questions(app: &axum::Router, run_id: &str) -> serde_json::Value {
+async fn wait_for_file(path: &std::path::Path) {
+    for _ in 0..POLL_ATTEMPTS {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!("{} should have been created", path.display());
+}
+
+async fn scheduler_slots_used(app: &axum::Router) -> i64 {
     let request = Request::builder()
         .method("GET")
-        .uri(api(&format!("/runs/{run_id}/questions")))
+        .uri(api("/system/info"))
         .body(Body::empty())
-        .expect("questions request should build");
+        .expect("system info request should build");
     let response = app.clone().oneshot(request).await.unwrap();
-    response_json(
-        response,
-        StatusCode::OK,
-        format!("GET /api/v1/runs/{run_id}/questions"),
+    response_json(response, StatusCode::OK, "GET /api/v1/system/info")
+        .await["runs"]["scheduler_slots_used"]
+        .as_i64()
+        .expect("scheduler slot count should be present")
+}
+
+async fn answer_yes(app: &axum::Router, run_id: &str, question_id: &str) {
+    let question_id = question_id.replace('#', "%23");
+    let request = Request::builder()
+        .method("POST")
+        .uri(api(&format!(
+            "/runs/{run_id}/questions/{question_id}/answer"
+        )))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"kind":"yes"}"#))
+        .expect("answer request should build");
+    response_status(
+        app.clone().oneshot(request).await.unwrap(),
+        StatusCode::NO_CONTENT,
+        "POST question answer",
     )
-    .await
+    .await;
 }
 
 #[tokio::test]
@@ -403,7 +429,7 @@ fn assert_percent_if_present(value: &serde_json::Value) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_app_state_with_options_respects_max_concurrent_runs() {
+async fn blocked_runs_release_shared_scheduler_capacity() {
     let workspace = tempfile::tempdir().unwrap();
     let app = test_app_with_scheduler(test_app_state_with_options(test_settings(), 1));
 
@@ -423,16 +449,8 @@ async fn test_app_state_with_options_respects_max_concurrent_runs() {
 
     let question = wait_for_question(&app, &first_run).await;
     assert_eq!(question["stage"], "gate@1");
-
-    tokio::time::sleep(POLL_INTERVAL * 5).await;
-
-    let second_questions = load_questions(&app, &second_run).await;
-    assert!(
-        second_questions["data"]
-            .as_array()
-            .is_some_and(std::vec::Vec::is_empty),
-        "second run should still be waiting for scheduler capacity while the first waits at the human gate: {second_questions}"
-    );
+    let question = wait_for_question(&app, &second_run).await;
+    assert_eq!(question["stage"], "gate@1");
 
     let request = Request::builder()
         .method("GET")
@@ -442,7 +460,135 @@ async fn test_app_state_with_options_respects_max_concurrent_runs() {
     let response = app.oneshot(request).await.unwrap();
     let body = response_json(response, StatusCode::OK, "GET /api/v1/system/info").await;
     assert_eq!(body["runs"]["active"], 2);
-    assert_eq!(body["runs"]["scheduler_slots_used"], 1);
+    assert_eq!(body["runs"]["scheduler_slots_used"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_gate_waits_at_native_admission_until_a_slot_is_free() {
+    let workspace = tempfile::tempdir().unwrap();
+    let app = test_app_with_scheduler(test_app_state_with_options(test_settings(), 1));
+    let after_gate = workspace.path().join("after-gate");
+    let occupant_started = workspace.path().join("occupant-started");
+    let release_occupant = workspace.path().join("release-occupant");
+    let gate_dot = format!(
+        r#"digraph GateTimeout {{
+    graph [goal="Wait for scheduler readmission"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    gate [shape=hexagon, label="Go?", question_type="yes_no", timeout="5s", human.default_choice="Y"]
+    next [shape=parallelogram, script="touch {after_gate}"]
+    start -> gate
+    gate -> next [label="[Y] Yes"]
+    gate -> exit [label="[N] No"]
+    next -> exit
+}}"#,
+        after_gate = after_gate.display(),
+    );
+    let occupant_dot = format!(
+        r#"digraph Occupant {{
+    graph [goal="Occupy one scheduler slot"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    hold [shape=parallelogram, script="touch {started}; while [ ! -f {release} ]; do sleep 0.05; done"]
+    start -> hold -> exit
+}}"#,
+        started = occupant_started.display(),
+        release = release_occupant.display(),
+    );
+
+    let gate_run = create_run(
+        &app,
+        minimal_intent_json(&app, &gate_dot, workspace.path()).await,
+    )
+    .await;
+    let occupant_run = create_run(
+        &app,
+        minimal_intent_json(&app, &occupant_dot, workspace.path()).await,
+    )
+    .await;
+    start_run(&app, &gate_run).await;
+    wait_for_question(&app, &gate_run).await;
+    start_run(&app, &occupant_run).await;
+    wait_for_file(&occupant_started).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
+    assert!(
+        !after_gate.exists(),
+        "the command after the expired gate must remain at native admission"
+    );
+
+    std::fs::write(&release_occupant, "").unwrap();
+    wait_for_file(&after_gate).await;
+    assert_eq!(
+        wait_for_run_status(&app, &gate_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_human_wait_keeps_capacity_while_structural_parent_is_live() {
+    let workspace = tempfile::tempdir().unwrap();
+    let app = test_app_with_scheduler(test_app_state_with_options(test_settings(), 1));
+    let hold_started = workspace.path().join("parallel-hold-started");
+    let release_hold = workspace.path().join("parallel-release-hold");
+    let ready_finished = workspace.path().join("parallel-ready-finished");
+    let dot = format!(
+        r#"digraph ParallelGate {{
+    graph [goal="Release only after every active branch is idle"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    fork [shape=component]
+    merge [shape=tripleoctagon]
+    gate [shape=hexagon, label="Go?", question_type="yes_no"]
+    hold [shape=parallelogram, script="touch {hold_started}; while [ ! -f {release_hold} ]; do sleep 0.05; done"]
+    ready [shape=parallelogram, script="touch {ready_finished}"]
+    start -> fork
+    fork -> gate
+    fork -> hold
+    fork -> ready
+    gate -> merge [label="[Y] Yes"]
+    gate -> merge [label="[N] No"]
+    hold -> merge
+    ready -> merge
+    merge -> exit
+}}"#,
+        hold_started = hold_started.display(),
+        release_hold = release_hold.display(),
+        ready_finished = ready_finished.display(),
+    );
+    let run_id = create_run(
+        &app,
+        minimal_intent_json(&app, &dot, workspace.path()).await,
+    )
+    .await;
+    start_run(&app, &run_id).await;
+    let question = wait_for_question(&app, &run_id).await;
+    wait_for_file(&hold_started).await;
+    wait_for_file(&ready_finished).await;
+    assert_eq!(
+        scheduler_slots_used(&app).await,
+        1,
+        "the live parallel command keeps the run admitted"
+    );
+
+    std::fs::write(&release_hold, "").unwrap();
+    tokio::time::sleep(POLL_INTERVAL * 5).await;
+    assert_eq!(
+        scheduler_slots_used(&app).await,
+        1,
+        "the parallel coordinator is still active, so this run is not quiescent"
+    );
+
+    answer_yes(
+        &app,
+        &run_id,
+        question["id"].as_str().expect("question should have an id"),
+    )
+    .await;
+    assert_eq!(
+        wait_for_run_status(&app, &run_id, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

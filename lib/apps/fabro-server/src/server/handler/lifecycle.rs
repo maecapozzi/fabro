@@ -576,7 +576,10 @@ enum PauseMode {
 enum UnpauseMode {
     /// No outstanding block; ask the worker to resume via the worker control
     /// bus.
-    Transport { transport: RunAnswerTransport },
+    Transport {
+        transport:       RunAnswerTransport,
+        needs_admission: bool,
+    },
     /// Was paused while blocked; append `RunUnpaused` and let the reducer
     /// restore the underlying blocked state from `Paused { prior_block }`.
     AppendEvent,
@@ -695,7 +698,10 @@ async fn unpause_run(
                         return ApiError::new(StatusCode::CONFLICT, "Run worker is not available.")
                             .into_response();
                     };
-                    UnpauseMode::Transport { transport }
+                    UnpauseMode::Transport {
+                        transport,
+                        needs_admission: !managed_run.scheduler_slot_held,
+                    }
                 }
                 _ => {
                     return ApiError::new(StatusCode::CONFLICT, "Run is not paused.")
@@ -724,8 +730,18 @@ async fn unpause_run(
         return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
     match mode {
-        UnpauseMode::Transport { transport } => {
-            if transport.unpause_run().await.is_err() {
+        UnpauseMode::Transport {
+            transport,
+            needs_admission,
+        } => {
+            if needs_admission {
+                let mut runs = state.runs.lock().expect("runs lock poisoned");
+                if let Some(run) = runs.get_mut(&id) {
+                    run.pending_unpause = true;
+                }
+                drop(runs);
+                state.scheduler_notify.notify_one();
+            } else if transport.unpause_run().await.is_err() {
                 return ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Failed to deliver unpause request to the active run.",

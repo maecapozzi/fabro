@@ -109,6 +109,12 @@ impl LocalWorkerRuntime {
             .arg(spec.mode)
             .arg("--fabro-home")
             .arg(&spec.fabro_home)
+            // This hidden spawn capability is the mixed-version boundary:
+            // an older server omits it, so a newer worker keeps the legacy
+            // scheduler behavior instead of waiting for grants that server
+            // cannot send. A newer server and older CLI must be rolled out
+            // together because the older CLI rejects the unknown flag.
+            .arg("--scheduler-admission")
             .stdin(Stdio::null())
             .stdout(worker_stdout)
             .stderr(Stdio::piped());

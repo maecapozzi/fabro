@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -61,7 +61,10 @@ use fabro_llm::credentials::CredentialProvider;
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_llm::{ClientOptions, FabroClient};
 use fabro_mcp_store::McpServerStore;
-use fabro_petri::controls::{RunControls, SteerError};
+use fabro_petri::controls::{
+    RunControls, SCHEDULER_ADMISSION_RELEASED_NOTICE, SCHEDULER_READMISSION_REQUESTED_NOTICE,
+    SteerError,
+};
 use fabro_petri::projector::Projector;
 use fabro_petri::providers::SandboxProviderConfig;
 use fabro_petri::prune::{self, PruneError, PruneRequest};
@@ -279,6 +282,20 @@ struct ManagedRun {
     /// life. Each time, the run resumes, up to
     /// `petri_runs::MAX_STORE_INTERRUPTIONS`.
     store_interruptions: u32,
+    /// Whether this run currently owns one shared scheduler slot. A live
+    /// worker can remain attached while a human gate is blocked without
+    /// owning a slot; the scheduler grants it again before delivering an
+    /// answer that can resume execution.
+    scheduler_slot_held: bool,
+    /// Answer requests waiting for readmission. The HTTP request is not
+    /// acknowledged until delivery; this queue is process-local, so a server
+    /// restart fails the request and the caller retries the still-pending
+    /// durable interview.
+    pending_answers: VecDeque<QueuedAnswer>,
+    /// The native `before_attempt` barrier reached by a timeout/default and
+    /// asked the scheduler to grant this live worker a slot again.
+    readmission_requested: bool,
+    pending_unpause: bool,
 }
 
 impl ManagedRun {
@@ -296,6 +313,12 @@ impl ManagedRun {
         self.error = error;
         self.active_steerable_stages.clear();
         self.active_non_steerable_stages.clear();
+        self.scheduler_slot_held = false;
+        self.readmission_requested = false;
+        self.pending_unpause = false;
+        for answer in self.pending_answers.drain(..) {
+            let _ = answer.response.send(false);
+        }
         true
     }
 
@@ -318,6 +341,13 @@ impl ManagedRun {
             self.cancel_escalation_worker = None;
         }
     }
+}
+
+struct QueuedAnswer {
+    qid:        String,
+    submission: AnswerSubmission,
+    transport:  RunAnswerTransport,
+    response:   oneshot::Sender<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -550,6 +580,21 @@ impl RunAnswerTransport {
                     .map_err(|err| Self::answer_error_from_bus(&err))
             }
             Self::InProcess { .. } => Err(AnswerTransportError::Closed),
+        }
+    }
+
+    async fn grant_scheduler_admission(&self) -> Result<(), AnswerTransportError> {
+        match self {
+            Self::Worker { run_id, bus, .. } => {
+                let message = WorkerControlEnvelope::scheduler_admission_granted();
+                Self::publish_worker_control(*run_id, bus, message)
+                    .await
+                    .map_err(|err| Self::answer_error_from_bus(&err))
+            }
+            Self::InProcess { controls, .. } => {
+                controls.scheduler_admission().grant();
+                Ok(())
+            }
         }
     }
 }
@@ -3125,14 +3170,8 @@ fn compute_queue_positions(runs: &HashMap<RunId, ManagedRun>) -> HashMap<RunId, 
         .collect()
 }
 
-pub(in crate::server) fn counts_toward_scheduler_capacity(status: RunStatus) -> bool {
-    matches!(
-        status,
-        RunStatus::Starting
-            | RunStatus::Running
-            | RunStatus::Blocked { .. }
-            | RunStatus::Paused { .. }
-    )
+pub(in crate::server) fn counts_toward_scheduler_capacity(run: &ManagedRun) -> bool {
+    run.scheduler_slot_held
 }
 
 #[allow(
@@ -3225,6 +3264,12 @@ fn clear_live_run_state(run: &mut ManagedRun) {
     run.cancel_token = None;
     run.worker_ref = None;
     run.cancel_escalation_worker = None;
+    run.scheduler_slot_held = false;
+    run.readmission_requested = false;
+    run.pending_unpause = false;
+    for answer in run.pending_answers.drain(..) {
+        let _ = answer.response.send(false);
+    }
 }
 
 fn cleanup_worker_control_bus_for_run(state: &AppState, run_id: RunId) {
@@ -3263,11 +3308,17 @@ fn reconcile_live_interview_state(run: &mut ManagedRun, item: &RunStreamItem) {
     }
 }
 
-fn claim_run_answer_transport(
+enum AnswerDispatch {
+    Immediate(Box<QueuedAnswer>),
+    Queued(oneshot::Receiver<bool>),
+}
+
+fn claim_run_answer(
     state: &AppState,
     run_id: RunId,
     qid: &str,
-) -> Result<RunAnswerTransport, StatusCode> {
+    submission: AnswerSubmission,
+) -> Result<AnswerDispatch, StatusCode> {
     let mut runs = state.runs.lock().expect("runs lock poisoned");
     let managed_run = runs.get_mut(&run_id).ok_or(StatusCode::NOT_FOUND)?;
     let transport = managed_run
@@ -3279,7 +3330,20 @@ fn claim_run_answer_transport(
         return Err(StatusCode::CONFLICT);
     }
 
-    Ok(transport)
+    let (response, receiver) = oneshot::channel();
+    let answer = QueuedAnswer {
+        qid: qid.to_string(),
+        submission,
+        transport,
+        response,
+    };
+    if managed_run.scheduler_slot_held {
+        Ok(AnswerDispatch::Immediate(Box::new(answer)))
+    } else {
+        managed_run.pending_answers.push_back(answer);
+        state.scheduler_notify.notify_one();
+        Ok(AnswerDispatch::Queued(receiver))
+    }
 }
 
 fn release_run_answer_claim(state: &AppState, run_id: RunId, qid: &str) {
@@ -3641,6 +3705,10 @@ fn managed_run(
         run_dir: Some(run_dir),
         execution_mode,
         store_interruptions: 0,
+        scheduler_slot_held: false,
+        pending_answers: VecDeque::new(),
+        readmission_requested: false,
+        pending_unpause: false,
     }
 }
 
@@ -3773,6 +3841,27 @@ fn apply_lifecycle_to_managed_run(state: &AppState, run_id: RunId, record: &RunL
         | RunLifecycleKind::CancelRequested
         | RunLifecycleKind::PauseRequested
         | RunLifecycleKind::UnpauseRequested => {}
+    }
+}
+
+fn apply_scheduler_admission_notice(state: &AppState, run_id: RunId, code: &str) {
+    let mut runs = state.runs.lock().expect("runs lock poisoned");
+    let Some(run) = runs.get_mut(&run_id) else {
+        return;
+    };
+    let notify = match code {
+        SCHEDULER_ADMISSION_RELEASED_NOTICE => {
+            std::mem::replace(&mut run.scheduler_slot_held, false)
+        }
+        SCHEDULER_READMISSION_REQUESTED_NOTICE if !run.scheduler_slot_held => {
+            run.readmission_requested = true;
+            true
+        }
+        _ => false,
+    };
+    drop(runs);
+    if notify {
+        state.scheduler_notify.notify_one();
     }
 }
 
@@ -4102,8 +4191,8 @@ async fn deliver_answer_to_run(
     qid: &str,
     submission: AnswerSubmission,
 ) -> Result<(), Response> {
-    let transport = match claim_run_answer_transport(state, run_id, qid) {
-        Ok(transport) => transport,
+    let dispatch = match claim_run_answer(state, run_id, qid, submission) {
+        Ok(dispatch) => dispatch,
         Err(StatusCode::NOT_FOUND) => {
             return Err(ApiError::not_found("Run not found.").into_response());
         }
@@ -4121,30 +4210,50 @@ async fn deliver_answer_to_run(
         }
     };
 
-    let answered = InterviewAnsweredRecord {
-        question:  qid.to_string(),
-        principal: Some(submission.actor.clone()),
-        channel:   None,
-        text:      None,
-        answer:    Some(answer_text(&submission.answer)),
+    let delivered = match dispatch {
+        AnswerDispatch::Immediate(answer) => deliver_admitted_answer(state, run_id, *answer).await,
+        AnswerDispatch::Queued(receiver) => receiver.await.unwrap_or(false),
     };
-    if let Ok(()) = transport.submit(qid, submission).await {
-        // The answer reached the run; who gave it, and what, is Fabro's
-        // record beside the answer Petri records.
-        if let Err(err) =
-            run_records::append(state, run_id, PlatformRecord::InterviewAnswered(answered)).await
-        {
-            warn!(run_id = %run_id, question = qid, error = %err, "the answer was delivered but not recorded");
-        }
+    if delivered {
         Ok(())
     } else {
-        release_run_answer_claim(state, run_id, qid);
         Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "Failed to deliver answer to the active run.",
         )
         .into_response())
     }
+}
+
+/// Deliver an answer after the run owns scheduler capacity. Answer delivery
+/// can wake Petri immediately, so callers must never invoke this for a run
+/// whose slot is released.
+async fn deliver_admitted_answer(state: &AppState, run_id: RunId, answer: QueuedAnswer) -> bool {
+    let answered = InterviewAnsweredRecord {
+        question:  answer.qid.clone(),
+        principal: Some(answer.submission.actor.clone()),
+        channel:   None,
+        text:      None,
+        answer:    Some(answer_text(&answer.submission.answer)),
+    };
+    let delivered = answer
+        .transport
+        .submit(&answer.qid, answer.submission)
+        .await
+        .is_ok();
+    if delivered {
+        // The answer reached the run; who gave it, and what, is Fabro's
+        // record beside the answer Petri records.
+        if let Err(err) =
+            run_records::append(state, run_id, PlatformRecord::InterviewAnswered(answered)).await
+        {
+            warn!(run_id = %run_id, question = answer.qid, error = %err, "the answer was delivered but not recorded");
+        }
+    } else {
+        release_run_answer_claim(state, run_id, &answer.qid);
+    }
+    let _ = answer.response.send(delivered);
+    delivered
 }
 
 /// An answer as text, for the record and the readers that show it.
@@ -4224,13 +4333,12 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             return;
         }
         let managed_run = match runs.get_mut(&run_id) {
-            Some(run) if run.status == RunStatus::Runnable => run,
+            Some(run) if run.status == RunStatus::Starting && run.scheduler_slot_held => run,
             _ => return,
         };
         let Some(run_dir) = managed_run.run_dir.clone() else {
             return;
         };
-        managed_run.status = RunStatus::Starting;
         (run_dir, managed_run.execution_mode)
     };
 
@@ -4468,7 +4576,134 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
     state.scheduler_notify.notify_one();
 }
 
-/// Background task that promotes runnable runs when capacity is available.
+enum ScheduledWork {
+    Start(RunId),
+    Readmit {
+        run_id:    RunId,
+        transport: RunAnswerTransport,
+        answers:   Vec<QueuedAnswer>,
+        unpause:   bool,
+    },
+}
+
+/// Claim available scheduler slots. New runnable runs are admitted before
+/// blocked workers are woken, so a waiting parent cannot immediately reclaim
+/// the slot its runnable child needs.
+fn claim_scheduled_work(state: &AppState) -> Vec<ScheduledWork> {
+    let mut runs = state.runs.lock().expect("runs lock poisoned");
+    let active = runs
+        .values()
+        .filter(|run| counts_toward_scheduler_capacity(run))
+        .count();
+    let mut available = state.max_concurrent_runs.saturating_sub(active);
+    if available == 0 {
+        return Vec::new();
+    }
+
+    let mut runnable: Vec<_> = runs
+        .iter()
+        .filter(|(_, run)| run.status == RunStatus::Runnable && !run.scheduler_slot_held)
+        .map(|(id, run)| (*id, run.created_at))
+        .collect();
+    runnable.sort_by_key(|(_, created_at)| *created_at);
+
+    let mut work = Vec::new();
+    for (run_id, _) in runnable.into_iter().take(available) {
+        let run = runs
+            .get_mut(&run_id)
+            .expect("a runnable scheduler candidate should remain registered");
+        run.status = RunStatus::Starting;
+        run.scheduler_slot_held = true;
+        work.push(ScheduledWork::Start(run_id));
+        available -= 1;
+    }
+    if available == 0 {
+        return work;
+    }
+
+    let mut waking: Vec<_> = runs
+        .iter()
+        .filter(|(_, run)| {
+            !run.scheduler_slot_held
+                && (run.readmission_requested
+                    || !run.pending_answers.is_empty()
+                    || run.pending_unpause)
+                && run.answer_transport.is_some()
+        })
+        .map(|(id, run)| (*id, run.created_at))
+        .collect();
+    waking.sort_by_key(|(_, created_at)| *created_at);
+    for (run_id, _) in waking.into_iter().take(available) {
+        let run = runs
+            .get_mut(&run_id)
+            .expect("a waking scheduler candidate should remain registered");
+        run.scheduler_slot_held = true;
+        run.readmission_requested = false;
+        let transport = run
+            .answer_transport
+            .clone()
+            .expect("a waking scheduler candidate should have a live transport");
+        let answers = run.pending_answers.drain(..).collect();
+        let unpause = std::mem::take(&mut run.pending_unpause);
+        work.push(ScheduledWork::Readmit {
+            run_id,
+            transport,
+            answers,
+            unpause,
+        });
+    }
+    work
+}
+
+async fn deliver_scheduled_answers(
+    state: Arc<AppState>,
+    run_id: RunId,
+    transport: RunAnswerTransport,
+    answers: Vec<QueuedAnswer>,
+    unpause: bool,
+) {
+    if transport.grant_scheduler_admission().await.is_err() {
+        for answer in answers {
+            release_run_answer_claim(state.as_ref(), run_id, &answer.qid);
+            let _ = answer.response.send(false);
+        }
+        release_scheduler_readmission(state.as_ref(), run_id, unpause);
+        return;
+    }
+    if answers.is_empty() {
+        if unpause {
+            let _ = transport.unpause_run().await;
+        }
+        return;
+    }
+    for answer in answers {
+        deliver_admitted_answer(state.as_ref(), run_id, answer).await;
+    }
+    if unpause {
+        let _ = transport.unpause_run().await;
+    }
+    // Once the grant reached the worker, the native gate is open even if
+    // every queued answer was stale or its transport failed. Keep ownership
+    // until that worker explicitly reports another quiescent wait or exits.
+}
+
+fn release_scheduler_readmission(state: &AppState, run_id: RunId, unpause: bool) {
+    let mut runs = state.runs.lock().expect("runs lock poisoned");
+    if let Some(run) = runs.get_mut(&run_id) {
+        if matches!(
+            run.status,
+            RunStatus::Blocked { .. } | RunStatus::Paused { .. }
+        ) {
+            run.scheduler_slot_held = false;
+            run.pending_unpause |= unpause;
+        }
+    }
+    drop(runs);
+    state.scheduler_notify.notify_one();
+}
+
+/// Background task that promotes runnable runs and readmits blocked workers
+/// when capacity is available.
 pub fn spawn_scheduler(state: Arc<AppState>) {
     stream_follower::spawn_stream_follower(Arc::clone(&state));
     tokio::spawn(async move {
@@ -4480,37 +4715,33 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
             if state.is_shutting_down() {
                 break;
             }
-            let runs_to_start = {
-                let runs = state.runs.lock().expect("runs lock poisoned");
-                let active = runs
-                    .values()
-                    .filter(|r| counts_toward_scheduler_capacity(r.status))
-                    .count();
-                let available = state.max_concurrent_runs.saturating_sub(active);
-                if available == 0 {
-                    Vec::new()
-                } else {
-                    let mut runnable: Vec<_> = runs
-                        .iter()
-                        .filter(|(_, r)| r.status == RunStatus::Runnable)
-                        .map(|(id, r)| (*id, r.created_at))
-                        .collect();
-                    runnable.sort_by_key(|(_, created_at)| *created_at);
-                    runnable
-                        .into_iter()
-                        .take(available)
-                        .map(|(id, _)| id)
-                        .collect::<Vec<_>>()
-                }
-            };
-            for id in runs_to_start {
+            for work in claim_scheduled_work(state.as_ref()) {
                 if state.is_shutting_down() {
                     break;
                 }
-                let state_clone = Arc::clone(&state);
-                tokio::spawn(
-                    execute_run(state_clone, id).instrument(tracing::info_span!("run", id = %id)),
-                );
+                match work {
+                    ScheduledWork::Start(id) => {
+                        let state_clone = Arc::clone(&state);
+                        tokio::spawn(
+                            execute_run(state_clone, id)
+                                .instrument(tracing::info_span!("run", id = %id)),
+                        );
+                    }
+                    ScheduledWork::Readmit {
+                        run_id,
+                        transport,
+                        answers,
+                        unpause,
+                    } => {
+                        tokio::spawn(deliver_scheduled_answers(
+                            Arc::clone(&state),
+                            run_id,
+                            transport,
+                            answers,
+                            unpause,
+                        ));
+                    }
+                }
             }
         }
     });

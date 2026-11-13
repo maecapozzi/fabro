@@ -843,7 +843,6 @@ pub(crate) mod test_support {
 mod tests {
     use fabro_types::RunSandboxRuntime;
     use fabro_types::settings::server::SandboxPluginSettings;
-    use sandbox_driver::SandboxProvider as _;
     use sandbox_driver_testing::ScriptedSandbox;
 
     use super::test_support::{petri_scripted_sandbox, scripted_provider};

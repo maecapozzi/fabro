@@ -104,6 +104,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::controls::SchedulerAdmission;
 use crate::projection;
 
 /// Whether a run answers its own questions.
@@ -308,10 +309,11 @@ impl ExecutionObserver for Observed {
 
 /// The interviewer a Fabro run installs.
 pub struct FabroInterviewer {
-    answers:  Arc<ControlInterviewer>,
-    sink:     Arc<dyn QuestionSink>,
-    approval: Approval,
-    observed: Arc<Observed>,
+    answers:             Arc<ControlInterviewer>,
+    sink:                Arc<dyn QuestionSink>,
+    approval:            Approval,
+    observed:            Arc<Observed>,
+    scheduler_admission: Option<SchedulerAdmission>,
 }
 
 impl FabroInterviewer {
@@ -323,7 +325,17 @@ impl FabroInterviewer {
             sink: Arc::new(Unobserved),
             approval,
             observed: Arc::new(Observed::default()),
+            scheduler_admission: None,
         }
+    }
+
+    /// Hold native attempt admission while a prompt waits. The guard may be
+    /// dropped by Petri's timeout race; the execution hook remains closed
+    /// until the shared scheduler explicitly grants readmission.
+    #[must_use]
+    pub fn with_scheduler_admission(mut self, admission: SchedulerAdmission) -> Self {
+        self.scheduler_admission = Some(admission);
+        self
     }
 
     /// Report what happens to each question to `sink` as well.
@@ -396,6 +408,13 @@ impl Interviewer for FabroInterviewer {
             started:     Instant::now(),
             open:        true,
         };
+        let _scheduler_wait = (self.approval == Approval::Prompt)
+            .then(|| {
+                self.scheduler_admission
+                    .as_ref()
+                    .map(|admission| admission.wait(request.execution, request.firing))
+            })
+            .flatten();
         let submission = match self.approval {
             Approval::Auto => Some(AutoApproveInterviewer::engine().ask(legacy).await),
             Approval::Prompt => tokio::select! {

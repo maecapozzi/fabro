@@ -46,7 +46,10 @@ use fabro_config::{
 };
 use fabro_interview::ControlInterviewer;
 use fabro_petri::artifacts::StoreArtifactWriter;
-use fabro_petri::controls::RunControls;
+use fabro_petri::controls::{
+    RunControls, SCHEDULER_ADMISSION_RELEASED_NOTICE, SCHEDULER_READMISSION_REQUESTED_NOTICE,
+    SchedulerAdmissionEvent,
+};
 use fabro_petri::engine::{self, Conclusion, Execution, RunRequest};
 use fabro_petri::hooks::HooksSpec;
 use fabro_petri::interview::{Approval, FabroInterviewer};
@@ -59,15 +62,19 @@ use fabro_petri::secrets::VaultSecrets;
 use fabro_petri::source::RunSource;
 use fabro_petri::{SqliteRunStore, admission, projection, run_graph};
 use fabro_static::EnvVars;
-use fabro_store::platform_records::{RunLifecycleKind, RunLifecycleRecord};
+use fabro_store::platform_records::{
+    PlatformRecord, RunLifecycleKind, RunLifecycleRecord, RunNoticeRecord,
+};
 use fabro_types::settings::McpTransport;
 use fabro_types::settings::run::{ApprovalMode, McpServerSettings, RunMode};
 use fabro_types::{
-    FailureReason, RunControlAction, RunId, RunRunnableSource, RunStatus, RunTarget, SuccessReason,
+    FailureReason, RunControlAction, RunId, RunNoticeLevel, RunRunnableSource, RunStatus,
+    RunTarget, SuccessReason,
 };
 use fabro_util::error as error_util;
 use fabro_workflow::Error as WorkflowError;
 use lithos_llm::catalog::ProviderId;
+use tokio::sync::oneshot;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -345,14 +352,13 @@ pub(crate) async fn execute(state: Arc<AppState>, run_id: RunId) {
     let (run_dir, cancel, mode) = {
         let mut runs = state.runs.lock().expect("runs lock poisoned");
         let managed_run = match runs.get_mut(&run_id) {
-            Some(run) if run.status == RunStatus::Runnable => run,
+            Some(run) if run.status == RunStatus::Starting && run.scheduler_slot_held => run,
             _ => return,
         };
         let Some(run_dir) = managed_run.run_dir.clone() else {
             return;
         };
         let cancel = CancellationToken::new();
-        managed_run.status = RunStatus::Starting;
         managed_run.cancel_token = Some(cancel.clone());
         (run_dir, cancel, managed_run.execution_mode)
     };
@@ -467,8 +473,36 @@ pub(crate) async fn execute(state: Arc<AppState>, run_id: RunId) {
     } else {
         Approval::Prompt
     };
-    let petri_interviewer = FabroInterviewer::new(interviewer, approval);
+    let petri_interviewer = FabroInterviewer::new(interviewer, approval)
+        .with_scheduler_admission(controls.scheduler_admission());
     let observers = vec![petri_interviewer.observer()];
+    let mut admission_events = controls
+        .take_scheduler_admission_events()
+        .expect("one task owns scheduler admission events");
+    let admission_state = Arc::clone(&state);
+    let (admission_failure_tx, mut admission_failure_rx) = oneshot::channel();
+    let admission_mirror = tokio::spawn(async move {
+        let mut admission_failure_tx = Some(admission_failure_tx);
+        while let Some(event) = admission_events.recv().await {
+            let code = match event {
+                SchedulerAdmissionEvent::Released => SCHEDULER_ADMISSION_RELEASED_NOTICE,
+                SchedulerAdmissionEvent::ReadmissionRequested => {
+                    SCHEDULER_READMISSION_REQUESTED_NOTICE
+                }
+            };
+            let record = PlatformRecord::RunNotice(RunNoticeRecord {
+                level:   RunNoticeLevel::Info,
+                code:    code.to_string(),
+                message: "shared scheduler admission changed".to_string(),
+            });
+            if let Err(error) = run_records::append(&admission_state, run_id, record).await {
+                if let Some(sender) = admission_failure_tx.take() {
+                    let _ = sender.send(error.to_string());
+                }
+                return;
+            }
+        }
+    });
     let (_, eligible) = state.resolve_llm_client_with_ready_ids().await;
     let dry_run = run_state.spec.settings.run.execution.mode == RunMode::DryRun;
     // The in-process path serves the server's tests: a Git target is
@@ -519,7 +553,27 @@ pub(crate) async fn execute(state: Arc<AppState>, run_id: RunId) {
         blobs: Some(state.store_ref().blobs()),
         hooks: Some(hooks),
     };
-    let result = Box::pin(engine::run(request)).await;
+    let mut run = Box::pin(engine::run(request));
+    let result = tokio::select! {
+        result = &mut run => result,
+        failure = &mut admission_failure_rx => {
+            match failure {
+                Ok(failure) => {
+                    admission_mirror.abort();
+                    drop(run);
+                    match resume_after_interruption(&state, run_id, &failure).await {
+                        Ok(()) => return,
+                        Err(message) => {
+                            fail_before_execution(&state, run_id, &message).await;
+                            return;
+                        }
+                    }
+                }
+                Err(_) => (&mut run).await,
+            }
+        }
+    };
+    admission_mirror.abort();
     info!(
         run_id = %run_id,
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),

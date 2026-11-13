@@ -78,7 +78,10 @@ use fabro_llm::credentials::{CredentialProvider, readiness};
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_petri::artifacts::ClientArtifactWriter;
 use fabro_petri::blobs::ClientBlobs;
-use fabro_petri::controls::{RunControls, SteerError};
+use fabro_petri::controls::{
+    RunControls, SCHEDULER_ADMISSION_RELEASED_NOTICE, SCHEDULER_READMISSION_REQUESTED_NOTICE,
+    SchedulerAdmissionEvent, SteerError,
+};
 use fabro_petri::engine::{self, Conclusion, Execution, RunRequest};
 use fabro_petri::hooks::{HooksSpec, RunPublisher};
 use fabro_petri::interview::{Approval, FabroInterviewer};
@@ -101,7 +104,7 @@ use fabro_util::exit::{ErrorExt as _, ExitClass};
 use fabro_vault::Vault;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::services::FabroRunToolServices;
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{RwLock as AsyncRwLock, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -113,17 +116,20 @@ use crate::command_context;
 
 /// What the worker holds when it hands a run to Petri.
 pub(super) struct PetriWorker<'a> {
-    pub(super) run_id:       RunId,
-    pub(super) target:       ServerTarget,
-    pub(super) client:       Client,
-    pub(super) run_state:    RunProjection,
-    pub(super) storage_dir:  &'a Path,
-    pub(super) run_dir:      PathBuf,
-    pub(super) mode:         RunWorkerMode,
+    pub(super) run_id:              RunId,
+    pub(super) target:              ServerTarget,
+    pub(super) client:              Client,
+    pub(super) run_state:           RunProjection,
+    pub(super) storage_dir:         &'a Path,
+    pub(super) run_dir:             PathBuf,
+    pub(super) mode:                RunWorkerMode,
     /// The Fabro home the server named; `None` falls back to Petri's own
     /// lookup of the worker's environment.
-    pub(super) fabro_home:   Option<PathBuf>,
-    pub(super) worker_token: &'a str,
+    pub(super) fabro_home:          Option<PathBuf>,
+    /// Enabled only when the spawning server advertised support on the
+    /// hidden worker command line.
+    pub(super) scheduler_admission: bool,
+    pub(super) worker_token:        &'a str,
 }
 
 /// Execute the run to its end. `Ok` when the record says it succeeded;
@@ -155,6 +161,7 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
         Arc::new(HttpPlatformRecords::new(worker.client.clone_for_reuse()));
     let petri_controls = Arc::new(
         PetriControls::new(run_id, controls.clone(), Arc::clone(&records))
+            .with_scheduler_admission(worker.scheduler_admission)
             .with_muted_acks(test_control_acks_muted()),
     );
     let mut control_manager = runner::spawn_worker_control_manager(
@@ -171,8 +178,26 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
     } else {
         Approval::Prompt
     };
-    let petri_interviewer = FabroInterviewer::new(interviewer, approval);
+    let mut petri_interviewer = FabroInterviewer::new(interviewer, approval);
+    if worker.scheduler_admission {
+        petri_interviewer =
+            petri_interviewer.with_scheduler_admission(controls.scheduler_admission());
+    }
     let observers = vec![petri_interviewer.observer()];
+    let (scheduler_failure_tx, mut scheduler_failure_rx) = oneshot::channel();
+    let mut scheduler_failure_guard = Some(scheduler_failure_tx);
+    let scheduler_admission_mirror = worker.scheduler_admission.then(|| {
+        mirror_scheduler_admission(
+            run_id,
+            controls
+                .take_scheduler_admission_events()
+                .expect("one task owns scheduler admission events"),
+            Arc::clone(&records),
+            scheduler_failure_guard
+                .take()
+                .expect("the scheduler mirror owns its failure sender"),
+        )
+    });
 
     let vault = runner::load_worker_vault(worker.storage_dir).await?;
     let secrets = VaultSecrets::from_vault(&*vault.read().await);
@@ -271,10 +296,16 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
         ))),
         hooks: Some(hooks),
     };
-    let paused_mirror = mirror_paused_state(run_id, &controls, Arc::clone(&records));
+    let paused_mirror = mirror_paused_state(
+        run_id,
+        &controls,
+        Arc::clone(&records),
+        worker.scheduler_admission,
+    );
     let run = Box::pin(engine::run(request));
     tokio::pin!(run);
     let mut control_lost = None;
+    let mut scheduler_failure_monitoring = worker.scheduler_admission;
     let result = loop {
         tokio::select! {
             result = &mut run => break result,
@@ -285,10 +316,27 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
                 control_lost = Some(lost);
                 cancel_token.cancel();
             }
+            failure = &mut scheduler_failure_rx, if scheduler_failure_monitoring => {
+                match failure {
+                    Ok(failure) => {
+                        warn!(run_id = %run_id, error = %failure, "scheduler admission reporting failed; interrupting the worker");
+                        control_manager.finish();
+                        paused_mirror.abort();
+                        if let Some(task) = &scheduler_admission_mirror {
+                            task.abort();
+                        }
+                        return Err(anyhow!(failure).classify(ExitClass::Interrupted));
+                    }
+                    Err(_) => scheduler_failure_monitoring = false,
+                }
+            }
         }
     };
     control_manager.finish();
     paused_mirror.abort();
+    if let Some(task) = &scheduler_admission_mirror {
+        task.abort();
+    }
 
     info!(
         run_id = %run_id,
@@ -361,13 +409,14 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
 /// Cancel and answers are applied by the channel itself, before a message
 /// reaches here.
 pub(super) struct PetriControls {
-    run_id:     RunId,
-    controls:   RunControls,
+    run_id:              RunId,
+    controls:            RunControls,
     /// Where a refused steer's notice goes.
-    records:    Arc<dyn PlatformRecords>,
+    records:             Arc<dyn PlatformRecords>,
+    scheduler_admission: bool,
     /// A test hook: the worker applies every control but acknowledges
     /// none, so the server's wait for an answer runs out.
-    muted_acks: bool,
+    muted_acks:          bool,
 }
 
 impl PetriControls {
@@ -380,6 +429,7 @@ impl PetriControls {
             run_id,
             controls,
             records,
+            scheduler_admission: false,
             muted_acks: false,
         }
     }
@@ -389,6 +439,12 @@ impl PetriControls {
     #[must_use]
     pub(super) fn with_muted_acks(mut self, muted: bool) -> Self {
         self.muted_acks = muted;
+        self
+    }
+
+    #[must_use]
+    pub(super) fn with_scheduler_admission(mut self, enabled: bool) -> Self {
+        self.scheduler_admission = enabled;
         self
     }
 
@@ -409,12 +465,23 @@ impl PetriControls {
         let outcome = match message {
             WorkerControlMessage::RunPause => {
                 info!(run_id = %self.run_id, "pause requested: admission is held");
+                if self.scheduler_admission {
+                    self.controls.scheduler_admission().pause();
+                }
                 self.controls.pause();
                 None
             }
             WorkerControlMessage::RunUnpause => {
+                if self.scheduler_admission {
+                    self.controls.scheduler_admission().unpaused();
+                }
                 self.controls.unpause().await;
                 info!(run_id = %self.run_id, "unpause recorded: admission is released");
+                None
+            }
+            WorkerControlMessage::SchedulerAdmissionGranted => {
+                self.controls.scheduler_admission().grant();
+                info!(run_id = %self.run_id, "shared scheduler admission granted");
                 None
             }
             WorkerControlMessage::Steer {
@@ -542,6 +609,7 @@ fn control_name(message: &WorkerControlMessage) -> &'static str {
         WorkerControlMessage::RunCancel => "run.cancel",
         WorkerControlMessage::RunPause => "run.pause",
         WorkerControlMessage::RunUnpause => "run.unpause",
+        WorkerControlMessage::SchedulerAdmissionGranted => "scheduler.admission_granted",
         WorkerControlMessage::Steer { .. } => "run.steer",
         WorkerControlMessage::Interrupt { .. } => "run.interrupt",
         WorkerControlMessage::InterruptThenSteer { .. } => "run.interrupt_then_steer",
@@ -576,8 +644,10 @@ fn mirror_paused_state(
     run_id: RunId,
     controls: &RunControls,
     records: Arc<dyn PlatformRecords>,
+    scheduler_admission: bool,
 ) -> JoinHandle<()> {
     let mut changes = controls.paused_changes();
+    let admission = controls.scheduler_admission();
     tokio::spawn(async move {
         let mut last = *changes.borrow_and_update();
         while changes.changed().await.is_ok() {
@@ -586,6 +656,13 @@ fn mirror_paused_state(
                 continue;
             }
             last = paused;
+            if scheduler_admission {
+                if paused {
+                    admission.pause();
+                } else {
+                    admission.unpaused();
+                }
+            }
             let (transition, phase) = if paused {
                 (RunLifecycleKind::Paused, WorkerTitlePhase::Paused)
             } else {
@@ -596,6 +673,40 @@ fn mirror_paused_state(
                 warn!(run_id = %run_id, error = %error, "the paused state was not reported");
             }
             runner::set_worker_title(&run_id, phase);
+        }
+    })
+}
+
+/// Mirror the worker-side scheduler barrier into lifecycle records the server
+/// scheduler consumes. The barrier itself is native execution admission; the
+/// records only transfer ownership of the shared slot.
+pub(super) fn mirror_scheduler_admission(
+    run_id: RunId,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<SchedulerAdmissionEvent>,
+    records: Arc<dyn PlatformRecords>,
+    failure: oneshot::Sender<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let code = match event {
+                SchedulerAdmissionEvent::Released => SCHEDULER_ADMISSION_RELEASED_NOTICE,
+                SchedulerAdmissionEvent::ReadmissionRequested => {
+                    SCHEDULER_READMISSION_REQUESTED_NOTICE
+                }
+            };
+            let record = RunNoticeRecord {
+                level:   RunNoticeLevel::Info,
+                code:    code.to_string(),
+                message: "shared scheduler admission changed".to_string(),
+            };
+            if let Err(error) = records
+                .append(&run_id, &PlatformRecord::RunNotice(record), None)
+                .await
+            {
+                let rendered = fabro_util::error::collect_chain(&error).join(": ");
+                let _ = failure.send(rendered);
+                return;
+            }
         }
     })
 }
