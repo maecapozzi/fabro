@@ -148,12 +148,14 @@ struct InstallationTokenResponse {
     token: String,
 }
 
-fn valid_reviewer(reviewer: &str) -> anyhow::Result<&str> {
+/// Validate and normalize an explicit GitHub reviewer login.
+pub fn validate_reviewer(reviewer: &str) -> anyhow::Result<&str> {
     let reviewer = reviewer.trim();
     if reviewer.is_empty()
         || reviewer.len() > 39
         || reviewer.starts_with('-')
         || reviewer.ends_with('-')
+        || reviewer.contains("--")
         || reviewer
             .chars()
             .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-'))
@@ -353,7 +355,7 @@ pub async fn review_queue_with_client(
     context: &GitHubContext<'_>,
     reviewer: &str,
 ) -> Result<ReviewQueue, ReviewQueueError> {
-    let reviewer = valid_reviewer(reviewer)?.to_string();
+    let reviewer = validate_reviewer(reviewer)?.to_string();
     let tokens = access_tokens(client, context).await?;
     if tokens.is_empty() {
         return Err(ReviewQueueError::Access);
@@ -505,7 +507,7 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::*;
-    use crate::tests_mock::MockHttpClient;
+    use crate::tests_mock::{MockHttpClient, test_rsa_key};
 
     fn search_item(number: u64, draft: bool) -> serde_json::Value {
         serde_json::json!({
@@ -540,6 +542,43 @@ mod tests {
             "updated_at": "2026-11-13T13:00:00Z"
         })
         .to_string()
+    }
+
+    async fn direct_queue(requested_reviewers: &str) -> ReviewQueue {
+        let direct_path =
+            "/search/issues?q=is%3Apr+is%3Aopen+review-requested%3Amae&per_page=100&page=1";
+        let mock = MockHttpClient::new()
+            .on(HttpMethod::Get, "/user", 200, r#"{"login":"mae","id":7}"#)
+            .on(
+                HttpMethod::Get,
+                "/user/teams?per_page=100&page=1",
+                403,
+                "{}",
+            )
+            .on(
+                HttpMethod::Get,
+                direct_path,
+                200,
+                &search_body(vec![search_item(1, false)]),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1",
+                200,
+                &live_pull(1, "open", false, false),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1/requested_reviewers",
+                200,
+                requested_reviewers,
+            );
+        let credentials = GitHubCredentials::Pat("token".to_string());
+        let context = GitHubContext::new(&credentials, "https://api.test");
+
+        review_queue_with_client(&mock, &context, "mae")
+            .await
+            .expect("queue should load")
     }
 
     #[tokio::test]
@@ -754,6 +793,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fulfilled_or_removed_requests_disappear_and_a_new_request_reappears() {
+        let outstanding = direct_queue(r#"{"users":[{"login":"mae"}],"teams":[]}"#).await;
+        assert_eq!(outstanding.items.len(), 1);
+
+        let fulfilled_or_removed =
+            direct_queue(r#"{"users":[{"login":"someone-else"}],"teams":[]}"#).await;
+        assert!(fulfilled_or_removed.items.is_empty());
+
+        let requested_again = direct_queue(r#"{"users":[{"login":"mae"}],"teams":[]}"#).await;
+        assert_eq!(requested_again.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_reviewers_decisions_do_not_clear_an_outstanding_request() {
+        let direct_path =
+            "/search/issues?q=is%3Apr+is%3Aopen+review-requested%3Amae&per_page=100&page=1";
+        let live_with_decision = |number, decision| {
+            let mut pull: serde_json::Value =
+                serde_json::from_str(&live_pull(number, "open", false, false))
+                    .expect("live pull fixture should be JSON");
+            pull["review_decision"] = serde_json::json!(decision);
+            pull["latest_reviews"] = serde_json::json!([{
+                "user": { "login": "another-reviewer" },
+                "state": decision
+            }]);
+            pull.to_string()
+        };
+        let mock = MockHttpClient::new()
+            .on(HttpMethod::Get, "/user", 200, r#"{"login":"mae","id":7}"#)
+            .on(
+                HttpMethod::Get,
+                "/user/teams?per_page=100&page=1",
+                403,
+                "{}",
+            )
+            .on(
+                HttpMethod::Get,
+                direct_path,
+                200,
+                &search_body(vec![search_item(1, false), search_item(2, false)]),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1",
+                200,
+                &live_with_decision(1, "APPROVED"),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1/requested_reviewers",
+                200,
+                r#"{"users":[{"login":"mae"}],"teams":[]}"#,
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/2",
+                200,
+                &live_with_decision(2, "CHANGES_REQUESTED"),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/2/requested_reviewers",
+                200,
+                r#"{"users":[{"login":"mae"}],"teams":[]}"#,
+            );
+        let credentials = GitHubCredentials::Pat("token".to_string());
+        let context = GitHubContext::new(&credentials, "https://api.test");
+
+        let queue = review_queue_with_client(&mock, &context, "mae")
+            .await
+            .expect("queue should load");
+
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.number)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_searches_every_installation_and_deduplicates_results() {
+        let direct_path =
+            "/search/issues?q=is%3Apr+is%3Aopen+review-requested%3Amae&per_page=100&page=1";
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/app/installations?per_page=100&page=1",
+                200,
+                r#"[{"id":11},{"id":22}]"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/11/access_tokens",
+                201,
+                r#"{"token":"installation-11"}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/22/access_tokens",
+                201,
+                r#"{"token":"installation-22"}"#,
+            )
+            .on(
+                HttpMethod::Get,
+                direct_path,
+                200,
+                &search_body(vec![search_item(1, false)]),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1",
+                200,
+                &live_pull(1, "open", false, false),
+            )
+            .on(
+                HttpMethod::Get,
+                "/repos/acme/widgets/pulls/1/requested_reviewers",
+                200,
+                r#"{"users":[{"login":"mae"}],"teams":[]}"#,
+            );
+        let credentials = GitHubCredentials::App(crate::GitHubAppCredentials {
+            app_id:          "123".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        });
+        let context = GitHubContext::new(&credentials, "https://api.test");
+
+        let queue = review_queue_with_client(&mock, &context, "mae")
+            .await
+            .expect("queue should load");
+
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(queue.items[0].number, 1);
+        assert_eq!(queue.team_coverage, TeamCoverage::Limited);
+        assert_eq!(mock.request_count(), 7);
+    }
+
+    #[tokio::test]
     async fn bare_requested_team_slug_is_scoped_to_the_repository_owner() {
         let direct_path =
             "/search/issues?q=is%3Apr+is%3Aopen+review-requested%3Amae&per_page=100&page=1";
@@ -798,8 +978,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_or_invalid_explicit_reviewer() {
-        assert!(valid_reviewer("").is_err());
-        assert!(valid_reviewer("owner/name").is_err());
-        assert_eq!(valid_reviewer("mae-capozzi").unwrap(), "mae-capozzi");
+        assert!(validate_reviewer("").is_err());
+        assert!(validate_reviewer("owner/name").is_err());
+        assert!(validate_reviewer("mae--capozzi").is_err());
+        assert_eq!(validate_reviewer("mae-capozzi").unwrap(), "mae-capozzi");
     }
 }

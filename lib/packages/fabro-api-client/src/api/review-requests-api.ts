@@ -33,7 +33,7 @@ export const ReviewRequestsApiAxiosParamCreator = function (configuration?: Conf
         /**
          * Returns open GitHub pull requests with a current direct review request for the selected user, plus team requests when the configured GitHub credential can establish team membership. Results are independent of Fabro runs and aggregate pull request review state.
          * @summary List pull requests awaiting review
-         * @param {string} [reviewer] Explicit GitHub login. Required when the authenticated Fabro principal does not carry a GitHub identity.
+         * @param {string} [reviewer] Explicit GitHub login used only when the authenticated Fabro principal does not carry a GitHub identity. A signed-in GitHub principal\&#39;s own login is authoritative.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
@@ -83,7 +83,7 @@ export const ReviewRequestsApiFp = function(configuration?: Configuration) {
         /**
          * Returns open GitHub pull requests with a current direct review request for the selected user, plus team requests when the configured GitHub credential can establish team membership. Results are independent of Fabro runs and aggregate pull request review state.
          * @summary List pull requests awaiting review
-         * @param {string} [reviewer] Explicit GitHub login. Required when the authenticated Fabro principal does not carry a GitHub identity.
+         * @param {string} [reviewer] Explicit GitHub login used only when the authenticated Fabro principal does not carry a GitHub identity. A signed-in GitHub principal\&#39;s own login is authoritative.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
@@ -105,7 +105,7 @@ export const ReviewRequestsApiFactory = function (configuration?: Configuration,
         /**
          * Returns open GitHub pull requests with a current direct review request for the selected user, plus team requests when the configured GitHub credential can establish team membership. Results are independent of Fabro runs and aggregate pull request review state.
          * @summary List pull requests awaiting review
-         * @param {string} [reviewer] Explicit GitHub login. Required when the authenticated Fabro principal does not carry a GitHub identity.
+         * @param {string} [reviewer] Explicit GitHub login used only when the authenticated Fabro principal does not carry a GitHub identity. A signed-in GitHub principal\&#39;s own login is authoritative.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
@@ -122,7 +122,7 @@ export class ReviewRequestsApi extends BaseAPI {
     /**
      * Returns open GitHub pull requests with a current direct review request for the selected user, plus team requests when the configured GitHub credential can establish team membership. Results are independent of Fabro runs and aggregate pull request review state.
      * @summary List pull requests awaiting review
-     * @param {string} [reviewer] Explicit GitHub login. Required when the authenticated Fabro principal does not carry a GitHub identity.
+     * @param {string} [reviewer] Explicit GitHub login used only when the authenticated Fabro principal does not carry a GitHub identity. A signed-in GitHub principal\&#39;s own login is authoritative.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */

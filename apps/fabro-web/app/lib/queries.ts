@@ -371,9 +371,9 @@ export function useRunPullRequest(id: string | undefined) {
 
 export type { ReviewRequest, ReviewRequestListResponse };
 
-export function useReviewRequests(reviewer?: string) {
+export function useReviewRequests(reviewer?: string, enabled = true) {
   return useSWR<ReviewRequestListResponse>(
-    queryKeys.reviewRequests.list(reviewer),
+    enabled ? queryKeys.reviewRequests.list(reviewer) : null,
     () => apiData(() => reviewRequestsApi.listReviewRequests(reviewer)),
     {
       keepPreviousData: true,

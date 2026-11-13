@@ -3,6 +3,8 @@ visible to the configured GitHub connection, verifies each candidate against
 the pull request's live open/merged/draft state and current requested
 reviewers, and keeps draft and partial coverage states explicit. The queue is
 independent of Fabro runs, so pull requests created elsewhere are included.
+The signed-in GitHub identity is authoritative; other authentication methods
+can provide an explicit, validated GitHub login.
 
 Desktop:
 

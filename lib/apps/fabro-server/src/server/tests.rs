@@ -8797,6 +8797,22 @@ async fn review_requests_require_an_explicit_reviewer_without_github_identity() 
 }
 
 #[tokio::test]
+async fn review_requests_reject_invalid_explicit_reviewers_at_the_api_boundary() {
+    for reviewer in ["", "owner%2Fname", "mae--capozzi", &"a".repeat(40)] {
+        let app = crate::test_support::build_test_router(test_app_state());
+        let request = Request::builder()
+            .uri(api(&format!("/review-requests?reviewer={reviewer}")))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["code"], "github_reviewer_invalid");
+    }
+}
+
+#[tokio::test]
 async fn review_requests_distinguish_missing_github_credentials_from_an_empty_queue() {
     let state = create_github_token_app_state(None, None);
     let app = crate::test_support::build_test_router(state);

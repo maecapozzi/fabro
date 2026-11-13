@@ -14,12 +14,23 @@ struct ReviewRequestParams {
     reviewer: Option<String>,
 }
 
-fn selected_reviewer(user: &fabro_types::UserPrincipal, explicit: Option<&str>) -> Option<String> {
-    explicit
-        .map(str::trim)
-        .filter(|reviewer| !reviewer.is_empty())
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewerSelectionError {
+    Required,
+    Invalid,
+}
+
+fn selected_reviewer(
+    user: &fabro_types::UserPrincipal,
+    explicit: Option<&str>,
+) -> Result<String, ReviewerSelectionError> {
+    if user.auth_method == AuthMethod::Github {
+        return Ok(user.login.clone());
+    }
+    let explicit = explicit.ok_or(ReviewerSelectionError::Required)?;
+    fabro_github::review_queue::validate_reviewer(explicit)
         .map(str::to_string)
-        .or_else(|| (user.auth_method == AuthMethod::Github).then(|| user.login.clone()))
+        .map_err(|_| ReviewerSelectionError::Invalid)
 }
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -31,14 +42,24 @@ async fn list_review_requests(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReviewRequestParams>,
 ) -> Response {
-    let reviewer = selected_reviewer(&user, params.reviewer.as_deref());
-    let Some(reviewer) = reviewer else {
-        return ApiError::with_code(
-            StatusCode::BAD_REQUEST,
-            "Enter the GitHub login whose review requests should be shown.",
-            "github_reviewer_required",
-        )
-        .into_response();
+    let reviewer = match selected_reviewer(&user, params.reviewer.as_deref()) {
+        Ok(reviewer) => reviewer,
+        Err(ReviewerSelectionError::Required) => {
+            return ApiError::with_code(
+                StatusCode::BAD_REQUEST,
+                "Enter the GitHub login whose review requests should be shown.",
+                "github_reviewer_required",
+            )
+            .into_response();
+        }
+        Err(ReviewerSelectionError::Invalid) => {
+            return ApiError::with_code(
+                StatusCode::BAD_REQUEST,
+                "Reviewer must be a valid GitHub login of 1 to 39 letters, numbers, or hyphens.",
+                "github_reviewer_invalid",
+            )
+            .into_response();
+        }
     };
 
     let settings = state.server_settings();
@@ -152,7 +173,7 @@ async fn list_review_requests(
 mod tests {
     use fabro_types::{AuthMethod, IdpIdentity, Principal};
 
-    use super::selected_reviewer;
+    use super::{ReviewerSelectionError, selected_reviewer};
 
     fn user(login: &str, auth_method: AuthMethod) -> fabro_types::UserPrincipal {
         let Principal::User(user) = Principal::user(
@@ -167,20 +188,42 @@ mod tests {
     }
 
     #[test]
-    fn github_session_selects_its_own_login() {
+    fn github_session_uses_its_own_login_and_ignores_an_explicit_override() {
         assert_eq!(
             selected_reviewer(&user("maecapozzi", AuthMethod::Github), None).as_deref(),
-            Some("maecapozzi")
+            Ok("maecapozzi")
+        );
+        assert_eq!(
+            selected_reviewer(
+                &user("maecapozzi", AuthMethod::Github),
+                Some("another-user")
+            )
+            .as_deref(),
+            Ok("maecapozzi")
         );
     }
 
     #[test]
     fn non_github_session_requires_an_explicit_reviewer() {
         let user = user("operator", AuthMethod::DevToken);
-        assert_eq!(selected_reviewer(&user, None), None);
+        assert_eq!(
+            selected_reviewer(&user, None),
+            Err(ReviewerSelectionError::Required)
+        );
         assert_eq!(
             selected_reviewer(&user, Some("  maecapozzi ")).as_deref(),
-            Some("maecapozzi")
+            Ok("maecapozzi")
         );
+    }
+
+    #[test]
+    fn non_github_session_rejects_invalid_explicit_logins() {
+        let user = user("operator", AuthMethod::DevToken);
+        for reviewer in ["", "owner/name", "mae--capozzi", &"a".repeat(40)] {
+            assert_eq!(
+                selected_reviewer(&user, Some(reviewer)),
+                Err(ReviewerSelectionError::Invalid)
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 
 import type { ReviewRequestListResponse } from "../lib/queries";
-import { ReviewRequestsView } from "./review-requests";
+import { ReviewerForm, ReviewRequestsView } from "./review-requests";
 
 const response: ReviewRequestListResponse = {
   data: [
@@ -113,5 +113,48 @@ describe("ReviewRequestsView", () => {
     expect(rendered).toContain("No review requests found in the available results");
     expect(rendered).toContain("does not prove that your full review queue is empty");
     expect(rendered).not.toContain("No pull requests are awaiting your review");
+  });
+});
+
+describe("ReviewerForm", () => {
+  test("shows a validation error and submits a corrected login", () => {
+    let submitted = "";
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    act(() => {
+      renderer = TestRenderer.create(
+        <ReviewerForm
+          value="owner/name"
+          error="Reviewer must be a valid GitHub login."
+          onChange={() => {}}
+          onSubmit={(value) => {
+            submitted = value;
+          }}
+        />,
+      );
+    });
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Reviewer must be a valid GitHub login.",
+    );
+    expect(renderer!.root.findByType("input").props["aria-invalid"]).toBe(true);
+
+    act(() => {
+      renderer!.update(
+        <ReviewerForm
+          value="mae-capozzi"
+          onChange={() => {}}
+          onSubmit={(value) => {
+            submitted = value;
+          }}
+        />,
+      );
+    });
+    act(() => {
+      renderer!.root.findByType("form").props.onSubmit({
+        preventDefault() {},
+      });
+    });
+
+    expect(submitted).toBe("mae-capozzi");
   });
 });

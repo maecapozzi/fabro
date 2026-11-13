@@ -175,42 +175,87 @@ export function ReviewRequestsView({
   );
 }
 
+export function ReviewerForm({
+  value,
+  error,
+  onChange,
+  onSubmit,
+}: {
+  value: string;
+  error?: string;
+  onChange: (value: string) => void;
+  onSubmit: (value: string) => void;
+}) {
+  return (
+    <form
+      className="mx-auto max-w-md space-y-4 rounded-lg border border-line bg-panel p-6"
+      onSubmit={(event) => {
+        event.preventDefault();
+        const reviewer = value.trim();
+        if (reviewer) onSubmit(reviewer);
+      }}
+    >
+      <div>
+        <label htmlFor="reviewer" className="text-sm font-medium text-fg">
+          GitHub reviewer
+        </label>
+        <p className="mt-1 text-sm text-fg-3">
+          This sign-in does not include a GitHub identity. Enter your GitHub login explicitly.
+        </p>
+      </div>
+      {error ? (
+        <p id="reviewer-error" role="alert" className="text-sm text-red-300">
+          {error}
+        </p>
+      ) : null}
+      <input
+        id="reviewer"
+        name="reviewer"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={INPUT_CLASS}
+        autoComplete="username"
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? "reviewer-error" : undefined}
+        required
+      />
+      <button type="submit" className={SECONDARY_BUTTON_CLASS}>Show review requests</button>
+    </form>
+  );
+}
+
 export default function ReviewRequestsRoute() {
   const auth = useAuthMe();
   const needsReviewer = auth.data?.provider !== "github";
   const [reviewerInput, setReviewerInput] = useState("");
   const [reviewer, setReviewer] = useState<string | undefined>();
-  const queue = useReviewRequests(needsReviewer ? reviewer : undefined);
+  const queue = useReviewRequests(
+    needsReviewer ? reviewer : undefined,
+    !needsReviewer || Boolean(reviewer),
+  );
+  const reviewerError =
+    needsReviewer &&
+    reviewer &&
+    !queue.data &&
+    queue.error instanceof ApiError &&
+    queue.error.status === 400
+      ? queue.error.message
+      : undefined;
 
-  if (needsReviewer && !reviewer) {
+  if (needsReviewer && (!reviewer || reviewerError)) {
     return (
-      <form
-        className="mx-auto max-w-md space-y-4 rounded-lg border border-line bg-panel p-6"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const value = reviewerInput.trim();
-          if (value) setReviewer(value);
+      <ReviewerForm
+        value={reviewerInput}
+        error={reviewerError}
+        onChange={setReviewerInput}
+        onSubmit={(value) => {
+          if (value === reviewer) {
+            void queue.mutate();
+          } else {
+            setReviewer(value);
+          }
         }}
-      >
-        <div>
-          <label htmlFor="reviewer" className="text-sm font-medium text-fg">
-            GitHub reviewer
-          </label>
-          <p className="mt-1 text-sm text-fg-3">
-            This sign-in does not include a GitHub identity. Enter your GitHub login explicitly.
-          </p>
-        </div>
-        <input
-          id="reviewer"
-          name="reviewer"
-          value={reviewerInput}
-          onChange={(event) => setReviewerInput(event.target.value)}
-          className={INPUT_CLASS}
-          autoComplete="username"
-          required
-        />
-        <button type="submit" className={SECONDARY_BUTTON_CLASS}>Show review requests</button>
-      </form>
+      />
     );
   }
 
