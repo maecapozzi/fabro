@@ -15,6 +15,7 @@ import * as AutomationsNew from "./routes/automations-new";
 import * as AutomationsEdit from "./routes/automations-edit";
 import * as AutomationDetail from "./routes/automation-detail";
 import * as Runs from "./routes/runs";
+import * as ReviewRequests from "./routes/review-requests";
 import * as RunDetail from "./routes/run-detail";
 import * as RunOverview from "./routes/run-overview";
 import * as RunStages from "./routes/run-stages";
@@ -123,6 +124,7 @@ export const routes: RouteObject[] = [
           // Backwards-compatible singular automation route used by older links.
           route("automation/:id", AutomationDetail),
           route("runs", Runs),
+          route("review-requests", ReviewRequests),
           route("runs/:id", RunDetail, {
             children: [
               indexRoute(RunOverview),

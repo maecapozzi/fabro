@@ -11,6 +11,7 @@ api/integrations-api.ts
 api/mcpservers-api.ts
 api/models-api.ts
 api/repos-api.ts
+api/review-requests-api.ts
 api/run-internals-api.ts
 api/run-outputs-api.ts
 api/runs-api.ts
@@ -367,6 +368,11 @@ models/repo-check-response-permissions.ts
 models/repo-check-response.ts
 models/repository-ref.ts
 models/resolved-automation-git-workflow-source.ts
+models/review-request-kind.ts
+models/review-request-list-meta.ts
+models/review-request-list-response.ts
+models/review-request-team-coverage.ts
+models/review-request.ts
 models/review-target-kind.ts
 models/review-target.ts
 models/rewind-request.ts

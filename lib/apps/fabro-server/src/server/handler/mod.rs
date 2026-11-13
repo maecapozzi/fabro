@@ -21,6 +21,7 @@ mod models;
 mod pair;
 mod petri;
 pub(in crate::server) mod pull_requests;
+mod review_requests;
 pub(in crate::server) mod runs;
 mod sandbox;
 mod sandboxes;
@@ -89,6 +90,7 @@ where
 pub(super) fn demo_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/runs", get(demo::list_runs).post(demo::create_run_stub))
+        .route("/review-requests", get(demo::list_review_requests))
         .route("/runs/resolve", get(demo::resolve_run))
         .route("/attach", get(demo::attach_events_stub))
         .route("/runs/{id}", get(demo::get_run_status))
@@ -207,6 +209,7 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .merge(events::routes())
         .merge(usage::routes())
         .merge(pull_requests::routes())
+        .merge(review_requests::routes())
         .merge(artifacts::routes())
         .merge(automations::routes())
         .merge(mcp_servers::routes())

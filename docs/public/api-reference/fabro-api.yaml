@@ -15,6 +15,8 @@ tags:
     description: Browser authentication
   - name: Runs
     description: Run management operations
+  - name: Review Requests
+    description: Read-only personal GitHub review queue
   - name: Automations
     description: Server-managed automation definitions and automation-triggered runs
   - name: Environments
@@ -84,6 +86,69 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/review-requests:
+    get:
+      operationId: listReviewRequests
+      tags: [Review Requests]
+      summary: List pull requests awaiting review
+      description: >
+        Returns open GitHub pull requests with a current direct review request
+        for the selected user, plus team requests when the configured GitHub
+        credential can establish team membership. Results are independent of
+        Fabro runs and aggregate pull request review state.
+      parameters:
+        - name: reviewer
+          in: query
+          required: false
+          description: >
+            Explicit GitHub login. Required when the authenticated Fabro
+            principal does not carry a GitHub identity.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current personal review queue
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewRequestListResponse"
+        "400":
+          description: A reviewer could not be selected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: GitHub denied access
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: GitHub rate limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: GitHub credentials are unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: GitHub request failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /install/session:
     get:
@@ -13860,6 +13925,93 @@ components:
           format: uri
           description: Computed GitHub web URL for the pull request.
           example: https://github.com/fabro-sh/fabro/pull/123
+
+    ReviewRequestKind:
+      type: string
+      description: How the selected user is currently requested to review.
+      enum:
+        - direct
+        - team
+        - direct_and_team
+
+    ReviewRequestTeamCoverage:
+      type: string
+      description: Whether the configured credential could enumerate the selected user's teams.
+      enum:
+        - complete
+        - limited
+
+    ReviewRequest:
+      type: object
+      required:
+        - owner
+        - repository
+        - number
+        - title
+        - author
+        - html_url
+        - draft
+        - request_kind
+        - teams
+        - updated_at
+      properties:
+        owner:
+          type: string
+        repository:
+          type: string
+        number:
+          type: integer
+          format: int64
+        title:
+          type: string
+        author:
+          type: string
+        html_url:
+          type: string
+          format: uri
+        draft:
+          type: boolean
+        request_kind:
+          $ref: "#/components/schemas/ReviewRequestKind"
+        teams:
+          type: array
+          items:
+            type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    ReviewRequestListMeta:
+      type: object
+      required:
+        - reviewer
+        - fetched_at
+        - incomplete
+        - team_coverage
+      properties:
+        reviewer:
+          type: string
+        fetched_at:
+          type: string
+          format: date-time
+        incomplete:
+          type: boolean
+          description: True when GitHub search limits or inaccessible candidate details prevented exhaustive results.
+        team_coverage:
+          $ref: "#/components/schemas/ReviewRequestTeamCoverage"
+
+    ReviewRequestListResponse:
+      type: object
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReviewRequest"
+        meta:
+          $ref: "#/components/schemas/ReviewRequestListMeta"
 
     PullRequest:
       description: Stored pull request link plus optional live GitHub details.

@@ -14,6 +14,7 @@ import {
   InstallApi,
   MCPServersApi,
   ModelsApi,
+  ReviewRequestsApi,
   RunInternalsApi,
   RunOutputsApi,
   RunsApi,
@@ -109,6 +110,11 @@ export const installApi = new InstallApi(
   generatedAxios,
 );
 export const modelsApi = new ModelsApi(
+  generatedApiConfiguration,
+  "",
+  generatedAxios,
+);
+export const reviewRequestsApi = new ReviewRequestsApi(
   generatedApiConfiguration,
   "",
   generatedAxios,

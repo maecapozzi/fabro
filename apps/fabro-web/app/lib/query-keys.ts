@@ -85,6 +85,9 @@ export const queryKeys = {
     updateTitle: (id: string) => ["runs", "update-title", id] as const,
     attachUrl: (id: string) => `/api/v1/runs/${pathSegment(id)}/attach`,
   },
+  reviewRequests: {
+    list: (reviewer?: string) => ["review-requests", reviewer ?? null] as const,
+  },
   workflows: {
     list: () => ["workflows", "list"] as const,
     detail: (name: string) => ["workflows", "detail", name] as const,

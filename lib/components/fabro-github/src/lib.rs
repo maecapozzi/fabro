@@ -13,6 +13,7 @@ use crate::token_source::SecretString;
 
 pub mod access;
 pub mod identity;
+pub mod review_queue;
 pub mod token_source;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -22,6 +23,9 @@ pub(crate) mod tests_mock;
 
 pub use access::GitHubRepositoryAccess;
 pub use identity::GitHubAccountIdentity;
+pub use review_queue::{
+    ReviewQueue, ReviewQueueError, ReviewQueueItem, ReviewRequestKind, TeamCoverage,
+};
 
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 

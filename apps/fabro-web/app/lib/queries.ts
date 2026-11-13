@@ -22,6 +22,8 @@ import type {
   PaginatedRunStageList,
   PaginatedWorkflowListResponse,
   ProviderList,
+  ReviewRequest,
+  ReviewRequestListResponse,
   PullRequestResponse,
   RunArtifactListResponse,
   RunProjection,
@@ -57,6 +59,7 @@ import {
   insightsApi,
   mcpServersApi,
   modelsApi,
+  reviewRequestsApi,
   runInternalsApi,
   runOutputsApi,
   runsApi,
@@ -363,6 +366,19 @@ export function useRunPullRequest(id: string | undefined) {
   return useSWR<PullRequestResponse | null>(
     id ? queryKeys.runs.pullRequest(id) : null,
     () => apiNullableData(() => runsApi.getRunPullRequest(id!)),
+  );
+}
+
+export type { ReviewRequest, ReviewRequestListResponse };
+
+export function useReviewRequests(reviewer?: string) {
+  return useSWR<ReviewRequestListResponse>(
+    queryKeys.reviewRequests.list(reviewer),
+    () => apiData(() => reviewRequestsApi.listReviewRequests(reviewer)),
+    {
+      keepPreviousData: true,
+      revalidateOnFocus: true,
+    },
   );
 }
 

@@ -55,6 +55,44 @@ pub(crate) async fn list_runs(
     paginated_response(runs::summaries(), &pagination)
 }
 
+pub(crate) async fn list_review_requests(_auth: RequiredUser) -> Response {
+    Json(json!({
+        "data": [
+            {
+                "owner": "fabro-sh",
+                "repository": "fabro",
+                "number": 418,
+                "title": "Add a personal review queue",
+                "author": "octocat",
+                "html_url": "https://github.com/fabro-sh/fabro/pull/418",
+                "draft": false,
+                "request_kind": "direct_and_team",
+                "teams": ["fabro-sh/platform"],
+                "updated_at": "2026-11-13T12:00:00Z"
+            },
+            {
+                "owner": "acme",
+                "repository": "payments",
+                "number": 73,
+                "title": "Rotate checkout credentials",
+                "author": "hubot",
+                "html_url": "https://github.com/acme/payments/pull/73",
+                "draft": true,
+                "request_kind": "team",
+                "teams": ["acme/security"],
+                "updated_at": "2026-11-12T12:00:00Z"
+            }
+        ],
+        "meta": {
+            "reviewer": "octocat",
+            "fetched_at": "2026-11-13T12:01:00Z",
+            "incomplete": false,
+            "team_coverage": "complete"
+        }
+    }))
+    .into_response()
+}
+
 pub(crate) async fn create_run_stub(
     _auth: RequiredUser,
     State(_state): State<Arc<AppState>>,

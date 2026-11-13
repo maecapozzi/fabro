@@ -8783,6 +8783,35 @@ async fn interrupt_without_a_worker_channel_returns_unavailable() {
 }
 
 #[tokio::test]
+async fn review_requests_require_an_explicit_reviewer_without_github_identity() {
+    let app = crate::test_support::build_test_router(test_app_state());
+    let request = Request::builder()
+        .uri(api("/review-requests"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(body["errors"][0]["code"], "github_reviewer_required");
+}
+
+#[tokio::test]
+async fn review_requests_distinguish_missing_github_credentials_from_an_empty_queue() {
+    let state = create_github_token_app_state(None, None);
+    let app = crate::test_support::build_test_router(state);
+    let request = Request::builder()
+        .uri(api("/review-requests?reviewer=maecapozzi"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(body["errors"][0]["code"], "github_credentials_unavailable");
+}
+
+#[tokio::test]
 async fn get_graph_returns_svg() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
