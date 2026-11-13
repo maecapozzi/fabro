@@ -37,12 +37,13 @@ import {
 import { RunsListView } from "../components/runs-list/runs-list-view";
 import { mutateRunListCaches } from "../lib/board-cache";
 import { shouldRefreshBoardForEvent, useBoardEvents } from "../lib/board-events";
-import { useAllRuns, useAuthConfig, useRunsPage, useSystemInfo } from "../lib/queries";
+import { useAllRuns, useAuthConfig, useInReviewPullRequests, useRunsPage, useSystemInfo } from "../lib/queries";
 import { approveRun, archiveRuns, canArchive, mapError } from "../lib/run-actions";
 import { plural } from "../lib/plural";
 import { useToast } from "../components/toast";
 import type {
   BoardColumn,
+  InReviewPullRequest,
   ListRunsSortEnum,
   Run,
 } from "@qltysh/fabro-api-client";
@@ -613,6 +614,129 @@ function BoardColumnView({ column }: { column: Column }) {
   );
 }
 
+export function filterInReviewPullRequests(
+  pullRequests: InReviewPullRequest[],
+  query: string,
+  repoFilter: string,
+): InReviewPullRequest[] {
+  const lowerQuery = query.toLowerCase();
+  return pullRequests.filter((pullRequest) => {
+    const repository = `${pullRequest.owner}/${pullRequest.repo}`;
+    const matchesRepository =
+      repoFilter === "all"
+      || repoFilter === repository
+      || repoFilter === pullRequest.repo;
+    const matchesQuery =
+      !query
+      || pullRequest.title.toLowerCase().includes(lowerQuery)
+      || repository.toLowerCase().includes(lowerQuery)
+      || `#${pullRequest.number}`.includes(lowerQuery);
+    return matchesRepository && matchesQuery;
+  });
+}
+
+function InReviewCard({ pullRequest }: { pullRequest: InReviewPullRequest }) {
+  const repository = `${pullRequest.owner}/${pullRequest.repo}`;
+  return (
+    <article className="rounded-md border border-line bg-panel p-4 transition-all duration-200 hover:border-line-strong hover:shadow-lg hover:shadow-black/20">
+      <div className="mb-2 flex min-w-0 items-center gap-2">
+        <span className="min-w-0 truncate font-mono text-xs font-medium text-teal-500">
+          {repository}
+        </span>
+        {pullRequest.draft ? (
+          <span className="shrink-0 rounded-full border border-fg-muted/30 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-fg-muted">
+            Draft
+          </span>
+        ) : null}
+        <a
+          href={pullRequest.html_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ml-auto shrink-0 font-mono text-xs text-violet-300 hover:text-violet-200"
+          aria-label={`Open ${repository} pull request ${pullRequest.number} on GitHub`}
+        >
+          #{pullRequest.number}
+        </a>
+      </div>
+      <a
+        href={pullRequest.html_url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="block text-sm font-medium leading-snug text-fg-2 hover:text-fg"
+      >
+        {pullRequest.title}
+      </a>
+      {pullRequest.run_ids.length > 0 ? (
+        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-line pt-3">
+          <span className="mr-0.5 text-[10px] uppercase tracking-wide text-fg-muted">
+            {pullRequest.run_ids.length === 1 ? "Run" : "Runs"}
+          </span>
+          {pullRequest.run_ids.map((runId) => (
+            <Link
+              key={runId}
+              to={`/runs/${runId}`}
+              className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] text-teal-500 hover:border-teal-500/40 hover:text-teal-300"
+            >
+              {runId.slice(-6)}
+            </Link>
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function InReviewColumn({
+  pullRequests,
+  loading,
+  error,
+  partialWarning,
+}: {
+  pullRequests: InReviewPullRequest[];
+  loading: boolean;
+  error: boolean;
+  partialWarning?: string | null;
+}) {
+  return (
+    <div className="flex min-w-0 flex-col" data-testid="in-review-column">
+      <div className="mb-3 flex items-center gap-3">
+        <div className="h-2.5 w-2.5 rounded-full bg-violet-400" />
+        <h3 className="text-sm font-semibold tracking-wide text-fg-2">In review</h3>
+        <span className="rounded-full bg-overlay px-2 py-0.5 font-mono text-xs text-fg-muted">
+          {pullRequests.length}
+        </span>
+      </div>
+      <div className="flex flex-1 flex-col gap-3">
+        {partialWarning ? (
+          <div className="rounded-md border border-amber/20 bg-amber/5 px-3 py-2 text-xs text-amber">
+            Partial results: {partialWarning}
+          </div>
+        ) : null}
+        {loading ? (
+          <div className="rounded-md border border-line bg-panel/60 px-4 py-6 text-center text-xs text-fg-muted">
+            Loading pull requests…
+          </div>
+        ) : error ? (
+          <div className="rounded-md border border-coral/20 bg-coral/5 px-4 py-4 text-xs text-coral">
+            Open pull requests are unavailable. Your runs are still up to date.
+          </div>
+        ) : pullRequests.length === 0 ? (
+          <div className="rounded-md border border-dashed border-line px-4 py-6 text-center text-xs text-fg-muted">
+            No open pull requests
+          </div>
+        ) : (
+          pullRequests.map((pullRequest) => (
+            <InReviewCard
+              key={`${pullRequest.owner}/${pullRequest.repo}#${pullRequest.number}`}
+              pullRequest={pullRequest}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TerminalLine({ prompt, command }: { prompt: string; command: string }) {
   return (
     <div className="flex items-center gap-2 font-mono text-sm">
@@ -760,6 +884,7 @@ export default function Runs() {
   } = useRunsWorkspacePreferences();
 
   const boardRuns = useAllRuns({ includeArchived }, view === "columns");
+  const inReviewPullRequests = useInReviewPullRequests(view === "columns");
   const listRunsPage = useRunsPage(
     {
       includeArchived,
@@ -774,6 +899,7 @@ export default function Runs() {
   const systemInfo = useSystemInfo();
   const isLandingReady =
     boardRuns.data !== undefined &&
+    !inReviewPullRequests.isLoading &&
     authConfig.data !== undefined &&
     systemInfo.data !== undefined;
   const initialColumns = useMemo(
@@ -791,7 +917,14 @@ export default function Runs() {
     view === "list"
       ? (listRunsPage.data?.data ?? []).map(mapRunListItem)
       : initialColumns.flatMap((col: Column) => col.items);
-  const allRepos = buildFilterOptions(filterSourceItems, (item) => item.repo, repoFilter);
+  const allRepos = Array.from(new Set([
+    ...buildFilterOptions(filterSourceItems, (item) => item.repo, repoFilter),
+    ...(view === "columns"
+      ? (inReviewPullRequests.data?.data ?? []).map(
+          (pullRequest) => `${pullRequest.owner}/${pullRequest.repo}`,
+        )
+      : []),
+  ])).sort();
   const allWorkflows = buildFilterOptions(
     filterSourceItems,
     (item) => item.workflow,
@@ -857,6 +990,17 @@ export default function Runs() {
   const visibleColumns = placeArchivedColumnLast(statusVisibleColumns, includeArchived).filter(
     (col) => col.id !== "pending" || col.items.length > 0,
   );
+  const filteredPullRequests = filterInReviewPullRequests(
+    inReviewPullRequests.data?.data ?? [],
+    query,
+    repoFilter,
+  );
+  const reviewColumnIndex = visibleColumns.findIndex((column) => column.id === "succeeded");
+  const columnsBeforeReview =
+    reviewColumnIndex === -1 ? visibleColumns : visibleColumns.slice(0, reviewColumnIndex);
+  const columnsAfterReview =
+    reviewColumnIndex === -1 ? [] : visibleColumns.slice(reviewColumnIndex);
+  const totalBoardItems = totalRuns + (inReviewPullRequests.data?.data.length ?? 0);
 
   return (
     <>
@@ -888,16 +1032,33 @@ export default function Runs() {
             <>
               <div
                 className={`flex min-h-0 gap-5 overflow-x-auto pb-4 ${
-                  isLandingReady && totalRuns === 0 ? "" : "flex-1"
+                  isLandingReady && totalBoardItems === 0 ? "" : "flex-1"
                 }`}
               >
-                {visibleColumns.map((col) => (
+                {columnsBeforeReview.map((col) => (
+                  <div key={col.id} className="w-72 shrink-0">
+                    <BoardColumnView column={col} />
+                  </div>
+                ))}
+                <div className="w-72 shrink-0">
+                  <InReviewColumn
+                    pullRequests={filteredPullRequests}
+                    loading={inReviewPullRequests.isLoading}
+                    error={inReviewPullRequests.error != null}
+                    partialWarning={
+                      inReviewPullRequests.data?.meta.status === "partial"
+                        ? inReviewPullRequests.data.meta.warning
+                        : null
+                    }
+                  />
+                </div>
+                {columnsAfterReview.map((col) => (
                   <div key={col.id} className="w-72 shrink-0">
                     <BoardColumnView column={col} />
                   </div>
                 ))}
               </div>
-              {isLandingReady && totalRuns === 0 ? (
+              {isLandingReady && totalBoardItems === 0 ? (
                 <RunsLandingEmpty
                   hasGitHubAuth={hasGitHubAuth}
                   serverUrl={serverUrl}
