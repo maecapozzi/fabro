@@ -4,6 +4,7 @@ import type { BoardColumn, Run } from "@qltysh/fabro-api-client";
 import {
   buildBoardColumns,
   buildFilterOptions,
+  filterInReviewPullRequests,
   loadStoredRunsWorkspaceSearchParams,
   placeArchivedColumnLast,
   persistRunsWorkspacePreferences,
@@ -70,6 +71,39 @@ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
 }
 
 describe("runs route board mapping", () => {
+  test("filters the In review column by repository, title, and pull request number", () => {
+    const pullRequests = [
+      {
+        owner:      "acme",
+        repo:       "widgets",
+        number:     42,
+        title:      "Polish the Runs board",
+        html_url:   "https://github.com/acme/widgets/pull/42",
+        draft:      true,
+        updated_at: "2026-04-19T12:00:00Z",
+        run_ids:    ["run-1"],
+      },
+      {
+        owner:      "acme",
+        repo:       "docs",
+        number:     9,
+        title:      "Document workflows",
+        html_url:   "https://github.com/acme/docs/pull/9",
+        draft:      false,
+        updated_at: "2026-04-18T12:00:00Z",
+        run_ids:    [],
+      },
+    ];
+
+    expect(filterInReviewPullRequests(pullRequests, "#42", "all")).toEqual([
+      pullRequests[0],
+    ]);
+    expect(filterInReviewPullRequests(pullRequests, "", "acme/docs")).toEqual([
+      pullRequests[1],
+    ]);
+    expect(filterInReviewPullRequests(pullRequests, "runs board", "all")[0]?.draft).toBe(true);
+  });
+
   test("keeps blocked runs in the blocked lane and preserves question text", () => {
     const columns = buildBoardColumns(
       {

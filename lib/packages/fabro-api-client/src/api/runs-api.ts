@@ -46,6 +46,8 @@ import type { ForkRequest } from '../models';
 // @ts-ignore
 import type { ForkResponse } from '../models';
 // @ts-ignore
+import type { InReviewPullRequestListResponse } from '../models';
+// @ts-ignore
 import type { LinkRunPullRequestRequest } from '../models';
 // @ts-ignore
 import type { MergeRunPullRequestRequest } from '../models';
@@ -792,6 +794,42 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
             localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
             localVarRequestOptions.data = serializeDataIfNeeded(linkRunPullRequestRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * Lists open GitHub pull requests authored by the signed-in GitHub user, including drafts, across repositories visible to the server\'s authenticated GitHub credential. Pull requests linked to one or more Fabro runs include those run IDs. A partial response preserves pages fetched before a later GitHub pagination failure.
+         * @summary List the current user\'s open pull requests
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        listInReviewPullRequests: async (options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            const localVarPath = `/api/v1/runs/in-review`;
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
 
             return {
                 url: toPathString(localVarUrlObj),
@@ -1813,6 +1851,18 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
+         * Lists open GitHub pull requests authored by the signed-in GitHub user, including drafts, across repositories visible to the server\'s authenticated GitHub credential. Pull requests linked to one or more Fabro runs include those run IDs. A partial response preserves pages fetched before a later GitHub pagination failure.
+         * @summary List the current user\'s open pull requests
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async listInReviewPullRequests(options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<InReviewPullRequestListResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.listInReviewPullRequests(options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['RunsApi.listInReviewPullRequests']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
          * Returns durable run summaries from the backing store, including runs persisted before the current server boot. Supports per-status filtering and sorting for both list and kanban renderings. Archived runs are hidden by default; pass `include_archived=true` (or `status=archived`) to include them. Runs in the `removing` bucket are hidden unless explicitly requested via `status=removing`.
          * @summary List Runs
          * @param {number} [pageLimit] Maximum number of items to return per page.
@@ -2243,6 +2293,15 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.linkRunPullRequest(id, linkRunPullRequestRequest, options).then((request) => request(axios, basePath));
         },
         /**
+         * Lists open GitHub pull requests authored by the signed-in GitHub user, including drafts, across repositories visible to the server\'s authenticated GitHub credential. Pull requests linked to one or more Fabro runs include those run IDs. A partial response preserves pages fetched before a later GitHub pagination failure.
+         * @summary List the current user\'s open pull requests
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        listInReviewPullRequests(options?: RawAxiosRequestConfig): AxiosPromise<InReviewPullRequestListResponse> {
+            return localVarFp.listInReviewPullRequests(options).then((request) => request(axios, basePath));
+        },
+        /**
          * Returns durable run summaries from the backing store, including runs persisted before the current server boot. Supports per-status filtering and sorting for both list and kanban renderings. Archived runs are hidden by default; pass `include_archived=true` (or `status=archived`) to include them. Runs in the `removing` bucket are hidden unless explicitly requested via `status=removing`.
          * @summary List Runs
          * @param {number} [pageLimit] Maximum number of items to return per page.
@@ -2631,6 +2690,16 @@ export class RunsApi extends BaseAPI {
      */
     public linkRunPullRequest(id: string, linkRunPullRequestRequest: LinkRunPullRequestRequest, options?: RawAxiosRequestConfig) {
         return RunsApiFp(this.configuration).linkRunPullRequest(id, linkRunPullRequestRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Lists open GitHub pull requests authored by the signed-in GitHub user, including drafts, across repositories visible to the server\'s authenticated GitHub credential. Pull requests linked to one or more Fabro runs include those run IDs. A partial response preserves pages fetched before a later GitHub pagination failure.
+     * @summary List the current user\'s open pull requests
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public listInReviewPullRequests(options?: RawAxiosRequestConfig) {
+        return RunsApiFp(this.configuration).listInReviewPullRequests(options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

@@ -39,6 +39,7 @@ export const queryKeys = {
   runs: {
     all: (filters: object = {}) =>
       ["runs", "all", filters] as const,
+    inReview: () => ["runs", "in-review"] as const,
     page: (opts: object = {}) =>
       ["runs", "page", opts] as const,
     detail: (id: string) => ["runs", "detail", id] as const,
