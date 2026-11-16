@@ -73,6 +73,30 @@ const pageRuns: PaginatedRunList = {
   data: [run("run-1")],
   meta: { has_more: false, total: 1 },
 };
+const completeInReviewQuery = {
+  data: {
+    data: [
+      {
+        owner:      "qlty",
+        repo:       "fabro",
+        number:     42,
+        title:      "Show authored pull requests on Runs",
+        html_url:   "https://github.com/qlty/fabro/pull/42",
+        draft:      true,
+        updated_at: "2026-04-19T12:00:00Z",
+        run_ids:    ["run-1"],
+      },
+    ],
+    meta: { author: "octocat", status: "complete", warning: null },
+  },
+  isLoading: false,
+  error:     undefined,
+};
+let inReviewQuery: {
+  data?: typeof completeInReviewQuery.data;
+  isLoading: boolean;
+  error?: Error;
+} = completeInReviewQuery;
 
 const queryCalls: Array<{ hook: string; args: unknown[] }> = [];
 const BOARD_REFRESH_EVENTS = new Set([
@@ -125,6 +149,7 @@ mock.module("../lib/queries", () => ({
       mutate:       () => Promise.resolve(pageRuns),
     };
   },
+  useInReviewPullRequests: () => inReviewQuery,
   useAuthConfig: () => ({ data: { methods: ["github"] } }),
   useSystemInfo: () => ({ data: { server_url: "http://127.0.0.1:32276" } }),
 }));
@@ -236,6 +261,7 @@ beforeEach(() => {
   teardownReactEnv = setupReactTestEnv();
   installWindow();
   queryCalls.length = 0;
+  inReviewQuery = completeInReviewQuery;
 });
 
 afterEach(() => {
@@ -248,6 +274,54 @@ afterEach(() => {
 });
 
 describe("Runs workspace preference restoration", () => {
+  test("columns view renders authored pull requests in a distinct In review column", async () => {
+    const { renderer } = await renderRuns("/runs?view=columns");
+    await flushEffects();
+
+    renderer.root.findByProps({ "data-testid": "in-review-column" });
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("In review");
+    expect(rendered).toContain("Show authored pull requests on Runs");
+    expect(rendered).toContain("Draft");
+    expect(rendered).toContain("Open qlty/fabro pull request 42 on GitHub");
+    expect(rendered).toContain("run-1".slice(-6));
+  });
+
+  test("an In review failure leaves run columns usable and shows a scoped error", async () => {
+    inReviewQuery = {
+      data:      undefined,
+      isLoading: false,
+      error:     new Error("GitHub unavailable"),
+    };
+
+    const { renderer } = await renderRuns("/runs?view=columns");
+    await flushEffects();
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("Open pull requests are unavailable");
+    expect(rendered).toContain("Run run-1");
+    expect(rendered).toContain("Succeeded");
+  });
+
+  test("the In review column labels partial GitHub results", async () => {
+    inReviewQuery = {
+      ...completeInReviewQuery,
+      data: {
+        ...completeInReviewQuery.data,
+        meta: {
+          author:  "octocat",
+          status:  "partial",
+          warning: "GitHub search stopped after page 1.",
+        },
+      },
+    };
+
+    const { renderer } = await renderRuns("/runs?view=columns");
+    await flushEffects();
+
+    expect(JSON.stringify(renderer.toJSON())).toContain("Partial results");
+  });
+
   test("/runs with stored list view renders list mode", async () => {
     storage.setItem(
       RUNS_PREFERENCES_STORAGE_KEY,

@@ -60,6 +60,13 @@ mock.module("@headlessui/react", () => ({
 
 mock.module("../lib/queries", () => ({
   useAllRuns: () => ({ data: { data: currentBoardRuns }, isLoading: false }),
+  useInReviewPullRequests: () => ({
+    data: {
+      data: [],
+      meta: { author: "octocat", status: "complete", warning: null },
+    },
+    isLoading: false,
+  }),
   useRunsPage: () => ({ data: null, isLoading: false }),
   useAuthConfig: () => ({ data: { methods: [] } }),
   useSystemInfo: () => ({ data: null }),

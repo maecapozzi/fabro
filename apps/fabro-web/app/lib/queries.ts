@@ -11,6 +11,7 @@ import type {
   CommandLogResponse,
   Environment,
   EnvironmentListResponse,
+  InReviewPullRequestListResponse,
   ListRunsDirectionEnum,
   ListRunsSortEnum,
   McpServer,
@@ -158,6 +159,18 @@ export function useAllRuns(filters: RunsListFilters = {}, enabled = true) {
           ),
         ),
       ),
+  );
+}
+
+export function useInReviewPullRequests(enabled = true) {
+  return useSWR<InReviewPullRequestListResponse>(
+    enabled ? queryKeys.runs.inReview() : null,
+    () => apiData(() => runsApi.listInReviewPullRequests()),
+    {
+      refreshInterval: 60_000,
+      revalidateOnFocus: true,
+      shouldRetryOnError: false,
+    },
   );
 }
 
