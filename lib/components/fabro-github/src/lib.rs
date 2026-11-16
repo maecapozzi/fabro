@@ -2211,7 +2211,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authored_search_filters_archived_repositories_and_preserves_active_open_prs() {
+    async fn authored_search_requests_active_repositories_and_preserves_open_prs() {
+        let body = serde_json::json!({
+            "total_count": 1,
+            "items": [
+                search_issue("acme", "active", 1, "open", true, None),
+            ],
+        })
+        .to_string();
+        let mock = MockHttpClient::new().on(
+            HttpMethod::Get,
+            "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
+            200,
+            &body,
+        );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("authored search should succeed");
+
+        assert_eq!(result.author, "octocat");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].repo, "active");
+        assert!(result.items[0].draft);
+        assert!(!result.partial);
+    }
+
+    #[tokio::test]
+    async fn authored_search_keeps_drafts_while_excluding_closed_and_merged() {
         let body = serde_json::json!({
             "total_count": 4,
             "items": [
@@ -2252,7 +2284,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authored_search_returns_empty_when_archived_filter_has_no_active_matches() {
+    async fn authored_search_returns_empty_when_only_archived_repositories_match() {
+        // GitHub applies `archived:false` before returning search results, so
+        // an archived-only synthetic result set is represented by no items.
         let body = serde_json::json!({
             "total_count": 0,
             "items": [],
