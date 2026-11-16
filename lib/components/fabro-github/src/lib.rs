@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::num::NonZeroU64;
+
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -22,6 +25,7 @@ pub(crate) mod tests_mock;
 
 pub use access::GitHubRepositoryAccess;
 pub use identity::GitHubAccountIdentity;
+use identity::lookup_token_identity;
 
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 
@@ -110,6 +114,27 @@ pub enum PullRequestApiError {
     },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// One open pull request returned by the authenticated user's GitHub search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredPullRequest {
+    pub owner:      String,
+    pub repo:       String,
+    pub number:     NonZeroU64,
+    pub title:      String,
+    pub html_url:   String,
+    pub draft:      bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A complete or partially-complete authored pull request search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredPullRequestSearch {
+    pub author:  String,
+    pub items:   Vec<AuthoredPullRequest>,
+    pub partial: bool,
+    pub warning: Option<String>,
 }
 
 fn http_client() -> anyhow::Result<fabro_http::HttpClient> {
@@ -302,6 +327,209 @@ impl GitHubCredentials {
             Self::Installation(token) => token.valid_token().map(str::to_owned),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SearchIssuesResponse {
+    total_count:        u64,
+    #[serde(default)]
+    incomplete_results: bool,
+    items:              Vec<SearchIssue>,
+}
+
+#[derive(Deserialize)]
+struct SearchIssue {
+    repository_url: String,
+    number:         u64,
+    title:          String,
+    html_url:       String,
+    state:          String,
+    #[serde(default)]
+    draft:          bool,
+    updated_at:     DateTime<Utc>,
+    pull_request:   SearchIssuePullRequest,
+}
+
+#[derive(Deserialize)]
+struct SearchIssuePullRequest {
+    merged_at: Option<DateTime<Utc>>,
+}
+
+const SEARCH_PAGE_SIZE: usize = 100;
+const SEARCH_RESULT_LIMIT: u64 = 1_000;
+
+/// Search every repository visible to the configured user credential for open
+/// pull requests authored by that user. GitHub's search API caps a query at
+/// 1,000 results; reaching that cap is reported as a partial result.
+pub async fn search_open_authored_pull_requests(
+    ctx: &GitHubContext<'_>,
+    signed_in_github_login: Option<&str>,
+) -> anyhow::Result<AuthoredPullRequestSearch> {
+    let token = match ctx.creds {
+        GitHubCredentials::Pat(token) => token.clone(),
+        GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
+        GitHubCredentials::App(_) => {
+            bail!(
+                "GitHub App credentials cannot identify or search a user's authored pull requests"
+            )
+        }
+    };
+    let author = match signed_in_github_login
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+    {
+        Some(login) => login.to_string(),
+        None => {
+            lookup_token_identity(&ctx.http_client()?, &token, ctx.base_url)
+                .await?
+                .login
+        }
+    };
+    validate_search_login(&author)?;
+    search_open_authored_pull_requests_with_client(
+        &ctx.http_client()?,
+        &token,
+        ctx.base_url,
+        author,
+    )
+    .await
+}
+
+fn validate_search_login(login: &str) -> anyhow::Result<()> {
+    if login.is_empty()
+        || !login
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        bail!("GitHub returned an invalid login for authored pull request search");
+    }
+    Ok(())
+}
+
+async fn search_open_authored_pull_requests_with_client(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    author: String,
+) -> anyhow::Result<AuthoredPullRequestSearch> {
+    let auth = format!("Bearer {token}");
+    let mut page = 1_u64;
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut expected = None;
+    let mut partial = false;
+    let mut warning = None;
+
+    loop {
+        let url = format!(
+            "{base_url}/search/issues?q=is%3Apr+is%3Aopen+author%3A{author}&per_page={SEARCH_PAGE_SIZE}&page={page}"
+        );
+        let response = match client
+            .request(HttpMethod::Get, &url, &github_headers(&auth), None)
+            .await
+        {
+            Ok(response) => response,
+            Err(_err) if page > 1 => {
+                partial = true;
+                warning = Some(format!("GitHub search stopped after page {}.", page - 1));
+                break;
+            }
+            Err(err) => return Err(err).context("Failed to search GitHub pull requests"),
+        };
+        if response.status != 200 {
+            let message = format!(
+                "GitHub returned status {} searching pull requests",
+                response.status
+            );
+            if page == 1 {
+                bail!("{message}");
+            }
+            partial = true;
+            warning = Some(message);
+            break;
+        }
+
+        let search: SearchIssuesResponse = match response.json() {
+            Ok(search) => search,
+            Err(_err) if page > 1 => {
+                partial = true;
+                warning = Some(format!(
+                    "GitHub returned an invalid pull request search page {page}."
+                ));
+                break;
+            }
+            Err(err) => return Err(err).context("Failed to parse GitHub pull request search"),
+        };
+        expected.get_or_insert(search.total_count);
+        if search.incomplete_results {
+            partial = true;
+            warning = Some(
+                "GitHub reported incomplete search results; some open pull requests may be missing."
+                    .to_string(),
+            );
+        }
+        let page_len = search.items.len();
+        for item in search.items {
+            if item.state != "open" || item.pull_request.merged_at.is_some() {
+                continue;
+            }
+            let Some(number) = NonZeroU64::new(item.number) else {
+                partial = true;
+                warning = Some(
+                    "GitHub returned a pull request with an invalid pull request number."
+                        .to_string(),
+                );
+                continue;
+            };
+            let Some((owner, repo)) = repository_coordinates(&item.repository_url) else {
+                partial = true;
+                warning = Some(
+                    "GitHub returned a pull request with an invalid repository URL.".to_string(),
+                );
+                continue;
+            };
+            if seen.insert((owner.clone(), repo.clone(), number)) {
+                items.push(AuthoredPullRequest {
+                    owner,
+                    repo,
+                    number,
+                    title: item.title,
+                    html_url: item.html_url,
+                    draft: item.draft,
+                    updated_at: item.updated_at,
+                });
+            }
+        }
+
+        let total_count = expected.unwrap_or_default();
+        if page_len < SEARCH_PAGE_SIZE || page * SEARCH_PAGE_SIZE as u64 >= total_count {
+            break;
+        }
+        if page * SEARCH_PAGE_SIZE as u64 >= SEARCH_RESULT_LIMIT {
+            partial = true;
+            warning = Some(
+                "GitHub search returned more than 1,000 open pull requests; showing the first 1,000."
+                    .to_string(),
+            );
+            break;
+        }
+        page += 1;
+    }
+
+    items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(AuthoredPullRequestSearch {
+        author,
+        items,
+        partial,
+        warning,
+    })
+}
+
+fn repository_coordinates(repository_url: &str) -> Option<(String, String)> {
+    let path = repository_url.split_once("/repos/")?.1;
+    let (owner, repo) = path.split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty() && !repo.contains('/'))
+        .then(|| (owner.to_string(), repo.to_string()))
 }
 
 pub fn validate_static_github_token(token: &str) -> anyhow::Result<()> {
@@ -1961,6 +2189,179 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::tests_mock::{self, MockHttpClient};
+
+    fn search_issue(
+        owner: &str,
+        repo: &str,
+        number: u64,
+        state: &str,
+        draft: bool,
+        merged_at: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "repository_url": format!("https://api.github.test/repos/{owner}/{repo}"),
+            "number": number,
+            "title": format!("Pull request {number}"),
+            "html_url": format!("https://github.test/{owner}/{repo}/pull/{number}"),
+            "state": state,
+            "draft": draft,
+            "updated_at": format!("2026-01-{:02}T00:00:00Z", number % 28 + 1),
+            "pull_request": { "merged_at": merged_at },
+        })
+    }
+
+    #[tokio::test]
+    async fn authored_search_uses_author_and_keeps_drafts_while_excluding_closed_and_merged() {
+        let body = serde_json::json!({
+            "total_count": 4,
+            "items": [
+                search_issue("acme", "one", 1, "open", false, None),
+                search_issue("acme", "two", 2, "open", true, None),
+                search_issue("acme", "three", 3, "closed", false, None),
+                search_issue("acme", "four", 4, "open", false, Some("2026-01-04T00:00:00Z")),
+            ],
+        })
+        .to_string();
+        let mock = MockHttpClient::new().on(
+            HttpMethod::Get,
+            "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+            200,
+            &body,
+        );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("authored search should succeed");
+
+        assert_eq!(result.author, "octocat");
+        assert_eq!(result.items.len(), 2);
+        assert!(result.items.iter().any(|item| item.draft));
+        assert!(!result.partial);
+    }
+
+    #[tokio::test]
+    async fn authored_search_marks_incomplete_first_page_as_partial() {
+        let body = serde_json::json!({
+            "total_count": 1,
+            "incomplete_results": true,
+            "items": [
+                search_issue("acme", "one", 1, "open", false, None),
+            ],
+        })
+        .to_string();
+        let mock = MockHttpClient::new().on(
+            HttpMethod::Get,
+            "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+            200,
+            &body,
+        );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("incomplete search response should preserve returned items");
+
+        assert_eq!(result.items.len(), 1);
+        assert!(result.partial);
+        assert_eq!(
+            result.warning.as_deref(),
+            Some(
+                "GitHub reported incomplete search results; some open pull requests may be missing."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_search_paginates_and_deduplicates_pull_requests() {
+        let first_items = (1..=100)
+            .map(|number| search_issue("acme", "repo", number, "open", false, None))
+            .collect::<Vec<_>>();
+        let first = serde_json::json!({
+            "total_count": 102,
+            "items": first_items,
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "total_count": 102,
+            "items": [
+                search_issue("acme", "repo", 100, "open", false, None),
+                search_issue("acme", "repo", 101, "open", true, None),
+            ],
+        })
+        .to_string();
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+                200,
+                &first,
+            )
+            .on(
+                HttpMethod::Get,
+                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=2",
+                200,
+                &second,
+            );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("paginated search should succeed");
+
+        assert_eq!(result.items.len(), 101);
+        assert_eq!(mock.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn authored_search_returns_partial_items_when_a_later_page_fails() {
+        let first_items = (1..=100)
+            .map(|number| search_issue("acme", "repo", number, "open", false, None))
+            .collect::<Vec<_>>();
+        let first = serde_json::json!({
+            "total_count": 101,
+            "items": first_items,
+        })
+        .to_string();
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+                200,
+                &first,
+            )
+            .on(
+                HttpMethod::Get,
+                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=2",
+                502,
+                "",
+            );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("later-page failures should preserve earlier results");
+
+        assert_eq!(result.items.len(), 100);
+        assert!(result.partial);
+        assert!(result.warning.is_some());
+    }
 
     // -----------------------------------------------------------------------
     // create_installation_access_token — success

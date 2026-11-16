@@ -1228,6 +1228,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/runs/in-review:
+    get:
+      operationId: listInReviewPullRequests
+      tags: [Runs]
+      summary: List the current user's open pull requests
+      description: >
+        Lists open GitHub pull requests authored by the signed-in GitHub user,
+        including drafts, across repositories visible to the server's
+        authenticated GitHub credential. Pull requests linked to one or more
+        Fabro runs include those run IDs. A partial response preserves pages
+        fetched before a later GitHub pagination failure.
+      responses:
+        "200":
+          description: Open authored pull requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InReviewPullRequestListResponse"
+        "503":
+          description: GitHub credentials or the GitHub API are unavailable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/v1/runs/archive:
     post:
       operationId: batchArchiveRuns
@@ -7668,6 +7696,88 @@ components:
             $ref: "#/components/schemas/Run"
         meta:
           $ref: "#/components/schemas/PaginationMeta"
+
+    InReviewPullRequest:
+      description: An open GitHub pull request authored by the current user.
+      type: object
+      additionalProperties: false
+      required:
+        - owner
+        - repo
+        - number
+        - title
+        - html_url
+        - draft
+        - updated_at
+        - run_ids
+      properties:
+        owner:
+          type: string
+          example: fabro-sh
+        repo:
+          type: string
+          example: fabro
+        number:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 123
+        title:
+          type: string
+          example: Add the in-review Runs column
+        html_url:
+          type: string
+          format: uri
+          example: https://github.com/fabro-sh/fabro/pull/123
+        draft:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+        run_ids:
+          type: array
+          description: Fabro runs linked to this pull request, with duplicates removed.
+          uniqueItems: true
+          items:
+            type: string
+
+    InReviewPullRequestListStatus:
+      description: Whether every GitHub search page was fetched successfully.
+      type: string
+      enum:
+        - complete
+        - partial
+
+    InReviewPullRequestListMeta:
+      type: object
+      additionalProperties: false
+      required:
+        - author
+        - status
+      properties:
+        author:
+          type: string
+          description: GitHub login used in the authored-by search.
+        status:
+          $ref: "#/components/schemas/InReviewPullRequestListStatus"
+        warning:
+          oneOf:
+            - type: string
+            - type: "null"
+
+    InReviewPullRequestListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/InReviewPullRequest"
+        meta:
+          $ref: "#/components/schemas/InReviewPullRequestListMeta"
 
     BatchRunLifecycleRequest:
       description: Run IDs to archive or unarchive as one bounded fail-soft batch.

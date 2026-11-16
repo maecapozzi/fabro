@@ -179,6 +179,10 @@ models/history-entry.ts
 models/hook-definition.ts
 models/hook-event.ts
 models/idp-identity.ts
+models/in-review-pull-request-list-meta.ts
+models/in-review-pull-request-list-response.ts
+models/in-review-pull-request-list-status.ts
+models/in-review-pull-request.ts
 models/index.ts
 models/install-finish-response.ts
 models/install-github-app-manifest-input.ts
