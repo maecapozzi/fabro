@@ -358,9 +358,9 @@ struct SearchIssuePullRequest {
 const SEARCH_PAGE_SIZE: usize = 100;
 const SEARCH_RESULT_LIMIT: u64 = 1_000;
 
-/// Search every repository visible to the configured user credential for open
-/// pull requests authored by that user. GitHub's search API caps a query at
-/// 1,000 results; reaching that cap is reported as a partial result.
+/// Search every active repository visible to the configured user credential
+/// for open pull requests authored by that user. GitHub's search API caps a
+/// query at 1,000 results; reaching that cap is reported as a partial result.
 pub async fn search_open_authored_pull_requests(
     ctx: &GitHubContext<'_>,
     signed_in_github_login: Option<&str>,
@@ -422,7 +422,7 @@ async fn search_open_authored_pull_requests_with_client(
 
     loop {
         let url = format!(
-            "{base_url}/search/issues?q=is%3Apr+is%3Aopen+author%3A{author}&per_page={SEARCH_PAGE_SIZE}&page={page}"
+            "{base_url}/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3A{author}&per_page={SEARCH_PAGE_SIZE}&page={page}"
         );
         let response = match client
             .request(HttpMethod::Get, &url, &github_headers(&auth), None)
@@ -2211,7 +2211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authored_search_uses_author_and_keeps_drafts_while_excluding_closed_and_merged() {
+    async fn authored_search_filters_archived_repositories_and_preserves_active_open_prs() {
         let body = serde_json::json!({
             "total_count": 4,
             "items": [
@@ -2224,7 +2224,7 @@ mod tests {
         .to_string();
         let mock = MockHttpClient::new().on(
             HttpMethod::Get,
-            "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+            "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
             200,
             &body,
         );
@@ -2239,9 +2239,44 @@ mod tests {
         .expect("authored search should succeed");
 
         assert_eq!(result.author, "octocat");
-        assert_eq!(result.items.len(), 2);
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| (item.repo.as_str(), item.number.get()))
+                .collect::<Vec<_>>(),
+            [("two", 2), ("one", 1)]
+        );
         assert!(result.items.iter().any(|item| item.draft));
         assert!(!result.partial);
+    }
+
+    #[tokio::test]
+    async fn authored_search_returns_empty_when_archived_filter_has_no_active_matches() {
+        let body = serde_json::json!({
+            "total_count": 0,
+            "items": [],
+        })
+        .to_string();
+        let mock = MockHttpClient::new().on(
+            HttpMethod::Get,
+            "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
+            200,
+            &body,
+        );
+
+        let result = search_open_authored_pull_requests_with_client(
+            &mock,
+            "secret",
+            "",
+            "octocat".to_string(),
+        )
+        .await
+        .expect("an empty authored search should succeed");
+
+        assert!(result.items.is_empty());
+        assert!(!result.partial);
+        assert_eq!(result.author, "octocat");
     }
 
     #[tokio::test]
@@ -2256,7 +2291,7 @@ mod tests {
         .to_string();
         let mock = MockHttpClient::new().on(
             HttpMethod::Get,
-            "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+            "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
             200,
             &body,
         );
@@ -2301,13 +2336,13 @@ mod tests {
         let mock = MockHttpClient::new()
             .on(
                 HttpMethod::Get,
-                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+                "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
                 200,
                 &first,
             )
             .on(
                 HttpMethod::Get,
-                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=2",
+                "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=2",
                 200,
                 &second,
             );
@@ -2338,13 +2373,13 @@ mod tests {
         let mock = MockHttpClient::new()
             .on(
                 HttpMethod::Get,
-                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=1",
+                "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=1",
                 200,
                 &first,
             )
             .on(
                 HttpMethod::Get,
-                "/search/issues?q=is%3Apr+is%3Aopen+author%3Aoctocat&per_page=100&page=2",
+                "/search/issues?q=is%3Apr+is%3Aopen+archived%3Afalse+author%3Aoctocat&per_page=100&page=2",
                 502,
                 "",
             );
