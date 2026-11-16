@@ -51,10 +51,11 @@ impl SlackClient {
     pub async fn post_message(
         &self,
         channel: &str,
+        fallback_text: &str,
         blocks: &[Value],
         thread_ts: Option<&str>,
     ) -> Result<PostedMessage, SlackApiError> {
-        let body = build_post_message_body(channel, blocks, thread_ts);
+        let body = build_post_message_body(channel, fallback_text, blocks, thread_ts);
         let resp = self
             .http
             .post(format!("{}/chat.postMessage", self.api_base))
@@ -138,9 +139,15 @@ pub fn parse_wss_url(response: &Value) -> Result<String, SlackApiError> {
         .ok_or_else(|| SlackApiError::Api("missing url in response".to_string()))
 }
 
-fn build_post_message_body(channel: &str, blocks: &[Value], thread_ts: Option<&str>) -> Value {
+fn build_post_message_body(
+    channel: &str,
+    fallback_text: &str,
+    blocks: &[Value],
+    thread_ts: Option<&str>,
+) -> Value {
     let mut body = json!({
         "channel": channel,
+        "text": fallback_text,
         "blocks": blocks
     });
     if let Some(ts) = thread_ts {
@@ -163,9 +170,14 @@ mod tests {
 
     #[test]
     fn post_message_request_body_format() {
-        let body =
-            build_post_message_body("#general", &[serde_json::json!({"type": "section"})], None);
+        let body = build_post_message_body(
+            "#general",
+            "Mae Factory needs your input",
+            &[serde_json::json!({"type": "section"})],
+            None,
+        );
         assert_eq!(body["channel"], "#general");
+        assert_eq!(body["text"], "Mae Factory needs your input");
         assert_eq!(body["blocks"][0]["type"], "section");
         assert!(body["thread_ts"].is_null());
     }
@@ -174,6 +186,7 @@ mod tests {
     fn post_message_request_body_with_thread() {
         let body = build_post_message_body(
             "#general",
+            "Mae Factory needs your input",
             &[serde_json::json!({"type": "section"})],
             Some("1234.5678"),
         );

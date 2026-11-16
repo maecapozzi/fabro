@@ -97,7 +97,7 @@ use fabro_types::{
     AskFabro, AskFabroUnavailableReason, BlobHash, FailureReason, InterviewQuestionRecord,
     ModelRef, ModelTestMode, PendingReason, Principal, PullRequestLink, QuestionType,
     RunControlAction, RunId, RunRunnableSource, RunStatus, RunStatusKind, RunStreamItem,
-    RunStreamItemKind, SandboxProviderKind, ServerSettings, SuccessReason,
+    RunStreamItemKind, RunTarget, SandboxProviderKind, ServerSettings, SuccessReason,
 };
 use fabro_util::error::{SharedError, collect_chain, render_compact_with_causes};
 use fabro_util::version::FABRO_VERSION;
@@ -774,15 +774,29 @@ impl SlackService {
             return;
         };
         let question = runtime_question_from_interview_record(&pending.question);
-        let blocks = slack_blocks::question_to_blocks(
+        let task = projection.title();
+        let repository = match projection.spec.target.as_ref() {
+            Some(RunTarget::Git(target)) => Some(target.repo.as_str()),
+            Some(RunTarget::None {} | RunTarget::Folder { .. }) | None => None,
+        };
+        let message = slack_blocks::question_message(
             &run_id.to_string(),
             question_id,
             &question,
             run_web_url,
+            slack_blocks::QuestionIdentity {
+                task: Some(task.as_ref()),
+                repository,
+            },
         );
         if let Ok(posted) = self
             .client
-            .post_message(default_channel, &blocks, None)
+            .post_message(
+                default_channel,
+                &message.fallback_text,
+                &message.blocks,
+                None,
+            )
             .await
         {
             if question.allow_freeform || question.question_type == QuestionType::Freeform {
@@ -901,6 +915,8 @@ impl SlackService {
                 duration_ms: details.duration_ms,
                 pull_request: pull_request_blocks,
             });
+        let lifecycle_title: &'static str = details.kind.into();
+        let fallback_text = format!("{lifecycle_title}: {workflow_label}");
 
         let blocks = &blocks;
         let posts = routes.into_iter().filter_map(|(route_name, route)| {
@@ -909,8 +925,13 @@ impl SlackService {
             }
             let channel =
                 resolve_slack_lifecycle_route_channel(run_id, route_name, route, event_name)?;
+            let fallback_text = &fallback_text;
             Some(async move {
-                match self.client.post_message(&channel, blocks, None).await {
+                match self
+                    .client
+                    .post_message(&channel, fallback_text, blocks, None)
+                    .await
+                {
                     Ok(posted) => {
                         let record = PlatformRecord::NotificationSent(NotificationSentRecord {
                             route:      route_name.clone(),

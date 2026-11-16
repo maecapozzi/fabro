@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use fabro_interview::Question;
-use fabro_types::QuestionType;
+use fabro_types::{QuestionType, ReviewTarget, ReviewTargetKind};
 use serde_json::{Value, json};
 
 use crate::payload::{SlackActionPayload, encode_action_value};
@@ -27,6 +27,37 @@ const CONTEXT_TRUNCATION_SUFFIX: &str =
 /// Suffix appended when the header text itself exceeds the section limit
 /// (e.g. an extremely long question label combined with a long stage name).
 const HEADER_TRUNCATION_SUFFIX: &str = " …";
+const SLACK_BUTTON_TEXT_LIMIT: usize = 75;
+const SLACK_FALLBACK_TEXT_LIMIT: usize = 500;
+
+/// Human-facing identity supplied by the run projection. These values are
+/// presentation metadata; question routing remains in the action payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuestionIdentity<'a> {
+    pub task:       Option<&'a str>,
+    pub repository: Option<&'a str>,
+}
+
+/// A complete Slack interview message, including the top-level text Slack
+/// uses for push notifications and accessibility clients.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuestionMessage {
+    pub fallback_text: String,
+    pub blocks:        Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RoutingContext {
+    child_run_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuestionPresentation {
+    question_text: String,
+    action_url:    Option<String>,
+    action_label:  &'static str,
+    navigation:    bool,
+}
 
 /// Build a Slack-unique `action_id` for an interview button.
 ///
@@ -51,6 +82,7 @@ fn text_block(text: &str) -> Value {
 }
 
 fn button(label: &str, value: &str, action_id: &str) -> Value {
+    let label = truncate_to_limit(label, SLACK_BUTTON_TEXT_LIMIT, HEADER_TRUNCATION_SUFFIX);
     json!({
         "type": "button",
         "text": {
@@ -98,27 +130,46 @@ fn truncate_to_limit(text: &str, limit: usize, suffix: &str) -> String {
 /// stage hint, and a deep link back to the run when one is available. The
 /// final text is bounded by Slack's section-text limit so even pathological
 /// inputs cannot produce `invalid_blocks`.
-fn header_section(question: &Question, run_web_url: Option<&str>) -> Value {
-    let mut text = question.review_target.as_ref().map_or_else(
-        || format!("*{}*", escape_slack_controls(&question.text)),
+fn header_section(
+    question: &Question,
+    identity: QuestionIdentity<'_>,
+    presentation: &QuestionPresentation,
+) -> Value {
+    let mut lines = vec!["*Mae Factory needs your input.*".to_string()];
+    let task = identity
+        .task
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repository = identity
+        .repository
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (task, repository) {
+        (Some(task), Some(repository)) => lines.push(format!(
+            "*Task:* {}  ·  *Repository:* {}",
+            escape_slack_controls(task),
+            escape_slack_controls(repository)
+        )),
+        (Some(task), None) => lines.push(format!("*Task:* {}", escape_slack_controls(task))),
+        (None, Some(repository)) => lines.push(format!(
+            "*Repository:* {}",
+            escape_slack_controls(repository)
+        )),
+        (None, None) => {}
+    }
+
+    let question_text = question.review_target.as_ref().map_or_else(
+        || escape_slack_controls(&presentation.question_text),
         |target| {
             let link = slack_link(target.url(), target.label());
-            format!("*{}*", target.question_text_with_link(&link))
+            target.question_text_with_link(&link)
         },
     );
-    if !question.stage.is_empty() {
-        let _ = write!(
-            text,
-            "  ·  stage `{}`",
-            escape_slack_controls(&question.stage)
-        );
+    lines.push(question_text);
+    if let Some(url) = presentation.action_url.as_deref() {
+        lines.push(format!("<{url}|{}>", presentation.action_label));
     }
-    if let Some(url) = run_web_url {
-        // The URL is server-owned (built from `server.web.url` + run id) and
-        // does not flow through escape_slack_controls so the `<…|…>` link
-        // syntax is preserved.
-        let _ = write!(text, "\n<{url}|Open in Fabro>");
-    }
+    let text = lines.join("\n\n");
     text_block(&truncate_to_limit(
         &text,
         SLACK_SECTION_TEXT_LIMIT,
@@ -137,6 +188,9 @@ fn context_section(context_display: &str) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
+    if looks_like_structured_context(trimmed) {
+        return None;
+    }
     let neutralized = escape_slack_controls(trimmed);
     let bounded = truncate_to_limit(
         &neutralized,
@@ -148,8 +202,12 @@ fn context_section(context_display: &str) -> Option<Value> {
 
 /// Assemble the leading blocks shared by every question shape: header
 /// section + optional context preview + a divider before the buttons.
-fn lead_blocks(question: &Question, run_web_url: Option<&str>) -> Vec<Value> {
-    let mut blocks = vec![header_section(question, run_web_url)];
+fn lead_blocks(
+    question: &Question,
+    identity: QuestionIdentity<'_>,
+    presentation: &QuestionPresentation,
+) -> Vec<Value> {
+    let mut blocks = vec![header_section(question, identity, presentation)];
     if let Some(context_display) = question.context_display.as_deref() {
         if let Some(section) = context_section(context_display) {
             blocks.push(section);
@@ -157,6 +215,120 @@ fn lead_blocks(question: &Question, run_web_url: Option<&str>) -> Vec<Value> {
         }
     }
     blocks
+}
+
+fn looks_like_structured_context(context: &str) -> bool {
+    matches!(context.chars().next(), Some('{' | '['))
+}
+
+fn routing_context(context_display: Option<&str>) -> RoutingContext {
+    let Some(context) = context_display.map(str::trim) else {
+        return RoutingContext::default();
+    };
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(context) else {
+        return RoutingContext::default();
+    };
+    let is_routing = [
+        "preferred_next_label",
+        "suggested_next_ids",
+        "context_updates",
+        "child_run_id",
+        "child_run_url",
+        "child_status",
+        "factory_commit",
+        "target_base",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+    if !is_routing {
+        return RoutingContext::default();
+    }
+
+    let child_run_url = object
+        .get("child_run_url")
+        .and_then(Value::as_str)
+        .filter(|url| safe_action_url(url))
+        .map(ToOwned::to_owned);
+    RoutingContext { child_run_url }
+}
+
+fn safe_action_url(url: &str) -> bool {
+    ReviewTarget::new("Fabro", url, ReviewTargetKind::Document).is_ok()
+}
+
+fn is_parent_navigation_prompt(question: &Question, routing: &RoutingContext) -> bool {
+    if routing.child_run_url.is_none() {
+        return false;
+    }
+    let text = question.text.to_ascii_lowercase();
+    text.contains("child launch approval")
+        || (text.contains("linked child")
+            && (text.contains("approve") || text.contains("children tab")))
+}
+
+fn question_presentation(
+    question: &Question,
+    identity: QuestionIdentity<'_>,
+    run_web_url: Option<&str>,
+) -> QuestionPresentation {
+    let routing = routing_context(question.context_display.as_deref());
+    if is_parent_navigation_prompt(question, &routing) {
+        let question_text = identity
+            .task
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map_or(
+                "I am ready to start. Please approve the task in Fabro so I can begin.",
+                |_| "I am ready to work on this task. Please approve it in Fabro so I can start.",
+            )
+            .to_string();
+        return QuestionPresentation {
+            question_text,
+            action_url: routing.child_run_url,
+            action_label: "Approve task in Fabro",
+            navigation: true,
+        };
+    }
+
+    QuestionPresentation {
+        question_text: question.text.clone(),
+        action_url:    run_web_url.map(ToOwned::to_owned),
+        action_label:  "Open this task in Fabro",
+        navigation:    false,
+    }
+}
+
+fn fallback_text(identity: QuestionIdentity<'_>, presentation: &QuestionPresentation) -> String {
+    let mut text = String::from("Mae Factory needs your input");
+    if let Some(task) = identity
+        .task
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str(" for ");
+        text.push_str(&escape_slack_controls(task));
+    }
+    text.push_str(": ");
+    text.push_str(&escape_slack_controls(&presentation.question_text));
+    if let Some(url) = presentation.action_url.as_deref() {
+        text.push(' ');
+        text.push_str(&format!("<{url}|{}>", presentation.action_label));
+    }
+    truncate_to_limit(&text, SLACK_FALLBACK_TEXT_LIMIT, HEADER_TRUNCATION_SUFFIX)
+}
+
+fn navigation_button_label(label: &str) -> &str {
+    let normalized = label.trim().to_ascii_lowercase();
+    if normalized.contains("recheck")
+        || normalized.contains("check again")
+        || normalized.contains("refresh")
+    {
+        "Check again"
+    } else if normalized.contains("stop") || normalized.contains("cancel") {
+        "Stop"
+    } else {
+        label
+    }
 }
 
 fn option_descriptions_section(question: &Question) -> Option<Value> {
@@ -199,7 +371,26 @@ pub fn question_to_blocks(
     question: &Question,
     run_web_url: Option<&str>,
 ) -> Vec<Value> {
-    let mut blocks = lead_blocks(question, run_web_url);
+    question_message(
+        run_id,
+        question_id,
+        question,
+        run_web_url,
+        QuestionIdentity::default(),
+    )
+    .blocks
+}
+
+pub fn question_message(
+    run_id: &str,
+    question_id: &str,
+    question: &Question,
+    run_web_url: Option<&str>,
+    identity: QuestionIdentity<'_>,
+) -> QuestionMessage {
+    let presentation = question_presentation(question, identity, run_web_url);
+    let fallback_text = fallback_text(identity, &presentation);
+    let mut blocks = lead_blocks(question, identity, &presentation);
     if let Some(descriptions) = option_descriptions_section(question) {
         blocks.push(descriptions);
     }
@@ -226,8 +417,13 @@ pub fn question_to_blocks(
                 .iter()
                 .enumerate()
                 .map(|(idx, opt)| {
+                    let label = if presentation.navigation {
+                        navigation_button_label(&opt.label)
+                    } else {
+                        &opt.label
+                    };
                     button(
-                        &opt.label,
+                        label,
                         &encode_action_value(&SlackActionPayload::Selected {
                             run_id: run_id.to_string(),
                             qid:    question_id.to_string(),
@@ -294,7 +490,10 @@ pub fn question_to_blocks(
             ));
         }
     }
-    blocks
+    QuestionMessage {
+        fallback_text,
+        blocks,
+    }
 }
 
 /// Pull request metadata rendered in run lifecycle notification messages.
@@ -646,7 +845,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(header.contains("<http://127.0.0.1:32276/runs/run-1|Open in Fabro>"));
+        assert!(header.contains("<http://127.0.0.1:32276/runs/run-1|Open this task in Fabro>"));
     }
 
     #[test]
@@ -670,12 +869,12 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert_eq!(
-            header,
-            "*Review the \
+        assert!(header.starts_with("*Mae Factory needs your input.*"));
+        assert!(header.contains(
+            "Review the \
              <https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef|Quarry review \
-             exercise> document, then choose the next action.*"
-        );
+             exercise> document, then choose the next action."
+        ));
     }
 
     #[test]
@@ -713,15 +912,16 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_stage_when_present() {
+    fn header_hides_internal_stage_identifier() {
         let mut q = Question::new("Approve Plan", QuestionType::YesNo);
-        q.stage = "plan".to_string();
+        q.stage = "approval_wait@01JABC123".to_string();
         let blocks = question_to_blocks("run-1", "q-1", &q, None);
         let header = serde_json::to_value(&blocks).unwrap()[0]["text"]["text"]
             .as_str()
             .unwrap()
             .to_string();
-        assert!(header.contains("stage `plan`"));
+        assert!(!header.contains("approval_wait"));
+        assert!(!header.contains("01JABC123"));
     }
 
     #[test]
@@ -795,6 +995,163 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "section");
         assert_eq!(arr[1]["type"], "actions");
+    }
+
+    #[test]
+    fn routing_context_becomes_a_plain_language_action_without_machine_state() {
+        let mut q = Question::new(
+            "CHILD LAUNCH APPROVAL — Open the linked child from this run's Children tab and \
+             approve or deny its launch there. This parent cannot approve it.",
+            QuestionType::MultipleChoice,
+        );
+        q.stage = "approval_wait@01JSTAGE".to_string();
+        q.options = vec![
+            InterviewOption {
+                key:         "recheck_child".to_string(),
+                label:       "Recheck whether the child was approved and continue orchestration"
+                    .to_string(),
+                description: None,
+                preview:     None,
+            },
+            InterviewOption {
+                key:         "stop_parent".to_string(),
+                label:       "Stop the parent orchestrator".to_string(),
+                description: None,
+                preview:     None,
+            },
+        ];
+        q.context_display = Some(
+            json!({
+                "preferred_next_label": "Recheck child launch approval",
+                "outcome": "blocked",
+                "failure_reason": null,
+                "suggested_next_ids": ["approval_wait@01JSTAGE"],
+                "context_updates": {
+                    "human_action": "approve child",
+                    "factory_commit": "0123456789abcdef0123456789abcdef01234567"
+                },
+                "child_run_id": "01JCHILDRUN",
+                "child_run_url": "https://fabro.example/runs/01JCHILDRUN",
+                "child_status": "pending_approval",
+                "target_base": "fedcba9876543210",
+                "evidence_summary": "machine detail",
+                "pr_url": null
+            })
+            .to_string(),
+        );
+
+        let message = question_message(
+            "01JPARENTRUN",
+            "question-1",
+            &q,
+            Some("https://fabro.example/runs/01JPARENTRUN"),
+            QuestionIdentity {
+                task:       Some("Fix the PR list"),
+                repository: Some("maecapozzi/fabro"),
+            },
+        );
+        let rendered = lifecycle_text(&message.blocks);
+
+        assert!(rendered.contains("Mae Factory needs your input"));
+        assert!(rendered.contains("Fix the PR list"));
+        assert!(rendered.contains("maecapozzi/fabro"));
+        assert!(rendered.contains("I am ready to work on this task"));
+        assert!(rendered.contains("Approve task in Fabro"));
+        assert!(rendered.contains("https://fabro.example/runs/01JCHILDRUN"));
+        for internal in [
+            "CHILD LAUNCH",
+            "approval_wait",
+            "preferred_next_label",
+            "context_updates",
+            "0123456789abcdef",
+            "01JPARENTRUN",
+        ] {
+            assert!(!rendered.contains(internal), "{internal} leaked");
+        }
+
+        let actions = message
+            .blocks
+            .iter()
+            .find(|block| block["type"] == "actions")
+            .unwrap();
+        assert_eq!(actions["elements"][0]["text"]["text"], "Check again");
+        assert_eq!(actions["elements"][1]["text"]["text"], "Stop");
+        assert_eq!(actions["elements"][0]["action_id"], "interview.answer.0");
+        assert_eq!(actions["elements"][1]["action_id"], "interview.answer.1");
+        let first_value = actions["elements"][0]["value"].as_str().unwrap();
+        assert!(first_value.contains("\"run_id\":\"01JPARENTRUN\""));
+        assert!(first_value.contains("\"qid\":\"question-1\""));
+        assert!(first_value.contains("\"key\":\"recheck_child\""));
+
+        assert!(message.fallback_text.contains("Fix the PR list"));
+        assert!(message.fallback_text.contains("Approve task in Fabro"));
+        assert!(!message.fallback_text.contains("preferred_next_label"));
+        assert!(!message.fallback_text.contains("approval_wait"));
+        assert!(!message.fallback_text.contains("01JPARENTRUN"));
+    }
+
+    #[test]
+    fn malformed_and_unknown_structured_context_are_hidden() {
+        for context in [
+            r#"{"preferred_next_label":"Continue","context_updates":"#,
+            r#"{"unexpected":{"internal_run_id":"01JSECRET"}}"#,
+            r#"[{"factory_commit":"deadbeef"}]"#,
+        ] {
+            let mut q = Question::new("What should I do next?", QuestionType::Freeform);
+            q.context_display = Some(context.to_string());
+            let message = question_message(
+                "run-1",
+                "q-1",
+                &q,
+                Some("https://fabro.example/runs/run-1"),
+                QuestionIdentity::default(),
+            );
+            let rendered = serde_json::to_string(&message.blocks).unwrap();
+
+            assert!(rendered.contains("What should I do next?"));
+            assert!(rendered.contains("Open this task in Fabro"));
+            assert!(!rendered.contains("preferred_next_label"));
+            assert!(!rendered.contains("internal_run_id"));
+            assert!(!rendered.contains("factory_commit"));
+        }
+    }
+
+    #[test]
+    fn ordinary_context_and_option_text_remain_authored() {
+        let mut q = Question::new(
+            "The deployment failed with HTTP 502. Retry it?",
+            QuestionType::MultipleChoice,
+        );
+        q.context_display =
+            Some("The upstream returned `connection reset`; no files were changed.".to_string());
+        q.options = vec![InterviewOption {
+            key:         "retry".to_string(),
+            label:       "Retry deployment".to_string(),
+            description: Some("Run the deployment again.".to_string()),
+            preview:     None,
+        }];
+
+        let message = question_message("run-1", "q-1", &q, None, QuestionIdentity::default());
+        let rendered = serde_json::to_string(&message.blocks).unwrap();
+
+        assert!(rendered.contains("HTTP 502"));
+        assert!(rendered.contains("connection reset"));
+        assert!(rendered.contains("Retry deployment"));
+        assert!(rendered.contains("Run the deployment again."));
+    }
+
+    #[test]
+    fn fallback_text_escapes_controls_and_obeys_its_limit() {
+        let q = Question::new(
+            format!("Approve <!here> & {}?", "x".repeat(1_000)),
+            QuestionType::YesNo,
+        );
+        let message = question_message("run-1", "q-1", &q, None, QuestionIdentity::default());
+
+        assert!(message.fallback_text.chars().count() <= SLACK_FALLBACK_TEXT_LIMIT);
+        assert!(!message.fallback_text.contains("<!here>"));
+        assert!(message.fallback_text.contains("&lt;!here&gt;"));
+        assert!(message.fallback_text.contains("&amp;"));
     }
 
     #[test]
