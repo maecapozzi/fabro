@@ -71,6 +71,14 @@ impl WorkerControlEnvelope {
     }
 
     #[must_use]
+    pub fn scheduler_admission_granted() -> Self {
+        Self {
+            v:       WORKER_CONTROL_PROTOCOL_VERSION,
+            message: WorkerControlMessage::SchedulerAdmissionGranted,
+        }
+    }
+
+    #[must_use]
     pub fn steer(text: impl Into<String>, stage: Option<String>, actor: Principal) -> Self {
         Self {
             v:       WORKER_CONTROL_PROTOCOL_VERSION,
@@ -204,6 +212,8 @@ pub enum WorkerControlMessage {
     RunPause,
     #[serde(rename = "run.unpause")]
     RunUnpause,
+    #[serde(rename = "scheduler.admission_granted")]
+    SchedulerAdmissionGranted,
     #[serde(rename = "run.steer")]
     Steer {
         text:       String,

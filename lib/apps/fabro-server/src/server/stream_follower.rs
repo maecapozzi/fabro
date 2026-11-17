@@ -24,7 +24,10 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use super::{AppState, apply_lifecycle_to_managed_run, reconcile_live_interview_state};
+use super::{
+    AppState, apply_lifecycle_to_managed_run, apply_scheduler_admission_notice,
+    reconcile_live_interview_state,
+};
 
 /// How many stream items one read takes.
 const BATCH_LIMIT: usize = 256;
@@ -125,8 +128,16 @@ async fn catch_up(state: &Arc<AppState>, run_id: RunId) {
 /// One item into the in-memory run: its lifecycle records fold into the
 /// live status; a closed question releases its answer claim.
 fn fold_into_live_state(state: &AppState, run_id: RunId, item: &RunStreamItem) {
-    if let Some(PlatformRecord::RunLifecycle(record)) = super::platform_record_of(item) {
-        apply_lifecycle_to_managed_run(state, run_id, &record);
+    if let Some(record) = super::platform_record_of(item) {
+        match record {
+            PlatformRecord::RunLifecycle(record) => {
+                apply_lifecycle_to_managed_run(state, run_id, &record);
+            }
+            PlatformRecord::RunNotice(notice) => {
+                apply_scheduler_admission_notice(state, run_id, &notice.code);
+            }
+            _ => {}
+        }
     }
     let mut runs = state.runs.lock().expect("runs lock poisoned");
     if let Some(managed_run) = runs.get_mut(&run_id) {

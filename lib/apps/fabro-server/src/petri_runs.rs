@@ -173,7 +173,6 @@ mod tests {
     use fabro_config::Storage;
     use fabro_config::bind::Bind;
     use fabro_config::daemon::ServerDaemon;
-    use fabro_petri::petri::RunStore as _;
     use fabro_static::EnvVars;
     use fabro_store::platform_records::{PlatformRecord, RunLifecycleKind, RunLifecycleRecord};
     use fabro_types::{

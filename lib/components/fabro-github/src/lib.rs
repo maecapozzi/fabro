@@ -516,7 +516,7 @@ async fn search_open_authored_pull_requests_with_client(
         page += 1;
     }
 
-    items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
     Ok(AuthoredPullRequestSearch {
         author,
         items,

@@ -107,6 +107,7 @@ pub(crate) async fn dispatch(
             run_id,
             mode,
             fabro_home,
+            scheduler_admission,
         }) => {
             let worker_token = worker_token
                 .filter(|token| !token.trim().is_empty())
@@ -122,6 +123,7 @@ pub(crate) async fn dispatch(
                     run_dir,
                     mode,
                     fabro_home,
+                    scheduler_admission,
                     &worker_token,
                 )
                 .instrument(run_span),

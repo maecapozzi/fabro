@@ -1115,6 +1115,11 @@ pub(crate) struct RunWorkerArgs {
     /// agents read
     #[arg(long, hide = true)]
     pub(crate) fabro_home: Option<PathBuf>,
+
+    /// Enable shared scheduler release/readmission with a server that
+    /// understands the worker-control protocol.
+    #[arg(long, hide = true)]
+    pub(crate) scheduler_admission: bool,
 }
 
 #[derive(Args, Debug, Clone, Default)]

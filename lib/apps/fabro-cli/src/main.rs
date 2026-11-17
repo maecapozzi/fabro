@@ -1490,6 +1490,7 @@ destination = "{destination}"
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Start));
+                assert!(!args.scheduler_admission);
             }
             _ => panic!("unexpected command variant"),
         }
@@ -1510,6 +1511,7 @@ destination = "{destination}"
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "--mode",
             "resume",
+            "--scheduler-admission",
         ])
         .expect("should parse");
         match *cli.command.unwrap() {
@@ -1519,6 +1521,7 @@ destination = "{destination}"
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Resume));
+                assert!(args.scheduler_admission);
             }
             _ => panic!("unexpected command variant"),
         }

@@ -65,6 +65,7 @@ pub(crate) async fn execute(
     run_dir: PathBuf,
     mode: RunWorkerMode,
     fabro_home: Option<PathBuf>,
+    scheduler_admission: bool,
     worker_token: &str,
 ) -> Result<()> {
     let _ = fabro_proc::title_init();
@@ -96,6 +97,7 @@ pub(crate) async fn execute(
         run_dir,
         mode,
         fabro_home,
+        scheduler_admission,
         worker_token,
     }))
     .await
@@ -871,15 +873,17 @@ mod tests {
         AnswerValue, ControlInterviewer, Interviewer, Question, WorkerControlAck,
         WorkerControlEnvelope, WorkerControlOutcome,
     };
+    use fabro_petri::controls::SchedulerAdmissionEvent;
+    use fabro_petri::platform_records::{PlatformRecordError, PlatformRecords};
     use fabro_petri::test_support::MemoryPlatformRecords;
-    use fabro_store::PlatformRecord;
-    use fabro_types::{Principal, QuestionType, SystemActorKind, fixtures};
+    use fabro_store::{PlatformRecord, PlatformRecordKind, StagePosition, StoredPlatformRecord};
+    use fabro_types::{Principal, QuestionType, RunId, SystemActorKind, fixtures};
     use fabro_vault::{SecretType, Vault};
     use tokio::time::{self, Instant};
     use tokio_tungstenite::tungstenite::protocol::{Message as TestWebSocketMessage, Role};
     use tokio_util::sync::CancellationToken;
 
-    use super::super::petri_worker::PetriControls;
+    use super::super::petri_worker::{PetriControls, mirror_scheduler_admission};
     use super::{
         AppliedWorkerControlDeliveryIds, RunControls, WORKER_CONTROL_GIVE_UP,
         WORKER_CONTROL_ORPHAN_GIVE_UP, WORKER_CONTROL_RECONNECT_MAX_BACKOFF,
@@ -903,6 +907,30 @@ mod tests {
             RunControls::new(),
             records,
         ))
+    }
+
+    struct FailingPlatformRecords;
+
+    #[async_trait::async_trait]
+    impl PlatformRecords for FailingPlatformRecords {
+        async fn append(
+            &self,
+            _run_id: &RunId,
+            _record: &PlatformRecord,
+            _position: Option<StagePosition>,
+        ) -> Result<StoredPlatformRecord, PlatformRecordError> {
+            Err(PlatformRecordError::Api(anyhow::anyhow!(
+                "injected scheduler notice failure"
+            )))
+        }
+
+        async fn read_kind(
+            &self,
+            _run_id: &RunId,
+            _kind: PlatformRecordKind,
+        ) -> Result<Vec<StoredPlatformRecord>, PlatformRecordError> {
+            unreachable!("the scheduler mirror only appends")
+        }
     }
 
     /// The `run.notice` records of the test run, as `(code, message)`.
@@ -1172,6 +1200,70 @@ mod tests {
         )
         .await;
         assert_eq!(ack, None);
+    }
+
+    #[tokio::test]
+    async fn scheduler_admission_grant_crosses_the_worker_control_protocol() {
+        let interviewer = Arc::new(ControlInterviewer::new());
+        let cancel_token = CancellationToken::new();
+        let controls = test_controls();
+
+        let ack = apply_worker_control_message(
+            &interviewer,
+            &cancel_token,
+            &controls,
+            WorkerControlEnvelope::scheduler_admission_granted(),
+        )
+        .await;
+
+        assert_eq!(ack, None);
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn scheduler_notice_failure_is_reported_to_interrupt_the_worker_lifetime() {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (failure, failure_rx) = tokio::sync::oneshot::channel();
+        let records: Arc<dyn PlatformRecords> = Arc::new(FailingPlatformRecords);
+        let mirror = mirror_scheduler_admission(fixtures::RUN_1, receiver, records, failure);
+
+        events
+            .send(SchedulerAdmissionEvent::Released)
+            .expect("the mirror should be listening");
+
+        let failure = failure_rx.await.expect("the mirror should report failure");
+        assert!(failure.contains("injected scheduler notice failure"));
+        mirror.await.expect("the mirror task should finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_worker_pause_unpause_does_not_require_scheduler_protocol() {
+        let interviewer = Arc::new(ControlInterviewer::new());
+        let cancel_token = CancellationToken::new();
+        let records = Arc::new(MemoryPlatformRecords::new());
+        let run_controls = RunControls::new();
+        let controls: WorkerControls = Arc::new(PetriControls::new(
+            fixtures::RUN_1,
+            run_controls.clone(),
+            records,
+        ));
+
+        apply_worker_control_message(
+            &interviewer,
+            &cancel_token,
+            &controls,
+            WorkerControlEnvelope::pause_run(),
+        )
+        .await;
+        assert!(run_controls.is_paused());
+        apply_worker_control_message(
+            &interviewer,
+            &cancel_token,
+            &controls,
+            WorkerControlEnvelope::unpause_run(),
+        )
+        .await;
+        assert!(!run_controls.is_paused());
     }
 
     #[tokio::test]

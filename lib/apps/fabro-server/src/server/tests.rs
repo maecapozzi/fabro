@@ -2287,6 +2287,7 @@ fn worker_command_sets_worker_args() {
         "resume".to_string(),
         "--fabro-home".to_string(),
         fabro_config::Home::from_env().root().display().to_string(),
+        "--scheduler-admission".to_string(),
     ]);
 }
 
@@ -10224,29 +10225,244 @@ async fn queue_position_reported_for_runnable_runs() {
     assert_eq!(positions.get(&second_id).copied(), Some(2));
 }
 
+fn scheduler_test_run(status: RunStatus) -> ManagedRun {
+    managed_run(
+        MINIMAL_DOT.to_string(),
+        status,
+        Utc::now(),
+        PathBuf::from("/tmp/fabro-scheduler-test"),
+        RunExecutionMode::Start,
+    )
+}
+
 #[test]
-fn scheduler_capacity_counts_only_runs_occupying_slots() {
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Submitted));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Pending {
-        reason: PendingReason::ApprovalRequired,
-    }));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Runnable));
-    assert!(counts_toward_scheduler_capacity(RunStatus::Starting));
-    assert!(counts_toward_scheduler_capacity(RunStatus::Running));
-    assert!(counts_toward_scheduler_capacity(RunStatus::Blocked {
+fn scheduler_capacity_tracks_admission_instead_of_display_status() {
+    let mut run = scheduler_test_run(RunStatus::Running);
+    assert!(!counts_toward_scheduler_capacity(&run));
+
+    run.scheduler_slot_held = true;
+    assert!(counts_toward_scheduler_capacity(&run));
+
+    run.status = RunStatus::Blocked {
         blocked_reason: BlockedReason::HumanInputRequired,
-    }));
-    assert!(counts_toward_scheduler_capacity(RunStatus::Paused {
-        prior_block: None,
-    }));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Removing));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Succeeded {
-        reason: SuccessReason::Completed,
-    }));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Failed {
-        reason: FailureReason::WorkflowError,
-    }));
-    assert!(!counts_toward_scheduler_capacity(RunStatus::Dead));
+    };
+    assert!(counts_toward_scheduler_capacity(&run));
+}
+
+#[test]
+fn blocked_parent_releases_its_slot_for_a_runnable_child() {
+    let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);
+    let parent_id = fixtures::RUN_1;
+    let child_id = fixtures::RUN_2;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut parent = scheduler_test_run(RunStatus::Running);
+        parent.scheduler_slot_held = true;
+        runs.insert(parent_id, parent);
+        runs.insert(child_id, scheduler_test_run(RunStatus::Runnable));
+    }
+
+    apply_scheduler_admission_notice(
+        state.as_ref(),
+        parent_id,
+        SCHEDULER_ADMISSION_RELEASED_NOTICE,
+    );
+    let work = claim_scheduled_work(state.as_ref());
+
+    assert!(matches!(work.as_slice(), [ScheduledWork::Start(id)] if *id == child_id));
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(!runs[&parent_id].scheduler_slot_held);
+    assert!(runs[&child_id].scheduler_slot_held);
+}
+
+#[tokio::test]
+async fn blocked_parent_answer_waits_for_readmission_and_is_claimed_once() {
+    let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);
+    let parent_id = fixtures::RUN_1;
+    let child_id = fixtures::RUN_2;
+    let (transport, _control_rx) = worker_transport_with_receiver(parent_id).await;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut parent = scheduler_test_run(RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        });
+        parent.answer_transport = Some(transport);
+        runs.insert(parent_id, parent);
+        let mut child = scheduler_test_run(RunStatus::Running);
+        child.scheduler_slot_held = true;
+        runs.insert(child_id, child);
+    }
+
+    let submission = AnswerSubmission::system(Answer::yes(), SystemActorKind::Engine);
+    let dispatch = claim_run_answer(state.as_ref(), parent_id, "q-1", submission)
+        .expect("the first answer should be accepted");
+    assert!(matches!(dispatch, AnswerDispatch::Queued(_)));
+    assert!(
+        claim_run_answer(
+            state.as_ref(),
+            parent_id,
+            "q-1",
+            AnswerSubmission::system(Answer::yes(), SystemActorKind::Engine),
+        )
+        .is_err()
+    );
+    assert!(claim_scheduled_work(state.as_ref()).is_empty());
+
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        runs.get_mut(&child_id)
+            .expect("child should remain registered")
+            .scheduler_slot_held = false;
+    }
+    let work = claim_scheduled_work(state.as_ref());
+    assert!(matches!(
+        work.as_slice(),
+        [ScheduledWork::Readmit { run_id, answers, .. }]
+            if *run_id == parent_id && answers.len() == 1
+    ));
+}
+
+#[tokio::test]
+async fn worker_reconciliation_rejects_a_queued_answer_and_releases_capacity() {
+    let state = test_app_state();
+    let run_id = fixtures::RUN_1;
+    let (transport, _control_rx) = worker_transport_with_receiver(run_id).await;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut run = scheduler_test_run(RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        });
+        run.answer_transport = Some(transport);
+        runs.insert(run_id, run);
+    }
+    let dispatch = claim_run_answer(
+        state.as_ref(),
+        run_id,
+        "q-1",
+        AnswerSubmission::system(Answer::yes(), SystemActorKind::Engine),
+    )
+    .expect("the answer should queue");
+    let AnswerDispatch::Queued(response) = dispatch else {
+        panic!("a blocked run should queue its answer");
+    };
+
+    release_managed_run(state.as_ref(), run_id);
+
+    assert!(!response.await.expect("queued answer should be rejected"));
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(!runs[&run_id].scheduler_slot_held);
+    assert!(runs[&run_id].pending_answers.is_empty());
+}
+
+#[tokio::test]
+async fn failed_answer_after_a_successful_grant_keeps_scheduler_ownership() {
+    let state = test_app_state();
+    let run_id = fixtures::RUN_1;
+    let interviewer = Arc::new(ControlInterviewer::new());
+    interviewer.cancel_all().await;
+    let controls = RunControls::new();
+    let transport = RunAnswerTransport::InProcess {
+        interviewer: Arc::clone(&interviewer),
+        controls,
+    };
+    let (response, delivered) = oneshot::channel();
+    let answer = QueuedAnswer {
+        qid: "stale-question".to_string(),
+        submission: AnswerSubmission::system(Answer::yes(), SystemActorKind::Engine),
+        transport: transport.clone(),
+        response,
+    };
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut run = scheduler_test_run(RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        });
+        run.scheduler_slot_held = true;
+        run.answer_transport = Some(transport.clone());
+        run.accepted_questions.insert(answer.qid.clone());
+        runs.insert(run_id, run);
+    }
+
+    deliver_scheduled_answers(Arc::clone(&state), run_id, transport, vec![answer], false).await;
+
+    assert!(!delivered.await.expect("delivery result should be reported"));
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(
+        runs[&run_id].scheduler_slot_held,
+        "a successful grant keeps ownership even when its queued answer is stale"
+    );
+}
+
+#[test]
+fn pause_releases_capacity_only_after_the_run_was_already_blocked() {
+    let state = test_app_state();
+    let running_id = fixtures::RUN_1;
+    let blocked_id = fixtures::RUN_2;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut running = scheduler_test_run(RunStatus::Running);
+        running.scheduler_slot_held = true;
+        runs.insert(running_id, running);
+        let mut blocked = scheduler_test_run(RunStatus::Running);
+        blocked.scheduler_slot_held = true;
+        runs.insert(blocked_id, blocked);
+    }
+
+    apply_lifecycle_to_managed_run(
+        state.as_ref(),
+        running_id,
+        &RunLifecycleRecord::new(RunLifecycleKind::Paused),
+    );
+    apply_lifecycle_to_managed_run(
+        state.as_ref(),
+        blocked_id,
+        &run_records::transition(RunLifecycleKind::Blocked, RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        }),
+    );
+    apply_scheduler_admission_notice(
+        state.as_ref(),
+        blocked_id,
+        SCHEDULER_ADMISSION_RELEASED_NOTICE,
+    );
+    apply_lifecycle_to_managed_run(
+        state.as_ref(),
+        blocked_id,
+        &RunLifecycleRecord::new(RunLifecycleKind::Paused),
+    );
+
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(runs[&running_id].scheduler_slot_held);
+    assert!(!runs[&blocked_id].scheduler_slot_held);
+}
+
+#[tokio::test]
+async fn quiescent_paused_run_is_readmitted_before_unpause_delivery() {
+    let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);
+    let run_id = fixtures::RUN_1;
+    let (transport, _control_rx) = worker_transport_with_receiver(run_id).await;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut run = scheduler_test_run(RunStatus::Paused { prior_block: None });
+        run.answer_transport = Some(transport);
+        run.pending_unpause = true;
+        runs.insert(run_id, run);
+    }
+
+    let work = claim_scheduled_work(state.as_ref());
+
+    assert!(matches!(
+        work.as_slice(),
+        [ScheduledWork::Readmit {
+            run_id: admitted,
+            answers,
+            unpause: true,
+            ..
+        }] if *admitted == run_id && answers.is_empty()
+    ));
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(runs[&run_id].scheduler_slot_held);
+    assert!(!runs[&run_id].pending_unpause);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
