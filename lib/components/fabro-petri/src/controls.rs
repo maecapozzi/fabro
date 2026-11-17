@@ -52,6 +52,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use fabro_types::{CodingAgentEvent, CodingEvent};
 use fabro_workflow::run_tools::GatherWait;
 pub use petri_execution::controls::ControlError;
 use petri_execution::controls::{ControlService, LiveTurns};
@@ -65,7 +66,7 @@ use petri_runtime::driver::lifecycle::{
     TransitionError, TransitionReport,
 };
 use petri_runtime::engine::{Admission, EngineState, Event, EventRecord};
-use petri_runtime::ir::{FinalizationFailure, FiringId};
+use petri_runtime::ir::{FinalizationFailure, FiringId, StepEvent};
 use petri_runtime::steps::Interrupt;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -86,6 +87,7 @@ struct SchedulerAdmissionState {
     readmission_requested: bool,
     live:                  BTreeSet<(ExecutionId, FiringId)>,
     waiting:               BTreeSet<(ExecutionId, FiringId)>,
+    active_subagents:      BTreeSet<(ExecutionId, FiringId, String, u64)>,
     pause_requested:       bool,
 }
 
@@ -130,6 +132,7 @@ impl SchedulerAdmission {
     fn report_release_if_quiescent(&self, state: &mut SchedulerAdmissionState) -> bool {
         if state.admitted
             && !state.release_reported
+            && state.active_subagents.is_empty()
             && ((state.waiting.is_empty() && state.pause_requested && state.live.is_empty())
                 || (!state.waiting.is_empty()
                     && state
@@ -171,6 +174,68 @@ impl SchedulerAdmission {
             let mut state = self.state();
             state.live.remove(&(execution, firing));
             state.waiting.remove(&(execution, firing));
+            state
+                .active_subagents
+                .retain(|(active_execution, active_firing, _, _)| {
+                    (*active_execution, *active_firing) != (execution, firing)
+                });
+            self.report_release_if_quiescent(&mut state)
+        };
+        if released {
+            self.inner.released.notify_waiters();
+        }
+    }
+
+    fn observe_subagent_event(
+        &self,
+        execution: ExecutionId,
+        firing: FiringId,
+        event: &CodingEvent,
+    ) {
+        let released = {
+            let mut state = self.state();
+            match event {
+                CodingEvent::SubAgentSpawned {
+                    agent_id,
+                    generation,
+                    ..
+                }
+                | CodingEvent::SubAgentTurnStarted {
+                    agent_id,
+                    generation,
+                    ..
+                } => {
+                    state.active_subagents.insert((
+                        execution,
+                        firing,
+                        agent_id.clone(),
+                        *generation,
+                    ));
+                }
+                CodingEvent::SubAgentCompleted {
+                    agent_id,
+                    generation,
+                    ..
+                }
+                | CodingEvent::SubAgentFailed {
+                    agent_id,
+                    generation,
+                    ..
+                }
+                | CodingEvent::SubAgentClosed {
+                    agent_id,
+                    generation,
+                    ..
+                } => {
+                    state.active_subagents.remove(&(
+                        execution,
+                        firing,
+                        agent_id.clone(),
+                        *generation,
+                    ));
+                }
+                _ => return,
+            }
             self.report_release_if_quiescent(&mut state)
         };
         if released {
@@ -674,6 +739,25 @@ impl ExecutionObserver for RunControls {
                 self.scheduler_admission.finished(execution, *firing);
                 self.agents().firings.remove(&(execution, *firing));
             }
+            Event::StepProgressRecorded {
+                firing,
+                ev: StepEvent::Custom(payload),
+            } if payload["kind"] == "pebble" => {
+                // Petri records this payload with `send_acked`; this observer
+                // runs before that acknowledgement. Pebble publishes an
+                // initial spawn before opening the child's start gate, so a
+                // root gather cannot overtake an unobserved active child.
+                let Ok(envelope) =
+                    serde_json::from_value::<CodingAgentEvent>(payload["event"].clone())
+                else {
+                    return;
+                };
+                self.scheduler_admission.observe_subagent_event(
+                    execution,
+                    *firing,
+                    &envelope.event,
+                );
+            }
             _ => {}
         }
     }
@@ -754,6 +838,88 @@ mod tests {
 
         admission.grant();
         held.await.expect("admission task should finish");
+    }
+
+    #[tokio::test]
+    async fn scheduler_admission_tracks_initial_and_reused_subagent_turns_by_generation() {
+        let controls = RunControls::new();
+        let admission = controls.scheduler_admission();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        let execution = ExecutionId::new(0);
+        let firing = FiringId::new(1);
+        admission.started(execution, firing);
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentSpawned {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            task:       "work".to_string(),
+            generation: 1,
+        });
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentSpawned {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            task:       "duplicate".to_string(),
+            generation: 1,
+        });
+        assert_eq!(
+            admission.state().active_subagents.len(),
+            1,
+            "duplicate lifecycle delivery is idempotent"
+        );
+
+        let _wait = admission.wait(execution, firing);
+        assert!(
+            events.try_recv().is_err(),
+            "the firing is not quiescent while its descendant works"
+        );
+
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentCompleted {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            generation: 0,
+            success:    true,
+            turns_used: 1,
+        });
+        assert!(
+            events.try_recv().is_err(),
+            "a stale generation cannot finish the active initial turn"
+        );
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentCompleted {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            generation: 1,
+            success:    true,
+            turns_used: 1,
+        });
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+
+        admission.grant();
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentTurnStarted {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            task:       "more work".to_string(),
+            generation: 2,
+        });
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentCompleted {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            generation: 1,
+            success:    true,
+            turns_used: 1,
+        });
+        assert!(
+            events.try_recv().is_err(),
+            "a previous generation cannot finish a reused turn"
+        );
+        admission.observe_subagent_event(execution, firing, &CodingEvent::SubAgentCompleted {
+            agent_id:   "child".to_string(),
+            depth:      1,
+            generation: 2,
+            success:    true,
+            turns_used: 1,
+        });
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
     }
 
     #[tokio::test]

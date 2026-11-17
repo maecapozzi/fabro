@@ -16,8 +16,9 @@
 //! definitions beside Pebble's, every call passes through the run's tool
 //! hooks (a `pre_tool_use` hook from `[[run.hooks]]` can block one), Pebble
 //! reports the call on its event stream, and Petri records it under the
-//! stage. A sub-agent inherits them through Pebble's own rule, since the
-//! registration marks every run tool `allow_in_subagents`.
+//! stage. A sub-agent inherits them through Pebble's own rule, except that a
+//! scheduler-aware gather stays on the root session: releasing admission is a
+//! whole-stage operation, so it cannot be initiated from one descendant.
 //!
 //! # Identity
 //!
