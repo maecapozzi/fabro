@@ -22,8 +22,8 @@ use fabro_store::platform_records::{
 use fabro_types::settings::ServerAuthMethod;
 use fabro_types::settings::run::{ApprovalMode, RunMode};
 use fabro_types::{
-    AuthMethod, BlobHash, GitRunTarget, InterviewQuestionRecord, ModelRef, QuestionType, RunId,
-    RunTarget, SandboxProviderKind, SuccessReason, SystemActorKind, fixtures,
+    AuthMethod, BlobHash, GitRunTarget, InterviewOption, InterviewQuestionRecord, ModelRef,
+    QuestionType, RunId, RunTarget, SandboxProviderKind, SuccessReason, SystemActorKind, fixtures,
 };
 use fabro_util::check_report::CheckStatus;
 use httpmock::Method::{GET, POST};
@@ -8194,9 +8194,9 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
         .mock_async(|when, then| {
             when.method(POST)
                 .path("/chat.postMessage")
-                .body_includes("Fabro needs your approval")
+                .body_includes("Approval needed")
                 .body_includes("Approve")
-                .body_includes("Open in Fabro")
+                .body_includes("Open approval in Fabro")
                 .body_includes(&child_url)
                 .body_excludes(parent_run_id.to_string());
             then.status(200).json_body(json!({
@@ -8253,7 +8253,7 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
             when.method(POST)
                 .path("/chat.update")
                 .body_includes(r#""text":"Approved: Test""#)
-                .body_includes("Open in Fabro")
+                .body_includes("Open task in Fabro")
                 .body_includes(&child_url);
             then.status(200).json_body(json!({ "ok": true }));
         })
@@ -8316,6 +8316,69 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
 }
 
 #[tokio::test]
+async fn child_navigation_link_accepts_nested_native_context_only_for_actual_parent() {
+    let (state, app) = jwt_auth_app();
+    let user_jwt = issue_test_user_jwt();
+    let parent_run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let other_parent_id = create_run_with_bearer(&app, &user_jwt).await;
+    let worker_token = issue_test_run_tools_worker_token(&parent_run_id);
+    let child_run_id =
+        create_pending_worker_child(&app, &user_jwt, parent_run_id, &worker_token).await;
+    let child_url = state
+        .run_web_url(&child_run_id)
+        .expect("test server should expose a child URL");
+    let mut question = Question::new(
+        "CHILD QUESTION — Open the linked child and answer there.",
+        QuestionType::MultipleChoice,
+    );
+    question.context_display = Some(
+        json!({
+            "preferred_next_label": "question",
+            "outcome": "succeeded",
+            "context_updates": {
+                "monitoring": "question",
+                "child_run_id": child_run_id,
+                "child_status": "waiting for input",
+                "child_run_url": "https://untrusted.example/not-used"
+            }
+        })
+        .to_string(),
+    );
+    question.options = vec![InterviewOption {
+        key:         "recheck_child".to_string(),
+        label:       "Check again".to_string(),
+        description: None,
+        preview:     None,
+    }];
+
+    assert_eq!(
+        verified_child_action_url(state.as_ref(), parent_run_id, &question).await,
+        Some(child_url)
+    );
+    assert_eq!(
+        verified_child_action_url(state.as_ref(), other_parent_id, &question).await,
+        None
+    );
+
+    question.text = "CHILD LAUNCH APPROVAL — Open the linked child and approve it.".to_string();
+    question.context_display = Some(
+        json!({
+            "preferred_next_label": "Recheck child launch approval",
+            "child_run_id": child_run_id,
+            "child_status": "pending approval_required",
+            "child_run_url": "https://untrusted.example/not-used"
+        })
+        .to_string(),
+    );
+    assert!(
+        verified_child_action_url(state.as_ref(), parent_run_id, &question)
+            .await
+            .is_some(),
+        "existing flat routing context remains supported"
+    );
+}
+
+#[tokio::test]
 async fn child_decision_does_not_rewrite_unbound_parent_launch_questions() {
     let (state, app) = jwt_auth_app();
     let user_jwt = issue_test_user_jwt();
@@ -8362,11 +8425,15 @@ async fn child_decision_does_not_rewrite_unbound_parent_launch_questions() {
             .lock()
             .expect("slack posted messages lock poisoned")
             .insert((parent_run_id, qid.to_string()), SlackPostedQuestion {
-                message: SlackPostedMessage {
+                message:     SlackPostedMessage {
                     channel_id: "C-parent".to_string(),
                     ts:         ts.to_string(),
                 },
-                text:    question.text.clone(),
+                text:        question.text.clone(),
+                task:        "Parent task".to_string(),
+                repository:  Some("maecapozzi/fabro".to_string()),
+                run_web_url: Some(format!("https://fabro.example/runs/{parent_run_id}")),
+                child_run:   false,
             });
     }
 
@@ -8409,7 +8476,7 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
                 .path("/chat.update")
                 .body_includes(r#""text":"Approved: Child A""#)
                 .body_includes("Approved")
-                .body_includes("Open in Fabro");
+                .body_includes("Open task in Fabro");
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
@@ -8419,7 +8486,7 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
                 .path("/chat.update")
                 .body_includes(r#""text":"Denied: Child B""#)
                 .body_includes("Denied")
-                .body_includes("Open in Fabro");
+                .body_includes("Open task in Fabro");
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
