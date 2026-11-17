@@ -80,7 +80,7 @@ use fabro_petri::artifacts::ClientArtifactWriter;
 use fabro_petri::blobs::ClientBlobs;
 use fabro_petri::controls::{
     RunControls, SCHEDULER_ADMISSION_RELEASED_NOTICE, SCHEDULER_READMISSION_REQUESTED_NOTICE,
-    SchedulerAdmissionEvent, SteerError,
+    SchedulerAdmission, SchedulerAdmissionEvent, SteerError,
 };
 use fabro_petri::engine::{self, Conclusion, Execution, RunRequest};
 use fabro_petri::hooks::{HooksSpec, RunPublisher};
@@ -100,11 +100,12 @@ use fabro_store::platform_records::{
 };
 use fabro_types::settings::run::{ApprovalMode, RunMode};
 use fabro_types::{FailureReason, Principal, RunId, RunNoticeLevel, RunStatus, SuccessReason};
+use fabro_util::error;
 use fabro_util::exit::{ErrorExt as _, ExitClass};
 use fabro_vault::Vault;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::services::FabroRunToolServices;
-use tokio::sync::{RwLock as AsyncRwLock, oneshot};
+use tokio::sync::{RwLock as AsyncRwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -685,7 +686,7 @@ fn mirror_paused_state(
 /// records only transfer ownership of the shared slot.
 pub(super) fn mirror_scheduler_admission(
     run_id: RunId,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<SchedulerAdmissionEvent>,
+    mut events: mpsc::UnboundedReceiver<SchedulerAdmissionEvent>,
     records: Arc<dyn PlatformRecords>,
     failure: oneshot::Sender<String>,
 ) -> JoinHandle<()> {
@@ -706,7 +707,7 @@ pub(super) fn mirror_scheduler_admission(
                 .append(&run_id, &PlatformRecord::RunNotice(record), None)
                 .await
             {
-                let rendered = fabro_util::error::collect_chain(&error).join(": ");
+                let rendered = error::collect_chain(&error).join(": ");
                 let _ = failure.send(rendered);
                 return;
             }
@@ -770,7 +771,7 @@ async fn runtime_spec(
     run_state: &RunProjection,
     fabro_home: Option<PathBuf>,
     run_tools: Option<FabroRunToolServices>,
-    scheduler_admission: Option<fabro_petri::controls::SchedulerAdmission>,
+    scheduler_admission: Option<SchedulerAdmission>,
 ) -> Result<RuntimeSpec> {
     let credentials: Arc<dyn CredentialProvider> =
         Arc::new(VaultCredentialSource::new(Arc::clone(vault)));

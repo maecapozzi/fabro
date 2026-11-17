@@ -79,13 +79,15 @@ pub enum SchedulerAdmissionEvent {
     ReadmissionRequested,
 }
 
+type LiveFirings = BTreeSet<(ExecutionId, FiringId)>;
+
 #[derive(Default)]
 struct SchedulerAdmissionState {
     held:                  bool,
     admitted:              bool,
     release_reported:      bool,
     readmission_requested: bool,
-    live:                  BTreeSet<(ExecutionId, FiringId)>,
+    live:                  LiveFirings,
     waiting:               BTreeSet<(ExecutionId, FiringId)>,
     active_subagents:      BTreeSet<(ExecutionId, FiringId, String, u64)>,
     pause_requested:       bool,
@@ -527,6 +529,7 @@ pub struct RunControls {
     service:             ControlService,
     agents:              Arc<Mutex<LiveAgents>>,
     scheduler_admission: SchedulerAdmission,
+    resumed_live:        Arc<Mutex<Option<LiveFirings>>>,
     scheduler_events:    Arc<Mutex<Option<mpsc::UnboundedReceiver<SchedulerAdmissionEvent>>>>,
 }
 
@@ -553,6 +556,7 @@ impl RunControls {
                     events,
                 }),
             },
+            resumed_live:        Arc::new(Mutex::new(None)),
             scheduler_events:    Arc::new(Mutex::new(Some(scheduler_events))),
         }
     }
@@ -691,6 +695,18 @@ impl RunControls {
         self.service.wire(handle);
     }
 
+    /// Stage the live firings reconstructed from the durable engine logs.
+    /// Petri calls `on_resumed` before it redispatches any of them.
+    pub(crate) fn prepare_resume_admission(
+        &self,
+        live: impl IntoIterator<Item = (ExecutionId, FiringId)>,
+    ) {
+        *self
+            .resumed_live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(live.into_iter().collect());
+    }
+
     /// The observer to register on the run: the service's own, which keeps
     /// the live firing of every stage and the paused state across a
     /// resume, and the live agent stages beside it.
@@ -767,6 +783,24 @@ impl ExecutionObserver for RunControls {
     }
 
     fn on_resumed(&self, state: &CoordinatorState) {
+        let live = self
+            .resumed_live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        let released = {
+            let mut admission = self.scheduler_admission.state();
+            admission.live = live;
+            admission.pause_requested = state.paused;
+            self.scheduler_admission
+                .report_release_if_quiescent(&mut admission)
+        };
+        if released {
+            self.scheduler_admission.inner.released.notify_waiters();
+        }
+        // Publish Petri's resumed pause only after scheduler accounting is
+        // authoritative. Its watch wakes the lifecycle mirror concurrently.
         self.service.on_resumed(state);
     }
 }
@@ -995,6 +1029,83 @@ mod tests {
         assert!(!held.is_finished());
         admission.grant();
         held.await.expect("readmitted pause should open");
+    }
+
+    #[tokio::test]
+    async fn resumed_paused_admission_starts_with_replayed_active_work() {
+        let controls = RunControls::new();
+        let admission = controls.scheduler_admission();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        let execution = ExecutionId::new(0);
+        let active = FiringId::new(1);
+        controls.prepare_resume_admission([(execution, active)]);
+
+        controls.on_resumed(&CoordinatorState {
+            paused: true,
+            ..CoordinatorState::default()
+        });
+        assert!(
+            events.try_recv().is_err(),
+            "replayed work must retain the slot"
+        );
+
+        admission.finished(execution, active);
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+    }
+
+    #[tokio::test]
+    async fn resumed_idle_pause_releases_without_a_watch_change() {
+        let controls = RunControls::new();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        controls.prepare_resume_admission([]);
+
+        controls.on_resumed(&CoordinatorState {
+            paused: true,
+            ..CoordinatorState::default()
+        });
+
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+    }
+
+    #[tokio::test]
+    async fn resumed_parallel_work_prevents_a_human_wait_from_releasing_early() {
+        let controls = RunControls::new();
+        let admission = controls.scheduler_admission();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        let execution = ExecutionId::new(0);
+        let gate = FiringId::new(1);
+        let active = FiringId::new(2);
+        controls.prepare_resume_admission([(execution, gate), (execution, active)]);
+        controls.on_resumed(&CoordinatorState::default());
+
+        let wait = admission.wait(execution, gate);
+        assert!(
+            events.try_recv().is_err(),
+            "the parallel replay still owns the slot"
+        );
+        admission.finished(execution, active);
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+
+        drop(wait);
+        let held = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.before_attempt().await }
+        });
+        task::yield_now().await;
+        assert_eq!(
+            events.recv().await,
+            Some(SchedulerAdmissionEvent::ReadmissionRequested)
+        );
+        assert!(!held.is_finished());
+        admission.grant();
+        held.await
+            .expect("the answered replay should be readmitted");
     }
 
     #[tokio::test]
