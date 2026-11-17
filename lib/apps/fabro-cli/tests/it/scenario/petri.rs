@@ -1237,6 +1237,324 @@ async fn worker_idle_pause_reacquires_one_shared_scheduler_slot() {
     server.shutdown();
 }
 
+/// Restart reconstructs a paused worker's already-started firing before the
+/// scheduler can release its one slot. Once that firing drains, the idle pause
+/// releases and an unpause waits for readmission.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_restart_reconciles_active_and_idle_paused_admission() {
+    let context = test_context!();
+    let mut server = RunningServer::start_with_env(
+        "\n[server.scheduler]\nmax_concurrent_runs = 1\n",
+        &[],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let markers = context.temp_dir.join("restart-pause-markers");
+    std::fs::create_dir_all(&markers).expect("the marker dir creates");
+    let first_started = markers.join("first-started");
+    let release_first = markers.join("release-first");
+    let second_started = markers.join("second-started");
+    let workflow = format!(
+        r#"digraph PausedRestart {{
+    graph [goal="Resume a paused command", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    first [shape=parallelogram, script="touch {first_started}; while [ ! -f {release_first} ]; do sleep 0.05; done"]
+    second [shape=parallelogram, script="touch {second_started}"]
+    start -> first -> second -> exit
+}}"#,
+        first_started = first_started.display(),
+        release_first = release_first.display(),
+        second_started = second_started.display(),
+    );
+    let workspace = write_petri_workflow(&context, &workflow);
+    let paused_run = run_detached_with(&context, &server, &workspace, &[]);
+    wait_for_path(&first_started, "the first command should start").await;
+    post_run_action(&server, &paused_run, "pause").await;
+    let original_worker = wait_for_worker(&paused_run);
+
+    server.kill();
+    fabro_proc::sigkill_process_group(original_worker);
+    server.launch().await;
+    let resumed_worker = wait_for_worker_except(&paused_run, Some(original_worker));
+    wait_until_gate_is_polled(&release_first);
+
+    let occupied = markers.join("occupied");
+    let release_occupant = markers.join("release-occupant");
+    let occupant = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        occupied.display(),
+        release_occupant.display()
+    );
+    let workspace = write_petri_workspace(&context, &occupant);
+    let occupying_run = run_detached_with(&context, &server, &workspace, &[]);
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !occupied.exists(),
+        "replayed active work must retain the only scheduler slot\nserver stderr:\n{}",
+        server.stderr_text()
+    );
+
+    std::fs::write(&release_first, "go").expect("the replayed command releases");
+    wait_for_path(
+        &occupied,
+        "the idle paused replay should release its scheduler slot",
+    )
+    .await;
+    assert!(
+        !second_started.exists(),
+        "the replayed pause must still hold the next command"
+    );
+
+    post_run_action(&server, &paused_run, "unpause").await;
+    let duplicate = fabro_test::test_http_client()
+        .post(format!(
+            "{}/api/v1/runs/{paused_run}/unpause",
+            server.api_base_url
+        ))
+        .bearer_auth(TEST_DEV_TOKEN)
+        .send()
+        .await
+        .expect("the duplicate unpause sends");
+    assert_eq!(
+        duplicate.status(),
+        fabro_http::StatusCode::CONFLICT,
+        "the duplicate unpause should be refused"
+    );
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !second_started.exists(),
+        "duplicate unpause must still wait for scheduler readmission"
+    );
+    assert_eq!(
+        worker_pid_other_than(&paused_run, Some(resumed_worker)),
+        None,
+        "duplicate unpause must not launch another worker"
+    );
+
+    std::fs::write(&release_occupant, "go").expect("the occupying command releases");
+    assert_eq!(
+        wait_for_status(&server, &occupying_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert_eq!(
+        wait_for_status(&server, &paused_run, &["succeeded", "failed"]).await,
+        "succeeded",
+        "server stderr:\n{}",
+        server.stderr_text()
+    );
+    assert!(second_started.exists());
+    server.shutdown();
+}
+
+/// A restarted human wait releases its slot once replay reaches the durable
+/// question. Its answer then waits behind another run for one-slot readmission.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_restart_reconciles_blocked_wait_before_answer_readmission() {
+    let context = test_context!();
+    let mut server = RunningServer::start_with_env(
+        "\n[server.scheduler]\nmax_concurrent_runs = 1\n",
+        &[],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let markers = context.temp_dir.join("restart-blocked-markers");
+    std::fs::create_dir_all(&markers).expect("the marker dir creates");
+    let workspace = write_petri_workflow(&context, &gate_dot(&markers, ""));
+    let blocked_run = run_detached_with(&context, &server, &workspace, &[]);
+    let pending = wait_for_questions(&server, &blocked_run, 1).await;
+    let question_id = pending[0]["id"].as_str().expect("an id").to_string();
+    let original_worker = wait_for_worker(&blocked_run);
+
+    server.kill();
+    fabro_proc::sigkill_process_group(original_worker);
+    server.launch().await;
+    let resumed_worker = wait_for_worker_except(&blocked_run, Some(original_worker));
+    let _ = wait_for_questions(&server, &blocked_run, 1).await;
+
+    let occupied = markers.join("occupied");
+    let release_occupant = markers.join("release-occupant");
+    let occupant = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        occupied.display(),
+        release_occupant.display()
+    );
+    let workspace = write_petri_workspace(&context, &occupant);
+    let occupying_run = run_detached_with(&context, &server, &workspace, &[]);
+    wait_for_path(
+        &occupied,
+        "the quiescent blocked replay should release its slot",
+    )
+    .await;
+
+    let mut url = fabro_http::Url::parse(&format!(
+        "{}/api/v1/runs/{blocked_run}/questions",
+        server.api_base_url
+    ))
+    .expect("the API base URL parses");
+    url.path_segments_mut()
+        .expect("the API URL has a path")
+        .push(&question_id)
+        .push("answer");
+    let first = tokio::spawn({
+        let url = url.clone();
+        async move {
+            fabro_test::test_http_client()
+                .post(url)
+                .bearer_auth(TEST_DEV_TOKEN)
+                .json(&serde_json::json!({ "kind": "yes" }))
+                .send()
+                .await
+                .expect("the first answer sends")
+        }
+    });
+    let duplicate = tokio::spawn(async move {
+        fabro_test::test_http_client()
+            .post(url)
+            .bearer_auth(TEST_DEV_TOKEN)
+            .json(&serde_json::json!({ "kind": "yes" }))
+            .send()
+            .await
+            .expect("the duplicate answer sends")
+    });
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !markers.join("yes").exists(),
+        "the accepted answer must wait for scheduler readmission"
+    );
+    assert_eq!(
+        worker_pid_other_than(&blocked_run, Some(resumed_worker)),
+        None,
+        "duplicate answers must not launch another worker"
+    );
+
+    std::fs::write(&release_occupant, "go").expect("the occupying command releases");
+    let statuses = [
+        first.await.expect("the first answer task joins").status(),
+        duplicate
+            .await
+            .expect("the duplicate answer task joins")
+            .status(),
+    ];
+    assert!(
+        statuses.contains(&fabro_http::StatusCode::NO_CONTENT),
+        "one answer must be accepted: {statuses:?}"
+    );
+    assert_eq!(
+        wait_for_status(&server, &occupying_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert_eq!(
+        wait_for_status(&server, &blocked_run, &["succeeded", "failed"]).await,
+        "succeeded",
+        "server stderr:\n{}",
+        server.stderr_text()
+    );
+    assert!(markers.join("yes").exists());
+    server.shutdown();
+}
+
+/// A resumed parallel command keeps the slot while its sibling is at a human
+/// wait. Answering that sibling cannot make the scheduler overcommit.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_restart_retains_parallel_work_during_a_human_wait() {
+    let context = test_context!();
+    let mut server = RunningServer::start_with_env(
+        "\n[server.scheduler]\nmax_concurrent_runs = 1\n",
+        &[],
+        &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+    )
+    .await;
+    let markers = context.temp_dir.join("restart-parallel-markers");
+    std::fs::create_dir_all(&markers).expect("the marker dir creates");
+    let active_started = markers.join("active-started");
+    let release_active = markers.join("release-active");
+    let after_join = markers.join("after-join");
+    let workflow = format!(
+        r#"digraph ParallelRestart {{
+    graph [goal="Resume parallel work and a question", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    fan [shape=component]
+    active [shape=parallelogram, script="touch {active_started}; while [ ! -f {release_active} ]; do sleep 0.05; done"]
+    gate [shape=hexagon, label="Continue?", question_type="yes_no"]
+    join [shape=tripleoctagon]
+    after [shape=parallelogram, script="touch {after_join}"]
+    start -> fan
+    fan -> active
+    fan -> gate
+    active -> join
+    gate -> join [label="[Y] Yes"]
+    gate -> join [label="[N] No"]
+    join -> after -> exit
+}}"#,
+        active_started = active_started.display(),
+        release_active = release_active.display(),
+        after_join = after_join.display(),
+    );
+    let workspace = write_petri_workflow(&context, &workflow);
+    let parallel_run = run_detached_with(&context, &server, &workspace, &[]);
+    wait_for_path(&active_started, "the parallel command should start").await;
+    let pending = wait_for_questions(&server, &parallel_run, 1).await;
+    let question_id = pending[0]["id"].as_str().expect("an id").to_string();
+    let original_worker = wait_for_worker(&parallel_run);
+
+    server.kill();
+    fabro_proc::sigkill_process_group(original_worker);
+    server.launch().await;
+    let _resumed_worker = wait_for_worker_except(&parallel_run, Some(original_worker));
+    wait_until_gate_is_polled(&release_active);
+    let _ = wait_for_questions(&server, &parallel_run, 1).await;
+
+    let occupied = markers.join("occupied");
+    let release_occupant = markers.join("release-occupant");
+    let occupant = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        occupied.display(),
+        release_occupant.display()
+    );
+    let workspace = write_petri_workspace(&context, &occupant);
+    let occupying_run = run_detached_with(&context, &server, &workspace, &[]);
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !occupied.exists(),
+        "the replayed parallel command must retain the only slot"
+    );
+
+    answer(
+        &server,
+        &parallel_run,
+        &question_id,
+        serde_json::json!({ "kind": "yes" }),
+    )
+    .await;
+    tokio::time::sleep(POLL * 4).await;
+    assert!(
+        !occupied.exists() && !after_join.exists(),
+        "the human answer must not hide replayed parallel work"
+    );
+
+    std::fs::write(&release_active, "go").expect("the parallel command releases");
+    assert_eq!(
+        wait_for_status(&server, &parallel_run, &["succeeded", "failed"]).await,
+        "succeeded",
+        "server stderr:\n{}",
+        server.stderr_text()
+    );
+    wait_for_path(
+        &occupied,
+        "the next run should start after parallel replay finishes",
+    )
+    .await;
+    std::fs::write(&release_occupant, "go").expect("the occupying command releases");
+    assert_eq!(
+        wait_for_status(&server, &occupying_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert!(after_join.exists());
+    server.shutdown();
+}
+
 async fn wait_for_path(path: &Path, expectation: &str) {
     let deadline = Instant::now() + RUN_TIMEOUT;
     while !path.exists() {

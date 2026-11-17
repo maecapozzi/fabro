@@ -75,6 +75,7 @@ use petri_runtime::driver::ExecutionReport;
 use petri_runtime::driver::lifecycle::ExecutionHooks;
 pub use petri_runtime::executor::Retention;
 use petri_runtime::executor::SecretProvider;
+use petri_runtime::ir::FiringId;
 use petri_runtime::{DaytonaResources, LostSandbox, RunOptions, Runtime, SandboxBackend};
 use sandbox_driver::NetworkPolicy;
 use tokio::fs;
@@ -238,8 +239,8 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
         .transpose()
         .map_err(RunError::ModelHeaders)?;
     let key = RunKey::new(request.run_id.as_str());
-    let stall_timeout = match &request.execution {
-        Execution::Start(graphs) => graphs.graph.policy.stall_timeout,
+    let (stall_timeout, resume_inspection) = match &request.execution {
+        Execution::Start(graphs) => (graphs.graph.policy.stall_timeout, None),
         Execution::Resume(graphs) => {
             let logs = request
                 .store
@@ -248,12 +249,24 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
                 .map_err(RunError::Open)?;
             // A persisted disabled policy stays disabled. Only a run with no
             // root yet uses the graph that the resume-to-start fallback runs.
-            host::stored_root_graph(&*logs)
+            let stored = host::stored_root_graph(&*logs)
                 .await
-                .map_err(RunError::Read)?
+                .map_err(RunError::Read)?;
+            let timeout = stored
+                .as_ref()
                 .map_or(graphs.graph.policy.stall_timeout, |graph| {
                     graph.policy.stall_timeout
-                })
+                });
+            let inspection = if stored.is_some() {
+                Some(
+                    inspect::inspect_run(&*logs)
+                        .await
+                        .map_err(RunError::Inspect)?,
+                )
+            } else {
+                None
+            };
+            (timeout, inspection)
         }
     };
     let watchdog = stall_timeout.map(StallWatchdog::new);
@@ -321,6 +334,27 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     // so a held attempt runs none of them until the unpause.
     // The live-turn set beside it: what an interrupt can reach.
     let controls = request.controls;
+    if let Some(inspection) = &resume_inspection {
+        let live: Vec<_> = inspection
+            .executions
+            .iter()
+            .flat_map(|execution| {
+                let execution_id = execution.execution;
+                execution
+                    .engine
+                    .iter()
+                    .flat_map(|engine| &engine.live)
+                    .filter(|firing| firing.started && !firing.awaiting_retry && !firing.cancelling)
+                    .map(move |firing| (execution_id, FiringId::new(firing.firing)))
+            })
+            .collect();
+        info!(
+            replayed_active_firings = live.len(),
+            paused = inspection.paused,
+            "Reconstructed scheduler admission from the run record"
+        );
+        controls.prepare_resume_admission(live);
+    }
     let installed = runtime.installed_hooks();
     runtime = runtime
         .hooks(controls.hooks(installed))

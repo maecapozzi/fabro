@@ -266,6 +266,7 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Notify;
     use tokio::task;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -362,7 +363,7 @@ mod tests {
                     fabro_tool::FABRO_RUN_GET_TOOL_NAME,
                     json!({"run_id": "missing"}),
                 ),
-                Default::default(),
+                CancellationToken::default(),
             )
             .await
             .expect("the ordinary registered tool executes");
@@ -392,7 +393,7 @@ mod tests {
                                 "poll_interval_seconds": 5,
                             }),
                         ),
-                        Default::default(),
+                        CancellationToken::default(),
                     )
                     .await
             }

@@ -63,6 +63,7 @@ fabro-github = { path = "../fabro-github", features = ["test-support"] }
 fabro-workflow = { path = ".", features = ["test-support"] }
 sandbox-driver-host.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio-util.workspace = true
 httpmock = "0.8"
 fabro-macros = { path = "../../foundation/fabro-macros" }
 fabro-test = { workspace = true }
