@@ -4,6 +4,7 @@ import {
   CheckIcon,
   ChevronRightIcon,
 } from "@heroicons/react/20/solid";
+import { Link } from "react-router";
 import { QuestionType } from "@qltysh/fabro-api-client";
 import type {
   ApiQuestion,
@@ -89,7 +90,9 @@ function InterviewQuestionDock({
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const submitting = submitMutation.isMutating;
-  const reviewTarget = safeReviewTarget(question.review_target);
+  const launchNavigation = launchNavigationPresentation(question);
+  const displayQuestion = launchNavigation?.question ?? question;
+  const reviewTarget = launchNavigation ? null : safeReviewTarget(question.review_target);
 
   const submit = useCallback(
     async (answer: SubmitInterviewAnswer) => {
@@ -111,7 +114,7 @@ function InterviewQuestionDock({
       tone="waiting"
       status="Awaiting input"
       stage={question.stage}
-      peek={question.text}
+      peek={launchNavigation?.text ?? question.text}
       collapsed={collapsed}
       onCollapsedChange={setCollapsed}
       headerActions={
@@ -134,9 +137,17 @@ function InterviewQuestionDock({
               className={QUESTION_TEXT}
             />
           ) : (
-            <p className={QUESTION_TEXT}>{question.text}</p>
+            <p className={QUESTION_TEXT}>{launchNavigation?.text ?? question.text}</p>
           )}
-          {question.context_display && (
+          {launchNavigation && (
+            <Link
+              to={`/runs/${runId}/children`}
+              className="inline-flex text-sm font-medium text-teal-500 hover:text-teal-400"
+            >
+              Open linked tasks
+            </Link>
+          )}
+          {!launchNavigation && question.context_display && (
             <ContextPanel text={question.context_display} />
           )}
         </>
@@ -144,7 +155,7 @@ function InterviewQuestionDock({
       actions={
         <>
           <QuestionBody
-            question={question}
+            question={displayQuestion}
             submitting={submitting}
             onSubmit={submit}
           />
@@ -153,6 +164,67 @@ function InterviewQuestionDock({
       }
     />
   );
+}
+
+interface LaunchNavigationPresentation {
+  text: string;
+  question: ApiQuestion;
+}
+
+export function launchNavigationPresentation(
+  question: ApiQuestion,
+): LaunchNavigationPresentation | null {
+  const context = question.context_display?.trim();
+  if (!context?.startsWith("{")) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(context);
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const routing = parsed as Record<string, unknown>;
+  const hasChildRouting =
+    "child_run_id" in routing
+    || "child_run_url" in routing
+    || "child_status" in routing;
+  const text = question.text.toLowerCase();
+  const asksForLaunchNavigation =
+    text.includes("child launch approval")
+    || (text.includes("linked child")
+      && (text.includes("approve") || text.includes("children tab")));
+  if (!hasChildRouting || !asksForLaunchNavigation) return null;
+
+  return {
+    text:
+      "Review the linked task’s current launch status, then use Check again to continue this task.",
+    question: {
+      ...question,
+      context_display: null,
+      options: question.options.map((option) => ({
+        ...option,
+        label: launchNavigationOptionLabel(option.label),
+      })),
+    },
+  };
+}
+
+function launchNavigationOptionLabel(label: string): string {
+  const normalized = label.trim().toLowerCase();
+  if (
+    normalized.includes("recheck")
+    || normalized.includes("check again")
+    || normalized.includes("refresh")
+  ) {
+    return "Check again";
+  }
+  if (normalized.includes("stop") || normalized.includes("cancel")) {
+    return "Stop";
+  }
+  return label;
 }
 
 /**

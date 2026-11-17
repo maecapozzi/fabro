@@ -200,52 +200,11 @@ async fn approve_run(
     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
         return response;
     }
-    let run_state = match run_records::require_projection(state.as_ref(), id).await {
-        Ok(run_state) => run_state,
-        Err(err) => return err.into_response(),
-    };
-    if !matches!(run_state.status, RunStatus::Pending {
-        reason: PendingReason::ApprovalRequired,
-    }) {
-        return ApiError::new(StatusCode::CONFLICT, "Run is not pending approval.").into_response();
-    }
     let _ = user;
-
-    for record in [
-        RunLifecycleRecord::new(RunLifecycleKind::Approved),
-        run_records::runnable(RunRunnableSource::Approved),
-    ] {
-        if let Err(err) = run_records::lifecycle(state.as_ref(), id, record).await {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    match decide_run_approval(state.as_ref(), id, ApprovalDecision::Approve).await {
+        Ok(()) => run_response(state.as_ref(), id, StatusCode::OK).await,
+        Err(err) => err.into_response(),
     }
-
-    {
-        let mut runs = state.runs.lock().expect("runs lock poisoned");
-        if let Some(managed_run) = runs.get_mut(&id) {
-            managed_run.status = RunStatus::Runnable;
-        } else {
-            let run_dir = Storage::new(state.server_storage_dir())
-                .run_scratch(&id)
-                .root()
-                .to_path_buf();
-            let dot_source = run_state.spec.graph_source.clone().unwrap_or_default();
-            runs.insert(
-                id,
-                managed_run(
-                    dot_source,
-                    RunStatus::Runnable,
-                    id.created_at(),
-                    run_dir,
-                    RunExecutionMode::Start,
-                ),
-            );
-        }
-    }
-
-    state.scheduler_notify.notify_one();
-    run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
 async fn deny_run(
@@ -268,41 +227,120 @@ async fn deny_run(
     let message = reason
         .clone()
         .unwrap_or_else(|| "Not approved for execution".to_string());
-    let run_state = match run_records::require_projection(state.as_ref(), id).await {
-        Ok(run_state) => run_state,
-        Err(err) => return err.into_response(),
-    };
+    let _ = user;
+    match decide_run_approval(state.as_ref(), id, ApprovalDecision::DenyWithReason {
+        reason,
+        message,
+    })
+    .await
+    {
+        Ok(()) => run_response(state.as_ref(), id, StatusCode::OK).await,
+        Err(err) => err.into_response(),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::server) enum ApprovalDecision {
+    Approve,
+    Deny,
+    DenyWithReason {
+        reason:  Option<String>,
+        message: String,
+    },
+}
+
+pub(in crate::server) async fn decide_run_approval(
+    state: &AppState,
+    id: RunId,
+    decision: ApprovalDecision,
+) -> Result<(), ApiError> {
+    let _guard = state.approval_decision_locks.lock(id).await;
+    let run_state = run_records::require_projection(state, id).await?;
+    if run_state.archived_at.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Archived runs cannot be approved or denied.",
+        ));
+    }
     if !matches!(run_state.status, RunStatus::Pending {
         reason: PendingReason::ApprovalRequired,
-    }) {
-        return ApiError::new(StatusCode::CONFLICT, "Run is not pending approval.").into_response();
-    }
-    let _ = user;
-
-    let mut denied = RunLifecycleRecord::new(RunLifecycleKind::Denied);
-    denied.reason.clone_from(&reason);
-    for record in [
-        denied,
-        run_records::failed(FailureReason::ApprovalDenied, message.clone()),
-    ] {
-        if let Err(err) = run_records::lifecycle(state.as_ref(), id, record).await {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    }
-
+    }) || run_state
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.state != fabro_types::RunApprovalState::Pending)
     {
-        let mut runs = state.runs.lock().expect("runs lock poisoned");
-        if let Some(managed_run) = runs.get_mut(&id) {
-            managed_run.status = RunStatus::Failed {
-                reason: FailureReason::ApprovalDenied,
-            };
-            managed_run.error = Some(message);
-            clear_live_run_state(managed_run);
-        }
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Run is not pending approval.",
+        ));
     }
 
-    run_response(state.as_ref(), id, StatusCode::OK).await
+    match decision {
+        ApprovalDecision::Approve => {
+            for record in [
+                RunLifecycleRecord::new(RunLifecycleKind::Approved),
+                run_records::runnable(RunRunnableSource::Approved),
+            ] {
+                run_records::lifecycle(state, id, record)
+                    .await
+                    .map_err(|err| {
+                        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    })?;
+            }
+            let mut runs = state.runs.lock().expect("runs lock poisoned");
+            if let Some(managed_run) = runs.get_mut(&id) {
+                managed_run.status = RunStatus::Runnable;
+            } else {
+                let run_dir = Storage::new(state.server_storage_dir())
+                    .run_scratch(&id)
+                    .root()
+                    .to_path_buf();
+                let dot_source = run_state.spec.graph_source.clone().unwrap_or_default();
+                runs.insert(
+                    id,
+                    managed_run(
+                        dot_source,
+                        RunStatus::Runnable,
+                        id.created_at(),
+                        run_dir,
+                        RunExecutionMode::Start,
+                    ),
+                );
+            }
+            drop(runs);
+            state.scheduler_notify.notify_one();
+        }
+        ApprovalDecision::Deny | ApprovalDecision::DenyWithReason { .. } => {
+            let (reason, message) = match decision {
+                ApprovalDecision::Deny => {
+                    (None, "Not approved for execution from Slack".to_string())
+                }
+                ApprovalDecision::DenyWithReason { reason, message } => (reason, message),
+                ApprovalDecision::Approve => unreachable!(),
+            };
+            let mut denied = RunLifecycleRecord::new(RunLifecycleKind::Denied);
+            denied.reason.clone_from(&reason);
+            for record in [
+                denied,
+                run_records::failed(FailureReason::ApprovalDenied, message.clone()),
+            ] {
+                run_records::lifecycle(state, id, record)
+                    .await
+                    .map_err(|err| {
+                        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    })?;
+            }
+            let mut runs = state.runs.lock().expect("runs lock poisoned");
+            if let Some(managed_run) = runs.get_mut(&id) {
+                managed_run.status = RunStatus::Failed {
+                    reason: FailureReason::ApprovalDenied,
+                };
+                managed_run.error = Some(message);
+                clear_live_run_state(managed_run);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker_ref: WorkerRef) {

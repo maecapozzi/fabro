@@ -41,6 +41,8 @@ pub fn dispatch(envelope: &SocketEnvelope, thread_registry: &ThreadRegistry) -> 
                 qid: question_ref.qid,
                 answer: fabro_interview::Answer::text(text),
                 actor,
+                approval: None,
+                message: None,
             }))
         }
         SocketEventKind::Disconnect => DispatchAction::Reconnect,

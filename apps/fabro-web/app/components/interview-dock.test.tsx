@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
+import { MemoryRouter } from "react-router";
 import { SWRConfig } from "swr";
 import {
   type ApiQuestion,
@@ -10,6 +11,7 @@ import {
 import {
   contextPreview,
   InterviewDock,
+  launchNavigationPresentation,
   shouldStackOptions,
 } from "./interview-dock";
 import { displayLabel } from "./interview-label";
@@ -20,7 +22,7 @@ function render(node: React.ReactNode): TestRenderer.ReactTestRenderer {
   act(() => {
     tree = TestRenderer.create(
       <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
-        {node}
+        <MemoryRouter>{node}</MemoryRouter>
       </SWRConfig>,
     );
   });
@@ -299,6 +301,45 @@ describe("InterviewDock", () => {
     const text = textContent(tree.toJSON());
     expect(text).toContain("Context from preceding stage");
     expect(text).toContain("1. Deploy");
+  });
+
+  test("keeps a launch-navigation gate honest after the child decision changes", () => {
+    const question = makeQuestion({
+      text:
+        "CHILD LAUNCH APPROVAL — Open the linked child from this run's Children tab and approve it.",
+      question_type: QuestionType.MULTIPLE_CHOICE,
+      options: [
+        {
+          key: "recheck_child",
+          label: "Recheck whether the child was approved and continue orchestration",
+        },
+        { key: "stop_parent", label: "Stop the parent orchestrator" },
+      ],
+      context_display: JSON.stringify({
+        child_run_id: "untrusted-child-id",
+        child_run_url: "https://untrusted.example/runs/wrong",
+        child_status: "pending_approval",
+      }),
+    });
+    const presentation = launchNavigationPresentation(question);
+
+    expect(presentation?.text).toContain("current launch status");
+    expect(presentation?.text).not.toContain("approval is still needed");
+    expect(presentation?.question.options.map((option) => option.label)).toEqual([
+      "Check again",
+      "Stop",
+    ]);
+
+    const tree = render(<InterviewDock runId="parent-run" questions={[question]} />);
+    const text = textContent(tree.toJSON());
+    expect(text).toContain("Review the linked task’s current launch status");
+    expect(text).not.toContain("CHILD LAUNCH APPROVAL");
+    expect(text).not.toContain("untrusted-child-id");
+    expect(buttonsByText(tree)["Check again"]).toBeDefined();
+    expect(buttonsByText(tree).Approve).toBeUndefined();
+    expect(
+      tree.root.findByType("a").props.href,
+    ).toBe("/runs/parent-run/children");
   });
 
   test("context starts closed so it costs one line, not a standing panel", () => {
