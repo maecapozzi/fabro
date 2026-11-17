@@ -67,7 +67,7 @@ use fabro_petri::projector::Projector;
 use fabro_petri::providers::SandboxProviderConfig;
 use fabro_petri::prune::{self, PruneError, PruneRequest};
 use fabro_redact::redact_jsonl_line;
-use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
+use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackAuthIdentity, SlackClient};
 use fabro_slack::config::{
     SlackCredentialResolution,
     resolve_credentials_status_with_lookup as resolve_slack_credentials_status_with_lookup,
@@ -584,12 +584,8 @@ struct SlackLifecyclePullRequest {
 /// the update that closes it.
 #[derive(Debug, Clone)]
 struct SlackPostedQuestion {
-    message:           SlackPostedMessage,
-    text:              String,
-    question:          fabro_interview::Question,
-    task:              String,
-    repository:        Option<String>,
-    launch_navigation: bool,
+    message: SlackPostedMessage,
+    text:    String,
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +595,9 @@ struct SlackPostedApproval {
     repository:  Option<String>,
     run_web_url: String,
 }
+
+const SLACK_LAUNCH_APPROVAL_ROUTE: &str = "slack.launch_approval";
+const SLACK_LAUNCH_APPROVAL_EVENT: &str = "run.approval_required";
 
 impl SlackPostedApproval {
     fn owns_message(&self, message: &SlackMessageRef) -> bool {
@@ -636,6 +635,7 @@ struct SlackService {
     default_channel:  Option<String>,
     posted_messages:  Arc<Mutex<HashMap<(RunId, String), SlackPostedQuestion>>>,
     posted_approvals: Arc<Mutex<HashMap<RunId, SlackPostedApproval>>>,
+    auth_identity:    Arc<Mutex<Option<SlackAuthIdentity>>>,
     thread_registry:  Arc<ThreadRegistry>,
     connection:       Arc<Mutex<SlackConnectionRuntimeState>>,
 }
@@ -648,6 +648,7 @@ impl SlackService {
             default_channel,
             posted_messages: Arc::new(Mutex::new(HashMap::new())),
             posted_approvals: Arc::new(Mutex::new(HashMap::new())),
+            auth_identity: Arc::new(Mutex::new(None)),
             thread_registry: Arc::new(ThreadRegistry::new()),
             connection: Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
         }
@@ -730,34 +731,22 @@ impl SlackService {
                                     .await;
                                 }
                                 RunLifecycleKind::Approved => {
-                                    tokio::join!(
-                                        self.finish_launch_approval(
-                                            run_id,
-                                            SlackApprovalDecision::Approve,
-                                            None,
-                                        ),
-                                        self.refresh_parent_launch_navigation(
-                                            state,
-                                            run_id,
-                                            SlackApprovalDecision::Approve,
-                                            run_web_url.as_deref(),
-                                        ),
-                                    );
+                                    self.finish_launch_approval(
+                                        state,
+                                        run_id,
+                                        SlackApprovalDecision::Approve,
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 RunLifecycleKind::Denied => {
-                                    tokio::join!(
-                                        self.finish_launch_approval(
-                                            run_id,
-                                            SlackApprovalDecision::Deny,
-                                            None,
-                                        ),
-                                        self.refresh_parent_launch_navigation(
-                                            state,
-                                            run_id,
-                                            SlackApprovalDecision::Deny,
-                                            run_web_url.as_deref(),
-                                        ),
-                                    );
+                                    self.finish_launch_approval(
+                                        state,
+                                        run_id,
+                                        SlackApprovalDecision::Deny,
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 _ => {}
                             }
@@ -876,11 +865,7 @@ impl SlackService {
                 .expect("slack posted messages lock poisoned")
                 .insert(key, SlackPostedQuestion {
                     message: posted,
-                    text: pending.question.text.clone(),
-                    launch_navigation: slack_blocks::is_launch_navigation_question(&question),
-                    question,
-                    task,
-                    repository,
+                    text:    pending.question.text.clone(),
                 });
         }
     }
@@ -1085,6 +1070,13 @@ impl SlackService {
         {
             return;
         }
+        if let Some(posted) = self.load_posted_approval(state, run_id, None).await {
+            self.posted_approvals
+                .lock()
+                .expect("slack posted approvals lock poisoned")
+                .insert(run_id, posted);
+            return;
+        }
         let Ok(Some(projection)) = run_records::projection(state, run_id).await else {
             return;
         };
@@ -1126,29 +1118,54 @@ impl SlackService {
         else {
             return;
         };
+        let approval = SlackPostedApproval {
+            message: SlackPostedMessage {
+                channel_id: posted.channel_id.clone(),
+                ts:         posted.ts.clone(),
+            },
+            task,
+            repository,
+            run_web_url,
+        };
         self.posted_approvals
             .lock()
             .expect("slack posted approvals lock poisoned")
-            .insert(run_id, SlackPostedApproval {
-                message: posted,
-                task,
-                repository,
-                run_web_url,
-            });
+            .insert(run_id, approval);
+        let record = PlatformRecord::NotificationSent(NotificationSentRecord {
+            route:      SLACK_LAUNCH_APPROVAL_ROUTE.to_string(),
+            event:      SLACK_LAUNCH_APPROVAL_EVENT.to_string(),
+            channel:    Some(posted.channel_id),
+            thread:     None,
+            message_id: Some(posted.ts),
+            question:   None,
+            operation:  None,
+        });
+        if let Err(err) = run_records::append(state, run_id, record).await {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "Slack launch approval was posted but its message identity was not recorded"
+            );
+        }
     }
 
     async fn finish_launch_approval(
         &self,
+        state: &AppState,
         run_id: RunId,
         decision: SlackApprovalDecision,
         actor: Option<&str>,
     ) {
-        let posted = self
+        let cached = self
             .posted_approvals
             .lock()
             .expect("slack posted approvals lock poisoned")
             .get(&run_id)
             .cloned();
+        let posted = match cached {
+            Some(posted) => Some(posted),
+            None => self.load_posted_approval(state, run_id, None).await,
+        };
         let Some(posted) = posted else {
             return;
         };
@@ -1179,55 +1196,88 @@ impl SlackService {
         }
     }
 
-    async fn refresh_parent_launch_navigation(
+    async fn load_posted_approval(
         &self,
         state: &AppState,
-        child_run_id: RunId,
-        decision: SlackApprovalDecision,
-        child_run_web_url: Option<&str>,
-    ) {
-        let Ok(child) = run_records::require_projection(state, child_run_id).await else {
-            return;
-        };
-        let Some(parent_id) = child.parent_id else {
-            return;
-        };
-        let Some(child_run_web_url) = child_run_web_url
-            .or(child.web_url.as_deref())
-            .map(ToOwned::to_owned)
-        else {
-            return;
-        };
-        let posted = self
-            .posted_messages
-            .lock()
-            .expect("slack posted messages lock poisoned")
-            .iter()
-            .filter(|((run_id, _), posted)| *run_id == parent_id && posted.launch_navigation)
-            .map(|((_, question_id), posted)| (question_id.clone(), posted.clone()))
-            .collect::<Vec<_>>();
-        for (question_id, posted) in posted {
-            let message = slack_blocks::launch_navigation_decided_message(
-                &parent_id.to_string(),
-                &question_id,
-                &posted.question,
-                &child_run_web_url,
-                slack_blocks::QuestionIdentity {
-                    task:       Some(&posted.task),
-                    repository: posted.repository.as_deref(),
-                },
-                decision,
-            );
-            let _ = self
-                .client
-                .update_message(
-                    &posted.message.channel_id,
-                    &posted.message.ts,
-                    &message.fallback_text,
-                    &message.blocks,
-                )
-                .await;
+        run_id: RunId,
+        expected_message: Option<&SlackMessageRef>,
+    ) -> Option<SlackPostedApproval> {
+        let records = state
+            .stores
+            .run_summaries
+            .platform_records()
+            .read_kind(&run_id, PlatformRecordKind::NotificationSent)
+            .await
+            .ok()?;
+        let message = records.into_iter().rev().find_map(|stored| {
+            let PlatformRecord::NotificationSent(record) = stored.record else {
+                return None;
+            };
+            if record.route != SLACK_LAUNCH_APPROVAL_ROUTE
+                || record.event != SLACK_LAUNCH_APPROVAL_EVENT
+            {
+                return None;
+            }
+            let message = SlackPostedMessage {
+                channel_id: record.channel?,
+                ts:         record.message_id?,
+            };
+            expected_message
+                .is_none_or(|expected| {
+                    message.channel_id == expected.channel_id && message.ts == expected.message_ts
+                })
+                .then_some(message)
+        })?;
+        let projection = run_records::require_projection(state, run_id).await.ok()?;
+        if projection.parent_id.is_none() {
+            return None;
         }
+        let run_web_url = projection
+            .web_url
+            .clone()
+            .or_else(|| state.run_web_url(&run_id))?;
+        let task = projection.title().into_owned();
+        let repository = match projection.spec.target.as_ref() {
+            Some(RunTarget::Git(target)) => Some(target.repo.clone()),
+            Some(RunTarget::None {} | RunTarget::Folder { .. }) | None => None,
+        };
+        Some(SlackPostedApproval {
+            message,
+            task,
+            repository,
+            run_web_url,
+        })
+    }
+
+    async fn authorized_slack_actor(&self, actor: &Principal) -> bool {
+        let Principal::Slack {
+            team_id, user_id, ..
+        } = actor
+        else {
+            return false;
+        };
+        if team_id.is_empty() || user_id.is_empty() {
+            return false;
+        }
+        let cached = self
+            .auth_identity
+            .lock()
+            .expect("slack auth identity lock poisoned")
+            .clone();
+        let identity = match cached {
+            Some(identity) => identity,
+            None => {
+                let Ok(identity) = self.client.auth_identity().await else {
+                    return false;
+                };
+                self.auth_identity
+                    .lock()
+                    .expect("slack auth identity lock poisoned")
+                    .replace(identity.clone());
+                identity
+            }
+        };
+        team_id == &identity.team_id && user_id != &identity.bot_user_id
     }
 
     async fn submit_answer(&self, state: Arc<AppState>, submission: SlackAnswerSubmission) {
@@ -1250,15 +1300,30 @@ impl SlackService {
         let Some(message) = submission.message.as_ref() else {
             return;
         };
-        let owns_message = self
+        if !self.authorized_slack_actor(&submission.actor).await {
+            return;
+        }
+        let cached = self
             .posted_approvals
             .lock()
             .expect("slack posted approvals lock poisoned")
             .get(&run_id)
-            .is_some_and(|posted| posted.owns_message(message));
-        if !owns_message {
+            .cloned();
+        let posted = match cached {
+            Some(posted) if posted.owns_message(message) => Some(posted),
+            Some(_) => None,
+            None => {
+                self.load_posted_approval(state.as_ref(), run_id, Some(message))
+                    .await
+            }
+        };
+        let Some(posted) = posted else {
             return;
-        }
+        };
+        self.posted_approvals
+            .lock()
+            .expect("slack posted approvals lock poisoned")
+            .insert(run_id, posted);
         let Ok(projection) = run_records::require_projection(state.as_ref(), run_id).await else {
             return;
         };
@@ -1278,7 +1343,8 @@ impl SlackService {
                     fabro_types::RunApprovalState::Pending => None,
                 });
             if let Some(decided) = decided {
-                self.finish_launch_approval(run_id, decided, None).await;
+                self.finish_launch_approval(state.as_ref(), run_id, decided, None)
+                    .await;
             }
             return;
         }
@@ -1293,8 +1359,13 @@ impl SlackService {
             .await
             .is_ok()
         {
-            self.finish_launch_approval(run_id, slack_decision, Some(&submission.actor.display()))
-                .await;
+            self.finish_launch_approval(
+                state.as_ref(),
+                run_id,
+                slack_decision,
+                Some(&submission.actor.display()),
+            )
+            .await;
         }
     }
 }

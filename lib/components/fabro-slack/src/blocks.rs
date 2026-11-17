@@ -294,9 +294,10 @@ fn question_presentation(
 ) -> QuestionPresentation {
     let routing = routing_context(question.context_display.as_deref());
     if is_parent_navigation_prompt(question, &routing) {
-        let question_text = "A linked task is waiting for launch approval. Open Fabro to review \
-                             it; Check again only refreshes the parent task."
-            .to_string();
+        let question_text =
+            "Review the linked task’s current launch status, then use Check again to continue \
+             this task."
+                .to_string();
         return QuestionPresentation {
             question_text,
             action_url: run_web_url.map(ToOwned::to_owned),
@@ -414,37 +415,6 @@ pub fn launch_approval_decided_message(
             "*{outcome}{by}.*\n{task}\n<{run_web_url}|Open in Fabro>"
         ))],
     }
-}
-
-pub fn launch_navigation_decided_message(
-    run_id: &str,
-    question_id: &str,
-    question: &Question,
-    child_run_web_url: &str,
-    identity: QuestionIdentity<'_>,
-    decision: SlackApprovalDecision,
-) -> QuestionMessage {
-    let mut decided = question.clone();
-    decided.text = match decision {
-        SlackApprovalDecision::Approve => {
-            "The linked task was approved. Use Check again to continue this task."
-        }
-        SlackApprovalDecision::Deny => {
-            "The linked task was denied. Use Check again to update this task."
-        }
-    }
-    .to_string();
-    decided.context_display = None;
-    for option in &mut decided.options {
-        option.label = navigation_button_label(&option.label).to_string();
-    }
-    question_message(
-        run_id,
-        question_id,
-        &decided,
-        Some(child_run_web_url),
-        identity,
-    )
 }
 
 fn fallback_text(identity: QuestionIdentity<'_>, presentation: &QuestionPresentation) -> String {
@@ -1045,71 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn decided_child_refreshes_parent_navigation_without_answering_it() {
-        let mut question = Question::new(
-            "CHILD LAUNCH APPROVAL — Open the linked child and approve or deny it.",
-            QuestionType::MultipleChoice,
-        );
-        question.options = vec![
-            InterviewOption {
-                key:         "recheck_child".to_string(),
-                label:       "Recheck whether the child was approved".to_string(),
-                description: None,
-                preview:     None,
-            },
-            InterviewOption {
-                key:         "stop_parent".to_string(),
-                label:       "Stop the parent orchestrator".to_string(),
-                description: None,
-                preview:     None,
-            },
-        ];
-        question.context_display = Some(
-            json!({
-                "child_run_id": "model-authored-id",
-                "child_run_url": "https://untrusted.example/runs/wrong",
-                "child_status": "pending_approval",
-            })
-            .to_string(),
-        );
-
-        let message = launch_navigation_decided_message(
-            "trusted-parent",
-            "question-1",
-            &question,
-            "https://fabro.example/runs/trusted-child",
-            QuestionIdentity {
-                task:       Some("Parent orchestration"),
-                repository: Some("maecapozzi/fabro"),
-            },
-            SlackApprovalDecision::Approve,
-        );
-        let rendered = serde_json::to_string(&message.blocks).unwrap();
-
-        assert!(rendered.contains("linked task was approved"));
-        assert!(rendered.contains("Check again"));
-        assert!(rendered.contains("https://fabro.example/runs/trusted-child"));
-        assert!(rendered.contains("\\\"run_id\\\":\\\"trusted-parent\\\""));
-        assert!(rendered.contains("\\\"qid\\\":\\\"question-1\\\""));
-        assert!(!rendered.contains("model-authored-id"));
-        assert!(!rendered.contains("untrusted.example"));
-        assert!(!rendered.contains("\"text\":\"Approve\""));
-
-        let denied = launch_navigation_decided_message(
-            "trusted-parent",
-            "question-1",
-            &question,
-            "https://fabro.example/runs/trusted-child",
-            QuestionIdentity::default(),
-            SlackApprovalDecision::Deny,
-        );
-        let denied_rendered = serde_json::to_string(&denied.blocks).unwrap();
-        assert!(denied_rendered.contains("linked task was denied"));
-        assert!(denied_rendered.contains("Check again"));
-        assert!(!denied_rendered.contains("\"text\":\"Approve\""));
-    }
-
-    #[test]
     fn header_includes_run_link_when_url_provided() {
         let q = Question::new("Approve Plan", QuestionType::YesNo);
         let blocks = question_to_blocks(
@@ -1332,7 +1237,8 @@ mod tests {
         assert!(rendered.contains("Mae Factory needs your input"));
         assert!(rendered.contains("Fix the PR list"));
         assert!(rendered.contains("maecapozzi/fabro"));
-        assert!(rendered.contains("linked task is waiting for launch approval"));
+        assert!(rendered.contains("Review the linked task’s current launch status"));
+        assert!(!rendered.contains("waiting for launch approval"));
         assert!(rendered.contains("Open in Fabro"));
         assert!(rendered.contains("https://fabro.example/runs/01JPARENTRUN"));
         assert!(!rendered.contains("https://fabro.example/runs/01JCHILDRUN"));
@@ -1361,7 +1267,17 @@ mod tests {
         assert!(first_value.contains("\"key\":\"recheck_child\""));
 
         assert!(message.fallback_text.contains("Fix the PR list"));
+        assert!(
+            message
+                .fallback_text
+                .contains("Review the linked task’s current launch status")
+        );
         assert!(message.fallback_text.contains("Open in Fabro"));
+        assert!(
+            !message
+                .fallback_text
+                .contains("waiting for launch approval")
+        );
         assert!(!message.fallback_text.contains("preferred_next_label"));
         assert!(!message.fallback_text.contains("approval_wait"));
         assert!(!message.fallback_text.contains("01JPARENTRUN"));

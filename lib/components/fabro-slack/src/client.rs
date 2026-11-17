@@ -10,6 +10,12 @@ pub struct PostedMessage {
     pub ts:         String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackAuthIdentity {
+    pub team_id:     String,
+    pub bot_user_id: String,
+}
+
 #[derive(Clone)]
 pub struct SlackClient {
     bot_token: String,
@@ -46,6 +52,23 @@ impl SlackClient {
 
     pub fn http(&self) -> &fabro_http::HttpClient {
         &self.http
+    }
+
+    pub async fn auth_identity(&self) -> Result<SlackAuthIdentity, SlackApiError> {
+        let resp = self
+            .http
+            .post(format!("{}/auth.test", self.api_base))
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .map_err(|e| SlackApiError::Http(e.to_string()))?;
+
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| SlackApiError::Http(e.to_string()))?;
+
+        parse_auth_identity(&json)
     }
 
     pub async fn post_message(
@@ -129,6 +152,20 @@ pub fn parse_post_message_response(response: &Value) -> Result<PostedMessage, Sl
     Ok(PostedMessage {
         channel_id: channel_id.to_string(),
         ts:         ts.to_string(),
+    })
+}
+
+pub fn parse_auth_identity(response: &Value) -> Result<SlackAuthIdentity, SlackApiError> {
+    check_ok(response)?;
+    let team_id = response["team_id"]
+        .as_str()
+        .ok_or_else(|| SlackApiError::Api("missing team_id in response".to_string()))?;
+    let bot_user_id = response["user_id"]
+        .as_str()
+        .ok_or_else(|| SlackApiError::Api("missing user_id in response".to_string()))?;
+    Ok(SlackAuthIdentity {
+        team_id:     team_id.to_string(),
+        bot_user_id: bot_user_id.to_string(),
     })
 }
 
@@ -234,6 +271,32 @@ mod tests {
         });
         let err = parse_post_message_response(&response).unwrap_err();
         assert!(err.to_string().contains("not_in_channel"));
+    }
+
+    #[test]
+    fn parse_auth_identity_extracts_workspace_and_bot_user() {
+        let identity = parse_auth_identity(&serde_json::json!({
+            "ok": true,
+            "team_id": "T123",
+            "user_id": "UBOT",
+        }))
+        .unwrap();
+
+        assert_eq!(identity, SlackAuthIdentity {
+            team_id:     "T123".to_string(),
+            bot_user_id: "UBOT".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_auth_identity_requires_workspace_and_bot_user() {
+        let error = parse_auth_identity(&serde_json::json!({
+            "ok": true,
+            "team_id": "T123",
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing user_id"));
     }
 
     #[test]
