@@ -11,10 +11,25 @@ pub struct SlackQuestionRef {
 
 #[derive(Debug, Clone)]
 pub struct SlackAnswerSubmission {
-    pub run_id: String,
-    pub qid:    String,
-    pub answer: Answer,
-    pub actor:  Principal,
+    pub run_id:   String,
+    pub qid:      String,
+    pub answer:   Answer,
+    pub actor:    Principal,
+    pub approval: Option<SlackApprovalDecision>,
+    pub message:  Option<SlackMessageRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackMessageRef {
+    pub channel_id: String,
+    pub message_ts: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackApprovalDecision {
+    Approve,
+    Deny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,21 +52,36 @@ pub enum SlackActionPayload {
         run_id: String,
         qid:    String,
     },
+    Approval {
+        run_id:   String,
+        decision: SlackApprovalDecision,
+    },
 }
 
 impl SlackActionPayload {
-    #[must_use]
-    pub fn question_ref(&self) -> SlackQuestionRef {
+    pub fn question_ref(&self) -> Option<SlackQuestionRef> {
         match self {
             Self::Yes { run_id, qid }
             | Self::No { run_id, qid }
             | Self::Selected { run_id, qid, .. }
-            | Self::SubmitMulti { run_id, qid } => SlackQuestionRef {
+            | Self::SubmitMulti { run_id, qid } => Some(SlackQuestionRef {
                 run_id: run_id.clone(),
                 qid:    qid.clone(),
-            },
+            }),
+            Self::Approval { .. } => None,
         }
     }
+}
+
+pub fn interaction_message(payload: &Value) -> Option<SlackMessageRef> {
+    let container = &payload["container"];
+    Some(SlackMessageRef {
+        channel_id: container["channel_id"]
+            .as_str()
+            .or_else(|| payload["channel"]["id"].as_str())?
+            .to_string(),
+        message_ts: container["message_ts"].as_str()?.to_string(),
+    })
 }
 
 #[must_use]

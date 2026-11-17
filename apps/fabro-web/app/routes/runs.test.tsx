@@ -266,7 +266,10 @@ describe("runs route filter options", () => {
       runWith("c", "qlty/beta", "release"),
     ].map(mapRunListItem);
 
-    expect(buildFilterOptions(items, (item) => item.repo, "all")).toEqual(["alpha", "beta"]);
+    expect(buildFilterOptions(items, (item) => item.repo, "all")).toEqual([
+      "qlty/alpha",
+      "qlty/beta",
+    ]);
     expect(buildFilterOptions(items, (item) => item.workflow, "all")).toEqual([
       "hello",
       "release",
@@ -276,7 +279,10 @@ describe("runs route filter options", () => {
   test("keeps the active selection when no loaded run matches it", () => {
     const items = [runWith("a", "qlty/beta", "release")].map(mapRunListItem);
 
-    expect(buildFilterOptions(items, (item) => item.repo, "gamma")).toEqual(["beta", "gamma"]);
+    expect(buildFilterOptions(items, (item) => item.repo, "gamma")).toEqual([
+      "gamma",
+      "qlty/beta",
+    ]);
     expect(buildFilterOptions([], (item) => item.workflow, "release")).toEqual(["release"]);
   });
 });

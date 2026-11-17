@@ -7,6 +7,7 @@ use crate::payload::{self, SlackActionPayload, SlackAnswerSubmission};
 const MULTI_SELECT_BLOCK_ID: &str = "interview.checkboxes";
 const MULTI_SELECT_ACTION_ID: &str = "interview.select";
 const MULTI_SELECT_SUBMIT_ACTION_ID: &str = "interview.submit";
+const APPROVAL_ACTION_ID: &str = "run.approval";
 
 /// Buttons for the same question must each have a unique `action_id`, so the
 /// outbound side stamps `interview.answer.<suffix>` per element. This matches
@@ -29,10 +30,24 @@ pub fn parse_interaction(payload: &Value) -> Option<SlackAnswerSubmission> {
     let action_id = action["action_id"].as_str()?;
     let value = action["value"].as_str()?;
     let routed: SlackActionPayload = serde_json::from_str(value).ok()?;
-    let question_ref = routed.question_ref();
     let actor = payload::interaction_actor(payload)?;
 
     let action_type = action["type"].as_str().unwrap_or("button");
+    if action_type == "button" && action_id.starts_with(APPROVAL_ACTION_ID) {
+        let SlackActionPayload::Approval { run_id, decision } = routed else {
+            return None;
+        };
+        return Some(SlackAnswerSubmission {
+            run_id,
+            qid: String::new(),
+            answer: Answer::skipped(),
+            actor,
+            approval: Some(decision),
+            message: Some(payload::interaction_message(payload)?),
+        });
+    }
+
+    let question_ref = routed.question_ref()?;
 
     let answer = match action_type {
         "button" if is_answer_action(action_id) => match routed {
@@ -44,6 +59,7 @@ pub fn parse_interaction(payload: &Value) -> Option<SlackAnswerSubmission> {
                 text:            None,
             },
             SlackActionPayload::SubmitMulti { .. } => return None,
+            SlackActionPayload::Approval { .. } => return None,
         },
         "button" if action_id == MULTI_SELECT_SUBMIT_ACTION_ID => {
             extract_checkbox_selections(payload)
@@ -60,6 +76,8 @@ pub fn parse_interaction(payload: &Value) -> Option<SlackAnswerSubmission> {
         qid: question_ref.qid,
         answer,
         actor,
+        approval: None,
+        message: None,
     })
 }
 
@@ -126,6 +144,58 @@ mod tests {
         assert_eq!(result.run_id, "run-1");
         assert_eq!(result.qid, "q-2");
         assert_eq!(result.answer.value, AnswerValue::No);
+    }
+
+    #[test]
+    fn parse_native_launch_approval_with_actor_and_message_identity() {
+        let payload = serde_json::json!({
+            "type": "block_actions",
+            "team": { "id": "T123" },
+            "user": { "id": "U123", "name": "ada" },
+            "container": {
+                "channel_id": "C123",
+                "message_ts": "1234.5678"
+            },
+            "actions": [{
+                "action_id": "run.approval.approve",
+                "type": "button",
+                "value": "{\"kind\":\"approval\",\"run_id\":\"01JCHILD\",\"decision\":\"approve\"}"
+            }]
+        });
+        let submission = parse_interaction(&payload).unwrap();
+
+        assert_eq!(submission.run_id, "01JCHILD");
+        assert_eq!(
+            submission.approval,
+            Some(crate::payload::SlackApprovalDecision::Approve)
+        );
+        assert_eq!(
+            submission.message,
+            Some(crate::payload::SlackMessageRef {
+                channel_id: "C123".to_string(),
+                message_ts: "1234.5678".to_string(),
+            })
+        );
+        assert!(matches!(
+            submission.actor,
+            fabro_types::Principal::Slack { .. }
+        ));
+    }
+
+    #[test]
+    fn launch_approval_without_posted_message_identity_is_rejected() {
+        let payload = serde_json::json!({
+            "type": "block_actions",
+            "team": { "id": "T123" },
+            "user": { "id": "U123" },
+            "actions": [{
+                "action_id": "run.approval.approve",
+                "type": "button",
+                "value": "{\"kind\":\"approval\",\"run_id\":\"01JCHILD\",\"decision\":\"approve\"}"
+            }]
+        });
+
+        assert!(parse_interaction(&payload).is_none());
     }
 
     #[test]

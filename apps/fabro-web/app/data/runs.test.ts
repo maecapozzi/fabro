@@ -104,6 +104,14 @@ describe("mapRunListItem", () => {
     expect(mapRunListItem(summary).title).toBe("Untitled run");
   });
 
+  test("keeps the repository owner for an unambiguous approval identity", () => {
+    const summary = makeRun({
+      repository: { name: "maecapozzi/fabro", origin_url: null, provider: "github" },
+    });
+
+    expect(mapRunListItem(summary).repo).toBe("maecapozzi/fabro");
+  });
+
   test("carries the billed total so the size chip can show it on hover", () => {
     expect(mapRunListItem(makeRun()).totalUsdMicros).toBe(500000);
   });
@@ -113,6 +121,43 @@ describe("mapRunListItem", () => {
     expect(
       mapRunListItem(makeRun({ usage: makeUsage({ input: 12 }) })).totalUsdMicros,
     ).toBeUndefined();
+  });
+
+  test("distinguishes approval, queue, running, and denied native states", () => {
+    const approvalRun = makeRun({
+      ...withStatus({ kind: "pending", reason: "approval_required" }),
+    });
+    approvalRun.lifecycle.approval = {
+      state: "pending",
+      requested_at: "2026-04-08T12:00:00Z",
+      decided_at: null,
+      denial_reason: null,
+    };
+    const approval = mapRunListItem(approvalRun);
+    const queued = mapRunListItem(makeRun({
+      ...withStatus({ kind: "runnable" }),
+    }));
+    const running = mapRunListItem(makeRun({
+      ...withStatus({ kind: "running" }),
+    }));
+    const denied = mapRunListItem(makeRun({
+      ...withStatus({ kind: "failed", reason: "approval_denied" }),
+    }));
+    const archivedDeniedRun = makeRun({
+      ...withStatus({ kind: "failed", reason: "approval_denied" }),
+    });
+    archivedDeniedRun.lifecycle.archived = true;
+    archivedDeniedRun.lifecycle.archived_at = "2026-04-08T13:00:00Z";
+    const archivedDenied = mapRunListItem(archivedDeniedRun);
+
+    expect(approval.lifecycleStatusLabel).toBe("Needs your approval");
+    expect(approval.pendingApproval).toBe(true);
+    expect(queued.lifecycleStatusLabel).toBe("Queued");
+    expect(running.lifecycleStatusLabel).toBe("Running");
+    expect(denied.lifecycleStatusLabel).toBe("Denied");
+    expect(denied.pendingApproval).toBe(false);
+    expect(archivedDenied.lifecycleStatusLabel).toBe("Archived");
+    expect(archivedDenied.pendingApproval).toBe(false);
   });
 });
 

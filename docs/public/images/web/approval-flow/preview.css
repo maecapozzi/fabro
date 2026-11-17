@@ -1,0 +1,79 @@
+:root {
+  color-scheme: dark;
+  background: #090d11;
+  color: #e8edf2;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: #090d11; }
+main { width: 1440px; min-height: 760px; padding: 48px; }
+h1 { margin: 0 0 28px; font-size: 28px; }
+.preview-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.preview-panel {
+  min-height: 560px;
+  padding: 28px;
+  overflow: hidden;
+  border: 1px solid #29323b;
+  border-radius: 14px;
+  background: #11171d;
+}
+.preview-label {
+  display: inline-block;
+  margin-bottom: 34px;
+  border-radius: 999px;
+  background: #26313a;
+  padding: 6px 10px;
+  color: #b9c5ce;
+  font: 700 11px/1 ui-monospace, monospace;
+  letter-spacing: .12em;
+}
+.preview-note { margin-top: 42px; color: #9aa8b3; font-size: 14px; }
+.slack-shell { background: #1a1d21; }
+.slack-message { display: grid; grid-template-columns: 42px 1fr; gap: 12px; color: #d1d2d3; }
+.slack-avatar {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 8px;
+  background: #2eb67d;
+  color: #08140f;
+  font-weight: 800;
+}
+.slack-author { color: #f8f8f8; font-weight: 700; }
+.slack-author span { color: #9b9c9e; font-size: 12px; font-weight: 400; }
+.slack-message p { max-width: 520px; margin: 8px 0; line-height: 1.45; }
+.slack-message a { color: #1d9bd1; font-weight: 600; }
+.slack-message pre {
+  max-width: 500px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: #222529;
+  padding: 12px;
+  color: #c5c7c9;
+}
+.slack-actions { display: flex; gap: 8px; margin-top: 14px; }
+.slack-message button {
+  border: 1px solid #565856;
+  border-radius: 5px;
+  background: #1a1d21;
+  padding: 8px 14px;
+  color: #f8f8f8;
+  font-weight: 700;
+}
+.slack-message button.approve { border-color: #2eb67d; background: #007a5a; }
+.slack-message button.deny { border-color: #e01e5a; color: #ff8aaa; }
+.interview-preview { min-height: 520px; }
+.interview-preview > div:not(.preview-label) { position: relative; }
+.legacy-routing-json {
+  max-height: 120px;
+  overflow: hidden;
+  border-radius: 7px;
+  background: #0b1015;
+  padding: 12px;
+  color: #8e9ba5;
+  font: 12px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

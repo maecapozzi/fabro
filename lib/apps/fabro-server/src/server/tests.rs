@@ -6680,6 +6680,32 @@ async fn submit_answer_not_found_run() {
     assert_status!(response, StatusCode::NOT_FOUND).await;
 }
 
+#[test]
+fn slack_launch_approval_message_identity_rejects_mismatched_targets() {
+    let posted = SlackPostedApproval {
+        message:     SlackPostedMessage {
+            channel_id: "C-approval".to_string(),
+            ts:         "1234.5678".to_string(),
+        },
+        task:        "Improve approval actions".to_string(),
+        repository:  Some("maecapozzi/fabro".to_string()),
+        run_web_url: "https://fabro.example/runs/child".to_string(),
+    };
+
+    assert!(posted.owns_message(&SlackMessageRef {
+        channel_id: "C-approval".to_string(),
+        message_ts: "1234.5678".to_string(),
+    }));
+    assert!(!posted.owns_message(&SlackMessageRef {
+        channel_id: "C-unrelated".to_string(),
+        message_ts: "1234.5678".to_string(),
+    }));
+    assert!(!posted.owns_message(&SlackMessageRef {
+        channel_id: "C-approval".to_string(),
+        message_ts: "9999.0000".to_string(),
+    }));
+}
+
 #[tokio::test]
 async fn submit_pending_interview_answer_rejects_invalid_answer_shape() {
     let state = test_app_state();
@@ -8066,6 +8092,69 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {
         );
     }
 
+    let slack_api = MockServer::start_async().await;
+    let update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""text":"Mae Factory needs your input"#)
+                .body_includes("linked task was approved")
+                .body_includes("Check again")
+                .body_includes("https://fabro.example/runs/trusted-child")
+                .body_excludes("model-authored-child");
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let slack_service = SlackService {
+        client:           SlackClient::with_api_base_and_http(
+            "xoxb-test".to_string(),
+            slack_api.base_url(),
+            fabro_http::test_http_client().expect("test Slack client should build"),
+        ),
+        app_token:        "xapp-test".to_string(),
+        default_channel:  Some("C-approval".to_string()),
+        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals: Arc::new(Mutex::new(HashMap::new())),
+        thread_registry:  Arc::new(ThreadRegistry::new()),
+        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+    };
+    let mut parent_question = Question::new(
+        "CHILD LAUNCH APPROVAL — Open the linked child and approve it.",
+        QuestionType::MultipleChoice,
+    );
+    parent_question.options = vec![fabro_types::InterviewOption {
+        key:         "recheck_child".to_string(),
+        label:       "Recheck whether the child was approved".to_string(),
+        description: None,
+        preview:     None,
+    }];
+    parent_question.context_display = Some(
+        json!({
+            "child_run_id": "model-authored-child",
+            "child_run_url": "https://untrusted.example/runs/wrong",
+            "child_status": "pending_approval",
+        })
+        .to_string(),
+    );
+    slack_service
+        .posted_messages
+        .lock()
+        .expect("slack posted messages lock poisoned")
+        .insert(
+            (parent_run_id, "parent-gate".to_string()),
+            SlackPostedQuestion {
+                message:           SlackPostedMessage {
+                    channel_id: "C-approval".to_string(),
+                    ts:         "1234.5678".to_string(),
+                },
+                text:              parent_question.text.clone(),
+                question:          parent_question,
+                task:              "Parent orchestration".to_string(),
+                repository:        Some("maecapozzi/fabro".to_string()),
+                launch_navigation: true,
+            },
+        );
+
     let response = app
         .clone()
         .oneshot(bearer_request(
@@ -8090,11 +8179,297 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {
             .as_str()
             .is_some()
     );
+    slack_service
+        .refresh_parent_launch_navigation(
+            state.as_ref(),
+            child_run_id,
+            SlackApprovalDecision::Approve,
+            Some("https://fabro.example/runs/trusted-child"),
+        )
+        .await;
+    update.assert_async().await;
 
     let runs = state.runs.lock().expect("runs lock poisoned");
     assert_eq!(
         runs.get(&child_run_id).map(|run| run.status),
         Some(RunStatus::Runnable)
+    );
+    drop(runs);
+
+    for path in [
+        format!("/runs/{child_run_id}/approve"),
+        format!("/runs/{child_run_id}/deny"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(bearer_request(
+                Method::POST,
+                &path,
+                &user_jwt,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_status!(response, StatusCode::CONFLICT).await;
+    }
+}
+
+async fn create_pending_worker_child(
+    app: &Router,
+    user_jwt: &str,
+    parent_run_id: RunId,
+    worker_token: &str,
+) -> RunId {
+    let mut child_intent =
+        test_intent_with_bearer(app, "workflow.fabro", MINIMAL_DOT, None, Some(user_jwt)).await;
+    child_intent["parent_id"] = json!(parent_run_id.to_string());
+    let response = app
+        .clone()
+        .oneshot(json_bearer_request(
+            Method::POST,
+            "/runs",
+            worker_token,
+            &child_intent,
+        ))
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::CREATED).await;
+    let child_run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_bearer_request(
+            Method::POST,
+            &format!("/runs/{child_run_id}/start"),
+            worker_token,
+            &json!({ "resume": false }),
+        ))
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::OK).await;
+    child_run_id
+}
+
+#[tokio::test]
+async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision_wins() {
+    let (state, app) = jwt_auth_app();
+    let user_jwt = issue_test_user_jwt();
+    let parent_run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let worker_token = issue_test_run_tools_worker_token(&parent_run_id);
+    let approved_child =
+        create_pending_worker_child(&app, &user_jwt, parent_run_id, &worker_token).await;
+    let denied_child =
+        create_pending_worker_child(&app, &user_jwt, parent_run_id, &worker_token).await;
+    let web_approved_child =
+        create_pending_worker_child(&app, &user_jwt, parent_run_id, &worker_token).await;
+
+    let slack_api = MockServer::start_async().await;
+    let approved_update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""text":"Approved: Child A""#)
+                .body_includes("Approved")
+                .body_includes("Open in Fabro");
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let denied_update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""text":"Denied: Child B""#)
+                .body_includes("Denied")
+                .body_includes("Open in Fabro");
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let stale_click_update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""text":"Approved: Child C""#)
+                .body_includes("Approved")
+                .body_excludes(r#""text":"Denied: Child C""#);
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let service = SlackService {
+        client:           SlackClient::with_api_base_and_http(
+            "xoxb-test".to_string(),
+            slack_api.base_url(),
+            fabro_http::test_http_client().expect("test Slack client should build"),
+        ),
+        app_token:        "xapp-test".to_string(),
+        default_channel:  Some("C-approval".to_string()),
+        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals: Arc::new(Mutex::new(HashMap::from([
+            (approved_child, SlackPostedApproval {
+                message:     SlackPostedMessage {
+                    channel_id: "C-approved".to_string(),
+                    ts:         "1111.0000".to_string(),
+                },
+                task:        "Child A".to_string(),
+                repository:  Some("maecapozzi/fabro".to_string()),
+                run_web_url: format!("https://fabro.example/runs/{approved_child}"),
+            }),
+            (denied_child, SlackPostedApproval {
+                message:     SlackPostedMessage {
+                    channel_id: "C-denied".to_string(),
+                    ts:         "2222.0000".to_string(),
+                },
+                task:        "Child B".to_string(),
+                repository:  Some("maecapozzi/fabro".to_string()),
+                run_web_url: format!("https://fabro.example/runs/{denied_child}"),
+            }),
+            (web_approved_child, SlackPostedApproval {
+                message:     SlackPostedMessage {
+                    channel_id: "C-web-approved".to_string(),
+                    ts:         "3333.0000".to_string(),
+                },
+                task:        "Child C".to_string(),
+                repository:  Some("maecapozzi/fabro".to_string()),
+                run_web_url: format!("https://fabro.example/runs/{web_approved_child}"),
+            }),
+        ]))),
+        thread_registry:  Arc::new(ThreadRegistry::new()),
+        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+    };
+    let actor = Principal::Slack {
+        team_id:   "T123".to_string(),
+        user_id:   "U123".to_string(),
+        user_name: Some("ada".to_string()),
+    };
+    let approval_submission =
+        |run_id: RunId, channel_id: &str, message_ts: &str, decision: SlackApprovalDecision| {
+            SlackAnswerSubmission {
+                run_id:   run_id.to_string(),
+                qid:      String::new(),
+                answer:   Answer::skipped(),
+                actor:    actor.clone(),
+                approval: Some(decision),
+                message:  Some(SlackMessageRef {
+                    channel_id: channel_id.to_string(),
+                    message_ts: message_ts.to_string(),
+                }),
+            }
+        };
+
+    service
+        .submit_approval(
+            Arc::clone(&state),
+            approval_submission(
+                denied_child,
+                "C-approved",
+                "1111.0000",
+                SlackApprovalDecision::Approve,
+            ),
+        )
+        .await;
+    assert!(matches!(
+        run_records::require_projection(state.as_ref(), denied_child)
+            .await
+            .unwrap()
+            .status,
+        RunStatus::Pending {
+            reason: PendingReason::ApprovalRequired,
+        }
+    ));
+
+    let approve = approval_submission(
+        approved_child,
+        "C-approved",
+        "1111.0000",
+        SlackApprovalDecision::Approve,
+    );
+    service
+        .submit_approval(Arc::clone(&state), approve.clone())
+        .await;
+    approved_update.assert_async().await;
+    service.submit_approval(Arc::clone(&state), approve).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_bearer_request(
+            Method::POST,
+            &format!("/runs/{approved_child}/deny"),
+            &user_jwt,
+            &json!({ "reason": "too late" }),
+        ))
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::CONFLICT).await;
+
+    let deny = approval_submission(
+        denied_child,
+        "C-denied",
+        "2222.0000",
+        SlackApprovalDecision::Deny,
+    );
+    service
+        .submit_approval(Arc::clone(&state), deny.clone())
+        .await;
+    denied_update.assert_async().await;
+    service.submit_approval(Arc::clone(&state), deny).await;
+
+    let response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            &format!("/runs/{denied_child}/approve"),
+            &user_jwt,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::CONFLICT).await;
+
+    let response = app
+        .clone()
+        .oneshot(bearer_request(
+            Method::POST,
+            &format!("/runs/{web_approved_child}/approve"),
+            &user_jwt,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::OK).await;
+    service
+        .submit_approval(
+            Arc::clone(&state),
+            approval_submission(
+                web_approved_child,
+                "C-web-approved",
+                "3333.0000",
+                SlackApprovalDecision::Deny,
+            ),
+        )
+        .await;
+    stale_click_update.assert_async().await;
+
+    let approved = run_records::require_projection(state.as_ref(), approved_child)
+        .await
+        .unwrap();
+    assert_eq!(
+        approved.approval.as_ref().map(|approval| approval.state),
+        Some(fabro_types::RunApprovalState::Approved)
+    );
+    let denied = run_records::require_projection(state.as_ref(), denied_child)
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.approval.as_ref().map(|approval| approval.state),
+        Some(fabro_types::RunApprovalState::Denied)
+    );
+    let web_approved = run_records::require_projection(state.as_ref(), web_approved_child)
+        .await
+        .unwrap();
+    assert_eq!(
+        web_approved
+            .approval
+            .as_ref()
+            .map(|approval| approval.state),
+        Some(fabro_types::RunApprovalState::Approved)
     );
 }
 

@@ -63,7 +63,7 @@ export const columnStatuses = [
 
 export const columnStatusDisplay: Record<BoardColumn, { label: string; dot: string; text: string }> = {
   pending:      { label: "Pending",      dot: "bg-fg-muted",  text: "text-fg-muted" },
-  runnable:     { label: "Runnable",     dot: "bg-cyan-500",  text: "text-cyan-500" },
+  runnable:     { label: "Queued",       dot: "bg-cyan-500",  text: "text-cyan-500" },
   initializing: { label: "Initializing", dot: "bg-amber",     text: "text-amber" },
   running:      { label: "Running",      dot: "bg-teal-500",  text: "text-teal-500" },
   blocked:      { label: "Blocked",      dot: "bg-amber",     text: "text-amber" },
@@ -82,11 +82,6 @@ function displayRunTitle(title: string | null | undefined): string {
   return title?.trim() ? title : "Untitled run";
 }
 
-function displayRepoName(name: string): string {
-  const slash = name.lastIndexOf("/");
-  return slash >= 0 ? name.slice(slash + 1) : name;
-}
-
 function runStatusKind(status: ApiRunStatus | null | undefined): RunStatus | null {
   return status?.kind ?? null;
 }
@@ -96,7 +91,7 @@ export function mapRunListItem(item: Run): RunItem {
   const runtime = sandboxRuntime(item.sandbox);
   return {
     id: item.id,
-    repo: displayRepoName(item.repository?.name ?? "unknown"),
+    repo: item.repository?.name ?? "unknown",
     title: displayRunTitle(item.title),
     workflow: item.workflow.name ?? item.workflow.graph_name ?? item.workflow.slug ?? "unknown",
     column: columnForRun(item) ?? undefined,
@@ -194,7 +189,7 @@ export type RunStatus =
 export const runStatusDisplay: Record<RunStatus, { label: string; dot: string; text: string }> = {
   submitted: { label: "Submitted", dot: "bg-fg-muted", text: "text-fg-muted" },
   pending: { label: "Pending", dot: "bg-fg-muted", text: "text-fg-muted" },
-  runnable: { label: "Runnable", dot: "bg-cyan-500", text: "text-cyan-500" },
+  runnable: { label: "Queued", dot: "bg-cyan-500", text: "text-cyan-500" },
   starting: { label: "Starting", dot: "bg-amber", text: "text-amber" },
   running: { label: "Running", dot: "bg-teal-500", text: "text-teal-500" },
   blocked: { label: "Blocked", dot: "bg-amber", text: "text-amber" },
@@ -215,6 +210,13 @@ export function isRunStatus(s: string): s is RunStatus {
 function lifecycleStatusLabel(status: ApiRunStatus | null | undefined, archived = false): string | undefined {
   const kind = archived ? "archived" : runStatusKind(status);
   if (!kind) return undefined;
+  if (archived) return runStatusDisplay.archived.label;
+  if (status?.kind === "pending" && status.reason === "approval_required") {
+    return "Needs your approval";
+  }
+  if (status?.kind === "failed" && status.reason === "approval_denied") {
+    return "Denied";
+  }
   return runStatusDisplay[kind].label;
 }
 

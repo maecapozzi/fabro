@@ -148,11 +148,7 @@ async fn run_event_loop_inner(
         match action {
             DispatchAction::SubmitAnswer(submission) => {
                 let submission = *submission;
-                debug!(
-                    run_id = submission.run_id.as_str(),
-                    qid = submission.qid.as_str(),
-                    "Submitting answer from Slack"
-                );
+                debug!("Submitting interaction from Slack");
                 on_submit(submission);
             }
             DispatchAction::Connected => {

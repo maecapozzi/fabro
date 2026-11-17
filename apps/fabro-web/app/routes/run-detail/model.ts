@@ -21,7 +21,7 @@ export function buildRunDetailRun(summary: Run): RunDetailRun {
 
   return {
     ...item,
-    statusLabel: display.label,
+    statusLabel: item.lifecycleStatusLabel ?? display.label,
     statusDot: display.dot,
     statusText: display.text,
   };
