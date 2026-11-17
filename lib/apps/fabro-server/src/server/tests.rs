@@ -8198,7 +8198,7 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
                 .body_includes("Approve")
                 .body_includes("Open in Fabro")
                 .body_includes(&child_url)
-                .body_excludes(&parent_run_id.to_string());
+                .body_excludes(parent_run_id.to_string());
             then.status(200).json_body(json!({
                 "ok": true,
                 "channel": "C-approval",

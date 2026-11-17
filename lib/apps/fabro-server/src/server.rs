@@ -1274,9 +1274,7 @@ impl SlackService {
                 .then_some(message)
         })?;
         let projection = run_records::require_projection(state, run_id).await.ok()?;
-        if projection.parent_id.is_none() {
-            return None;
-        }
+        projection.parent_id.as_ref()?;
         let run_web_url = projection
             .web_url
             .clone()
@@ -1309,18 +1307,17 @@ impl SlackService {
             .lock()
             .expect("slack auth identity lock poisoned")
             .clone();
-        let identity = match cached {
-            Some(identity) => identity,
-            None => {
-                let Ok(identity) = self.client.auth_identity().await else {
-                    return false;
-                };
-                self.auth_identity
-                    .lock()
-                    .expect("slack auth identity lock poisoned")
-                    .replace(identity.clone());
-                identity
-            }
+        let identity = if let Some(identity) = cached {
+            identity
+        } else {
+            let Ok(identity) = self.client.auth_identity().await else {
+                return false;
+            };
+            self.auth_identity
+                .lock()
+                .expect("slack auth identity lock poisoned")
+                .replace(identity.clone());
+            identity
         };
         team_id == &identity.team_id && user_id != &identity.bot_user_id
     }
