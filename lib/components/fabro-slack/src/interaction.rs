@@ -58,8 +58,9 @@ pub fn parse_interaction(payload: &Value) -> Option<SlackAnswerSubmission> {
                 selected_option: None,
                 text:            None,
             },
-            SlackActionPayload::SubmitMulti { .. } => return None,
-            SlackActionPayload::Approval { .. } => return None,
+            SlackActionPayload::SubmitMulti { .. } | SlackActionPayload::Approval { .. } => {
+                return None;
+            }
         },
         "button" if action_id == MULTI_SELECT_SUBMIT_ACTION_ID => {
             extract_checkbox_selections(payload)
@@ -104,6 +105,7 @@ mod tests {
     use fabro_interview::AnswerValue;
 
     use super::*;
+    use crate::payload::{SlackApprovalDecision, SlackMessageRef};
 
     #[test]
     fn parse_yes_button_click() {
@@ -165,13 +167,10 @@ mod tests {
         let submission = parse_interaction(&payload).unwrap();
 
         assert_eq!(submission.run_id, "01JCHILD");
-        assert_eq!(
-            submission.approval,
-            Some(crate::payload::SlackApprovalDecision::Approve)
-        );
+        assert_eq!(submission.approval, Some(SlackApprovalDecision::Approve));
         assert_eq!(
             submission.message,
-            Some(crate::payload::SlackMessageRef {
+            Some(SlackMessageRef {
                 channel_id: "C123".to_string(),
                 message_ts: "1234.5678".to_string(),
             })

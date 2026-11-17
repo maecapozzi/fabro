@@ -522,17 +522,22 @@ impl RunWorkspaces {
         let message = self.message(key, node, status);
         let user_name = format!("user.name={}", self.author.name);
         let user_email = format!("user.email={}", self.author.email);
-        self.git(site, "commit", &[
-            "-c",
-            &user_name,
-            "-c",
-            &user_email,
+        self.git_as_author(
+            site,
             "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            &message,
-        ])
+            &[
+                "-c",
+                &user_name,
+                "-c",
+                &user_email,
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                &message,
+            ],
+            &[],
+        )
         .await?;
         let sha = self.git(site, "rev-parse", &["rev-parse", "HEAD"]).await?;
         Ok(Snapshot {
@@ -844,6 +849,34 @@ impl RunWorkspaces {
         Self::run_with(site, action, args, &[], self.timeout).await
     }
 
+    /// Run a commit command as the run's resolved author and committer,
+    /// replacing conflicting ambient values at either site.
+    async fn git_as_author<S: AsRef<str>>(
+        &self,
+        site: &Site,
+        action: &str,
+        args: &[S],
+        extra_env: &[(String, String)],
+    ) -> Result<String, CheckpointError> {
+        let mut env = extra_env.to_vec();
+        env.extend([
+            ("GIT_AUTHOR_NAME".to_string(), self.author.name.clone()),
+            ("GIT_AUTHOR_EMAIL".to_string(), self.author.email.clone()),
+            ("GIT_COMMITTER_NAME".to_string(), self.author.name.clone()),
+            ("GIT_COMMITTER_EMAIL".to_string(), self.author.email.clone()),
+        ]);
+        let output = Self::run_with(site, action, args, &env, self.timeout).await?;
+        if output.success {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(CheckpointError::Command {
+                action: action.to_string(),
+                status: "non-zero exit".to_string(),
+                detail: detail(&output.stderr),
+            })
+        }
+    }
+
     /// [`Self::run`] with extra environment for the one command and its own
     /// deadline: a fetch from the origin carries its credential this way.
     async fn run_with<S: AsRef<str>>(
@@ -1064,6 +1097,70 @@ mod tests {
         assert!(message.starts_with("fabro(run-1): build (success)\n\n"));
         assert_eq!(CheckpointKey::from_message(&message), Some(key));
         assert_eq!(trailer::parse(&message, RUN_TRAILER), Some("run-1"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commit_replaces_conflicting_identity() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for (index, author) in [
+            GitAuthor {
+                name:  "Run Author".to_string(),
+                email: "run@example.com".to_string(),
+            },
+            GitAuthor::from_options(Some("Partial Author".to_string()), None),
+            GitAuthor::default(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workspaces = RunWorkspaces::new(
+                dir.path().to_path_buf(),
+                "run-1".to_string(),
+                author.clone(),
+                &RunCheckpointSettings::default(),
+            );
+            let path = dir.path().join(index.to_string());
+            fs::create_dir(&path).await.expect("the workspace");
+            let site = Site::Host(path);
+            workspaces
+                .git(&site, "init", &["init", "-q"])
+                .await
+                .expect("repository initialized");
+            let conflicting_env = [
+                ("GIT_AUTHOR_NAME".to_string(), "Ambient Author".to_string()),
+                (
+                    "GIT_AUTHOR_EMAIL".to_string(),
+                    "ambient-author@example.invalid".to_string(),
+                ),
+                (
+                    "GIT_COMMITTER_NAME".to_string(),
+                    "Ambient Committer".to_string(),
+                ),
+                (
+                    "GIT_COMMITTER_EMAIL".to_string(),
+                    "ambient-committer@example.invalid".to_string(),
+                ),
+            ];
+            workspaces
+                .git_as_author(
+                    &site,
+                    "commit",
+                    &["commit", "-q", "--allow-empty", "-m", "checkpoint"],
+                    &conflicting_env,
+                )
+                .await
+                .expect("checkpoint committed");
+            assert_eq!(
+                workspaces
+                    .git(&site, "log", &["log", "-1", "--format=%an|%ae|%cn|%ce"],)
+                    .await
+                    .expect("commit identity"),
+                format!(
+                    "{}|{}|{}|{}",
+                    author.name, author.email, author.name, author.email
+                )
+            );
+        }
     }
 
     #[tokio::test]

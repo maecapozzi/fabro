@@ -269,7 +269,7 @@ fn routing_context(context_display: Option<&str>) -> RoutingContext {
     }
 }
 
-fn is_parent_navigation_prompt(question: &Question, routing: &RoutingContext) -> bool {
+fn is_parent_navigation_prompt(question: &Question, routing: RoutingContext) -> bool {
     if !routing.launch_approval {
         return false;
     }
@@ -283,7 +283,7 @@ fn is_parent_navigation_prompt(question: &Question, routing: &RoutingContext) ->
 pub fn is_launch_navigation_question(question: &Question) -> bool {
     is_parent_navigation_prompt(
         question,
-        &routing_context(question.context_display.as_deref()),
+        routing_context(question.context_display.as_deref()),
     )
 }
 
@@ -293,7 +293,7 @@ fn question_presentation(
     run_web_url: Option<&str>,
 ) -> QuestionPresentation {
     let routing = routing_context(question.context_display.as_deref());
-    if is_parent_navigation_prompt(question, &routing) {
+    if is_parent_navigation_prompt(question, routing) {
         let question_text =
             "Review the linked task’s current launch status, then use Check again to continue \
              this task."
