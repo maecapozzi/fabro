@@ -57,6 +57,10 @@ docker = "buildpack-deps:bookworm"
 [environments.test.env]
 GIT_CONFIG_GLOBAL = "/dev/null"
 GIT_CONFIG_NOSYSTEM = "1"
+GIT_AUTHOR_NAME = "Conflicting Stage Author"
+GIT_AUTHOR_EMAIL = "stage-author@example.invalid"
+GIT_COMMITTER_NAME = "Conflicting Stage Committer"
+GIT_COMMITTER_EMAIL = "stage-committer@example.invalid"
 {author_settings}
 "#,
         base = support::SETTINGS,
