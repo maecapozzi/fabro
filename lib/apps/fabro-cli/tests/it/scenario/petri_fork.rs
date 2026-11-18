@@ -207,11 +207,11 @@ async fn a_retry_starts_over_and_succeeds_when_the_failure_was_transient() {
     assert_eq!(read(&retry_workspace, "flaky.txt"), "flaky\n");
     assert_eq!(read(&retry_workspace, "three.txt"), "three\n");
     assert_eq!(commit_subjects(&retry_workspace), [
-        format!("fabro({retry}): start (success)"),
-        format!("fabro({retry}): one (success)"),
-        format!("fabro({retry}): flaky (success)"),
-        format!("fabro({retry}): three (success)"),
-        format!("fabro({retry}): exit (success)"),
+        "Start completed (no source changes)",
+        "Update source during One",
+        "Update source during Flaky",
+        "Update source during Three",
+        "Exit completed (no source changes)",
     ]);
     let state = run_json(&server, &format!("runs/{retry}/state")).await;
     assert_eq!(state["retried_from"], source);

@@ -107,9 +107,9 @@ use petri_runtime::driver::lifecycle::{
 };
 use petri_runtime::executor::{EnvError, ExecEnv};
 use petri_runtime::ir::{
-    ExecutionId, FailureInfo, FinalizationFailure, RunStatus, ScopeId, Status,
+    ExecutionId, FailureInfo, FinalizationFailure, Outcome, RunStatus, ScopeId, Status,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tokio::{fs, time};
 use tracing::{debug, info, warn};
@@ -647,6 +647,7 @@ impl FabroHooks {
         node: &str,
         status: &Status,
         origin: ResultOrigin,
+        summary: Option<&str>,
     ) -> Result<Option<Note>, HookError> {
         self.gate("prepare", node).await;
         if !self.checkpoint_enabled {
@@ -676,7 +677,7 @@ impl FabroHooks {
         let _held = serialized.lock().await;
         match self
             .workspaces
-            .commit(&site, &workspace, key, node, status.tag())
+            .commit(&site, &workspace, key, node, status.tag(), summary)
             .await
         {
             Ok(snapshot) => {
@@ -1583,6 +1584,28 @@ fn is_checkpoint_failure(status: &Status) -> bool {
     matches!(status, Status::Failure(info) if info.class.as_str() == CHECKPOINT_FAILED_CLASS)
 }
 
+fn checkpoint_summary(outcome: &Outcome) -> Option<String> {
+    ["summary", "notes", "last_response"]
+        .into_iter()
+        .find_map(|key| outcome.context_updates.get(key))
+        .and_then(summary_value)
+        .or_else(|| {
+            ["summary", "notes"]
+                .into_iter()
+                .find_map(|key| outcome.output.get(key))
+                .and_then(summary_value)
+        })
+        .or_else(|| summary_value(&outcome.output))
+}
+
+fn summary_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Object(_) => serde_json::to_string(value).ok(),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl ExecutionHooks for FabroHooks {
     async fn before_attempt(
@@ -1607,13 +1630,24 @@ impl ExecutionHooks for FabroHooks {
         };
         let original = request.outcome.status.clone();
         let origin = request.origin;
+        // The driver masks this outcome before hooks see it. Keep the commit
+        // subject on that redacted boundary rather than consulting raw logs.
+        let checkpoint_summary = checkpoint_summary(&request.outcome);
         let mut prepared = self.inner.prepare_result(context, request).await?;
         let effective = prepared.adjustment.status.clone().unwrap_or(original);
         if matches!(effective, Status::Cancelled) {
             return Ok(prepared);
         }
         match self
-            .snapshot(context, scope, key, &node, &effective, origin)
+            .snapshot(
+                context,
+                scope,
+                key,
+                &node,
+                &effective,
+                origin,
+                checkpoint_summary.as_deref(),
+            )
             .await
         {
             Ok(Some(note)) => prepared.notes.push(note),
@@ -1823,6 +1857,39 @@ mod tests {
     struct NoHooks;
     #[async_trait::async_trait]
     impl ExecutionHooks for NoHooks {}
+
+    #[test]
+    fn checkpoint_summary_uses_masked_structured_result_fields() {
+        let mut outcome = Outcome::success(json!({
+            "summary": "Summarize the structured output",
+        }));
+        assert_eq!(
+            checkpoint_summary(&outcome),
+            Some("Summarize the structured output".to_string())
+        );
+
+        outcome.context_updates.insert(
+            "last_response".into(),
+            json!(
+                r#"{"outcome":"succeeded","context_updates":{"summary":"Use the routing summary"}}"#
+            ),
+        );
+        assert_eq!(
+            checkpoint_summary(&outcome),
+            Some(
+                r#"{"outcome":"succeeded","context_updates":{"summary":"Use the routing summary"}}"#
+                    .to_string()
+            )
+        );
+
+        outcome
+            .context_updates
+            .insert("notes".into(), json!("Prefer masked notes"));
+        assert_eq!(
+            checkpoint_summary(&outcome),
+            Some("Prefer masked notes".to_string())
+        );
+    }
 
     struct FlakyRecords {
         records: MemoryPlatformRecords,
