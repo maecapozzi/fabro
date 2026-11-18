@@ -2216,6 +2216,234 @@ default_channel = "#releases"
 }
 
 #[test]
+fn slack_interview_channel_prefers_nonempty_slack_run_channel() {
+    let selected = fabro_types::settings::run::RunInterviewsSettings {
+        provider: Some("slack".to_string()),
+        slack:    Some(fabro_types::settings::run::InterviewProviderSettings {
+            channel: Some("#standup".into()),
+        }),
+    };
+
+    assert_eq!(
+        resolve_slack_interview_channel(&selected, Some("D-default")).as_deref(),
+        Some("#standup")
+    );
+
+    for fallback in [
+        fabro_types::settings::run::RunInterviewsSettings::default(),
+        fabro_types::settings::run::RunInterviewsSettings {
+            provider: Some("web".to_string()),
+            slack:    Some(fabro_types::settings::run::InterviewProviderSettings {
+                channel: Some("#standup".into()),
+            }),
+        },
+        fabro_types::settings::run::RunInterviewsSettings {
+            provider: Some("slack".to_string()),
+            slack:    None,
+        },
+        fabro_types::settings::run::RunInterviewsSettings {
+            provider: Some("slack".to_string()),
+            slack:    Some(fabro_types::settings::run::InterviewProviderSettings {
+                channel: Some("  ".into()),
+            }),
+        },
+    ] {
+        assert_eq!(
+            resolve_slack_interview_channel(&fallback, Some("D-default")).as_deref(),
+            Some("D-default")
+        );
+    }
+
+    assert_eq!(
+        resolve_slack_interview_channel(&selected, None).as_deref(),
+        Some("#standup")
+    );
+    assert_eq!(
+        resolve_slack_interview_channel(
+            &fabro_types::settings::run::RunInterviewsSettings::default(),
+            None,
+        ),
+        None
+    );
+}
+
+async fn stored_run_with_pending_interview(
+    state: &Arc<AppState>,
+    app: &Router,
+    config: Option<&str>,
+    qid: &str,
+) -> RunId {
+    let intent = test_intent_with_bearer(app, "workflow.fabro", MINIMAL_DOT, config, None).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/runs"))
+                .header("content-type", "application/json")
+                .body(Body::from(intent.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::CREATED).await;
+    let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    let mut projection = state
+        .load_run_projection(&run_id)
+        .await
+        .expect("created run should have a projection")
+        .as_ref()
+        .clone();
+    // `post_question` consumes the projector's pending-interview view. Seed
+    // that input directly so this service test does not need to launch a
+    // worker merely to reach a human gate.
+    projection
+        .pending_interviews
+        .insert(qid.to_string(), PendingInterviewRecord {
+            question:   InterviewQuestionRecord {
+                id:              qid.to_string(),
+                text:            "Join standup?".to_string(),
+                stage:           "standup".to_string(),
+                question_type:   QuestionType::YesNo,
+                options:         vec![
+                    InterviewOption {
+                        key:         "Y".to_string(),
+                        label:       "Yes".to_string(),
+                        description: None,
+                        preview:     None,
+                    },
+                    InterviewOption {
+                        key:         "N".to_string(),
+                        label:       "No".to_string(),
+                        description: None,
+                        preview:     None,
+                    },
+                ],
+                allow_freeform:  false,
+                timeout_seconds: None,
+                context_display: None,
+                review_target:   None,
+            },
+            started_at: Utc::now(),
+        });
+    let projection_pool = state.stores.run_summaries.pool();
+    let result = sqlx::query("UPDATE petri_projection SET projection_json = ? WHERE run_id = ?")
+        .bind(serde_json::to_string(&projection).expect("projection should serialize"))
+        .bind(run_id.to_string())
+        .execute(&projection_pool)
+        .await
+        .expect("pending interview should be stored");
+    assert_eq!(result.rows_affected(), 1);
+
+    run_id
+}
+
+#[tokio::test]
+async fn slack_post_question_routes_and_updates_run_channel_or_server_default() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let selected_run = stored_run_with_pending_interview(
+        &state,
+        &app,
+        Some(
+            r#"
+_version = 1
+
+[run.interviews]
+provider = "slack"
+
+[run.interviews.slack]
+channel = "C-selected-request"
+"#,
+        ),
+        "q-selected",
+    )
+    .await;
+    let default_run = stored_run_with_pending_interview(&state, &app, None, "q-default").await;
+
+    let slack_api = MockServer::start_async().await;
+    let selected_post = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.postMessage")
+                .body_includes(r#""channel":"C-selected-request""#)
+                .body_includes("Join standup?");
+            then.status(200).json_body(json!({
+                "ok": true,
+                "channel": "C-selected-returned",
+                "ts": "1111.0000",
+            }));
+        })
+        .await;
+    let default_post = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.postMessage")
+                .body_includes(r#""channel":"D-default""#)
+                .body_includes("Join standup?");
+            then.status(200).json_body(json!({
+                "ok": true,
+                "channel": "D-default-returned",
+                "ts": "2222.0000",
+            }));
+        })
+        .await;
+    let selected_update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""channel":"C-selected-returned""#)
+                .body_includes(r#""ts":"1111.0000""#)
+                .body_includes("Yes");
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let default_update = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.update")
+                .body_includes(r#""channel":"D-default-returned""#)
+                .body_includes(r#""ts":"2222.0000""#)
+                .body_includes("No");
+            then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let service = SlackService {
+        client:           SlackClient::with_api_base_and_http(
+            "xoxb-test".to_string(),
+            slack_api.base_url(),
+            fabro_http::test_http_client().expect("test Slack client should build"),
+        ),
+        app_token:        "xapp-test".to_string(),
+        default_channel:  Some("D-default".to_string()),
+        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals: Arc::new(Mutex::new(HashMap::new())),
+        auth_identity:    Arc::new(Mutex::new(None)),
+        thread_registry:  Arc::new(ThreadRegistry::new()),
+        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+    };
+
+    service
+        .post_question(state.as_ref(), selected_run, "q-selected", None)
+        .await;
+    service
+        .post_question(state.as_ref(), default_run, "q-default", None)
+        .await;
+    selected_post.assert_async().await;
+    default_post.assert_async().await;
+
+    service
+        .finish_interview(selected_run, "q-selected", "Join standup?", "Yes")
+        .await;
+    service
+        .finish_interview(default_run, "q-default", "Join standup?", "No")
+        .await;
+
+    selected_update.assert_async().await;
+    default_update.assert_async().await;
+}
+
+#[test]
 fn slack_service_ignores_server_env_tokens() {
     let state = slack_app_state_with_secret_sources(
         &[],
@@ -8194,6 +8422,7 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
         .mock_async(|when, then| {
             when.method(POST)
                 .path("/chat.postMessage")
+                .body_includes(r#""channel":"C-approval""#)
                 .body_includes("Approval needed")
                 .body_includes("Approve")
                 .body_includes("Open approval in Fabro")
