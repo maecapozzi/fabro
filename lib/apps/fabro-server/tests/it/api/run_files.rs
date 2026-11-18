@@ -100,6 +100,7 @@ async fn final_patch_survives_sandbox_removal_and_reports_unreadable_blobs() {
     let live = get_json(&app, &files_url(&run_id), StatusCode::OK).await;
     assert_eq!(live["meta"]["source"], "sandbox");
     assert_eq!(live["meta"]["total_changed"], 3);
+    state.test_wait_for_run_files_quiescence().await;
 
     let sandbox_dir = projection["sandbox"]["instance"]["runtime"]["working_directory"]
         .as_str()
@@ -143,6 +144,7 @@ async fn final_patch_survives_sandbox_removal_and_reports_unreadable_blobs() {
     assert_eq!(file("artifacts/data.bin")["binary"], true);
     assert!(file("artifacts/data.bin")["unified_patch"].is_null());
     assert_eq!(blobs.read(&hash).await.unwrap().unwrap(), patch);
+    state.test_wait_for_run_files_quiescence().await;
 
     // A saved reference whose bytes are gone must not look like an empty diff.
     sqlx::query("DELETE FROM blobs WHERE hash = ?")
@@ -155,6 +157,7 @@ async fn final_patch_survives_sandbox_removal_and_reports_unreadable_blobs() {
         missing["errors"][0]["detail"],
         "The saved final patch is missing."
     );
+    state.test_wait_for_run_files_quiescence().await;
     sqlx::query("INSERT INTO blobs (hash, data) VALUES (?, ?)")
         .bind(hash.to_string())
         .bind(b"corrupt patch".as_slice())
@@ -166,6 +169,7 @@ async fn final_patch_survives_sandbox_removal_and_reports_unreadable_blobs() {
         corrupt["errors"][0]["detail"],
         "The saved final patch could not be read."
     );
+    state.test_wait_for_run_files_quiescence().await;
     // Repair is visible on the next request; failed materializations aren't cached.
     sqlx::query("UPDATE blobs SET data = ? WHERE hash = ?")
         .bind(patch.as_ref())

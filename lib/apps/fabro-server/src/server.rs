@@ -120,7 +120,7 @@ use tokio::process::Command;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast, mpsc, oneshot};
-use tokio::task::spawn_blocking;
+use tokio::task::{self, spawn_blocking};
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
@@ -1705,6 +1705,24 @@ impl AppState {
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_petri_projector(&self) -> &Arc<Projector> {
         &self.petri_projector
+    }
+
+    /// Wait until completed Run Files materializations have unregistered.
+    ///
+    /// A response is published before its in-flight entry is removed, so
+    /// tests that need a subsequent request to rematerialize must wait for
+    /// this condition rather than sleeping for an assumed cleanup duration.
+    pub async fn test_wait_for_run_files_quiescence(&self) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if self.files_in_flight.lock().await.is_empty() {
+                    break;
+                }
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Run Files materializations should become quiescent");
     }
 
     /// The status the server holds for a managed run, so a test can wait
