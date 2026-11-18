@@ -328,32 +328,47 @@ If no retry target is found at any level, the run fails:
 goal gate unsatisfied for node verify and no retry target
 ```
 
-## Stall watchdog
+## Run timeouts
 
-Fabro runs a background watchdog that monitors event activity. If no events are emitted for longer than the **stall timeout**, the run is canceled. This catches cases where a handler hangs indefinitely without producing errors.
+Fabro uses Petri's run watchdog for two independent limits: an inactivity
+budget and an active-runtime backstop. The clocks start when actual work
+starts, so scheduler queue time does not count.
 
-The budget applies to the whole run. Command output, streaming model activity,
-and activity in any child or parallel branch refresh it. A paused run or a run
-with a pending human question parks the clock. Unpausing or answering the last
-pending question starts a full budget again. Resumed runs use their persisted
-graph policy and preserve a recorded pause.
+The inactivity clock resets only for typed execution activity: non-empty command
+or tool output, artifacts, Pebble model request/streaming activity, and typed
+tool lifecycle events. Activity in child and parallel work counts for the
+containing run. Status requests, `fabro_run_get`/gather/wait polling,
+supervision bookkeeping, heartbeats, and retries without useful execution
+activity do not reset it. Fabro deliberately does not infer progress from
+arbitrary model prose.
 
-Work that emits no observable activity can exhaust the budget even while it is
-still running, including a one-shot prompt waiting for its model response. Set
-the budget to accommodate the longest expected quiet operation, or disable it
-explicitly. A watchdog cancellation records `StallTimeout` and emits
-`run.stalled` with the configured budget and observed idle time.
+Both clocks park for an explicit pause and when every currently running firing
+is waiting for real human launch approval or input. A parallel branch that is
+still working keeps both clocks running; ordinary parent waiting or polling for
+an active child is not a human wait. Resume restores the persisted accounting
+and policy without charging downtime or resetting the active-runtime budget.
 
 | Setting | Default |
 |---|---|
-| `stall_timeout` | 1800 seconds (30 minutes) |
-| Set to `0` | Disables the watchdog |
+| `stall_timeout` | 10 minutes of no meaningful execution activity |
+| `max_active_duration` | 90 minutes of active execution |
+| Set either to `0` | Disables that limit |
 
 ```dot title="example.fabro"
 digraph Example {
-    graph [stall_timeout="300"]  // 5 minutes
+    graph [stall_timeout="20m", max_active_duration="2h"]
 }
 ```
+
+Raise `stall_timeout` for a legitimate quiet operation (such as a build that
+does not emit output), or set it to `0` only when that risk is understood. The
+maximum active duration remains an independent backstop unless it too is raised
+or disabled. Timeout cancellation uses the normal run-tree cancellation path;
+saved checkpoints, artifacts, and logs remain available for recovery. A stall
+timeout records `StallTimeout` and `run.stalled`; an active-runtime timeout
+records `MaximumActiveDuration` and
+`run.maximum_active_duration_exceeded`, each with the configured limit and
+measured elapsed duration.
 
 ## When failures become fatal
 

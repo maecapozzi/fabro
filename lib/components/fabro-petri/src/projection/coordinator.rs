@@ -134,6 +134,7 @@ impl RunView {
                 }
             }
             CoordinatorEvent::GraphRegistered { .. }
+            | CoordinatorEvent::RunTimeoutUpdated { .. }
             | CoordinatorEvent::ExecutionFinished { .. }
             | CoordinatorEvent::RunNoteRecorded { .. } => {}
         }
@@ -277,6 +278,12 @@ pub(crate) fn stall_message(reason: Option<&CancelReason>) -> Option<String> {
             idle_ms,
         }) => Some(format!(
             "the run was cancelled after {idle_ms} ms without execution activity (stall timeout: {stall_timeout_ms} ms)"
+        )),
+        Some(CancelReason::MaximumActiveDuration {
+            maximum_active_duration_ms,
+            active_duration_ms,
+        }) => Some(format!(
+            "the run was cancelled after {active_duration_ms} ms of active execution (maximum active duration: {maximum_active_duration_ms} ms)"
         )),
         _ => None,
     }

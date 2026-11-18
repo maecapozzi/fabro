@@ -299,7 +299,8 @@ impl RunView {
             }
             ViewEvent::ForkStarted { .. }
             | ViewEvent::BranchCompleted { .. }
-            | ViewEvent::RunStalled { .. } => {}
+            | ViewEvent::RunStalled { .. }
+            | ViewEvent::RunMaximumActiveDurationExceeded { .. } => {}
         }
     }
 

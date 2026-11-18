@@ -83,7 +83,8 @@ rankdir=LR
 | `default_fidelity` | String | Default [fidelity level](/execution/context) for all nodes |
 | `default_thread` | String | Default thread ID for all nodes |
 | `max_node_visits` | Integer | Max visits per node across the run (0 = unlimited) |
-| `stall_timeout` | Duration | Timeout for stalled workflows (default: `1800s`, 0 = disabled) |
+| `stall_timeout` | Duration | Inactivity timeout for typed execution activity (default: `10m`, 0 = disabled) |
+| `max_active_duration` | Duration | Maximum active execution runtime, excluding queue, pauses, and qualifying human waits (default: `90m`, 0 = disabled) |
 | `loop_restart_signature_limit` | Integer | Max times the same failure signature can repeat before aborting (default: 3) |
 
 ### Node defaults

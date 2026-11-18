@@ -54,6 +54,7 @@
 //! finish the run, from the [`Conclusion`] this module derives. The
 //! projection over Petri's records is the read-side item that follows.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -61,18 +62,19 @@ use fabro_types::settings::run::{
     EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentResourcesSettings,
 };
 use fabro_types::settings::size::Size;
-use fabro_types::{FailureReason, RunId, SandboxProviderKind};
+use fabro_types::{CodingAgentEvent, CodingEvent, FailureReason, RunId, SandboxProviderKind};
 use fabro_util::sync;
 use lithos_llm::types::Error as LlmError;
 use petri_execution::host::{self, HostError, HostRun};
 use petri_execution::inspect::{self, InspectError, RunInspection};
-use petri_execution::watchdog::{StallWatchdog, WatchdogTask};
+use petri_execution::watchdog::{RunWatchdog, WatchdogTask};
 use petri_execution::{
-    Access, CancelReason, CoordinatorError, ExecutionObserver, InterviewDispatcher, Interviewer,
-    RECEIPT_FILE, RunKey, RunStore,
+    Access, CancelReason, CoordinatorError, CoordinatorRecord, CoordinatorState, ExecutionObserver,
+    InterviewDispatcher, Interviewer, RECEIPT_FILE, RunKey, RunStore,
 };
 use petri_runtime::driver::ExecutionReport;
 use petri_runtime::driver::lifecycle::ExecutionHooks;
+use petri_runtime::engine::{EngineState, Event, EventRecord};
 pub use petri_runtime::executor::Retention;
 use petri_runtime::executor::SecretProvider;
 use petri_runtime::ir::FiringId;
@@ -100,6 +102,126 @@ pub enum Execution {
     /// Continue the run from its records. The admitted graphs start the
     /// run again when a crash cut its creation short.
     Resume(AdmittedGraphs),
+}
+
+/// Fabro's activity policy over Petri's native run watchdog.
+///
+/// Petri owns persistence, timing, cancellation, and resume reconstruction.
+/// This observer only narrows which Pebble envelopes can refresh inactivity:
+/// read-only Fabro run-management tools and lifecycle bookkeeping are not
+/// activity, while model streaming and useful tool output are.
+#[derive(Clone)]
+struct FabroWatchdog {
+    native:        RunWatchdog,
+    polling_calls: Arc<Mutex<BTreeMap<String, bool>>>,
+}
+
+impl FabroWatchdog {
+    fn new(native: RunWatchdog) -> Self {
+        Self {
+            native,
+            polling_calls: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn on_pebble_event(&self, payload: &serde_json::Value) {
+        let Ok(envelope) = serde_json::from_value::<CodingAgentEvent>(payload["event"].clone())
+        else {
+            return;
+        };
+        match envelope.event {
+            CodingEvent::ToolCallStarted {
+                tool_name,
+                tool_call_id,
+                ..
+            } => {
+                sync::lock(&self.polling_calls).insert(tool_call_id, is_run_poll(&tool_name));
+            }
+            CodingEvent::ToolCallOutputDelta { delta }
+                if !delta.is_empty()
+                    && envelope.tool_call_id.is_some_and(|call_id| {
+                        !sync::lock(&self.polling_calls)
+                            .get(&call_id)
+                            .copied()
+                            .unwrap_or(true)
+                    }) =>
+            {
+                self.native.record_activity();
+            }
+            CodingEvent::ToolCallCompleted {
+                tool_name,
+                tool_call_id,
+                is_error: false,
+                ..
+            } if !sync::lock(&self.polling_calls)
+                .remove(&tool_call_id)
+                .unwrap_or_else(|| is_run_poll(&tool_name)) =>
+            {
+                self.native.record_activity();
+            }
+            CodingEvent::ToolCallCompleted { tool_call_id, .. } => {
+                sync::lock(&self.polling_calls).remove(&tool_call_id);
+            }
+            CodingEvent::LlmFirstOutput { .. } => {
+                self.native.record_activity();
+            }
+            CodingEvent::TextDelta { delta } if !delta.is_empty() => {
+                self.native.record_activity();
+            }
+            CodingEvent::ReasoningDelta { delta } if !delta.is_empty() => {
+                self.native.record_activity();
+            }
+            CodingEvent::AssistantMessage { text, .. } if !text.is_empty() => {
+                self.native.record_activity();
+            }
+            _ => {}
+        }
+    }
+
+    fn start(&self, handle: petri_execution::CoordinatorHandle) -> WatchdogTask {
+        self.native.start(handle)
+    }
+}
+
+impl ExecutionObserver for FabroWatchdog {
+    fn on_engine_record(
+        &self,
+        execution: petri_execution::ExecutionId,
+        record: &EventRecord,
+        recorded_at: u64,
+        state: &EngineState,
+    ) {
+        match &record.event {
+            Event::StepProgressRecorded {
+                ev: petri_runtime::ir::StepEvent::Custom(payload),
+                ..
+            } if payload.get("kind").and_then(serde_json::Value::as_str) == Some("pebble") => {
+                self.on_pebble_event(payload);
+            }
+            _ => self
+                .native
+                .on_engine_record(execution, record, recorded_at, state),
+        }
+    }
+
+    fn on_lifecycle(&self, record: &CoordinatorRecord) {
+        self.native.on_lifecycle(record);
+    }
+
+    fn on_resumed(&self, state: &CoordinatorState) {
+        self.native.on_resumed(state);
+    }
+
+    fn on_execution_resumed(&self, execution: petri_execution::ExecutionId, state: &EngineState) {
+        self.native.on_execution_resumed(execution, state);
+    }
+}
+
+fn is_run_poll(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "fabro_run_get" | "fabro_run_gather" | "fabro_run_events" | "fabro_run_search"
+    )
 }
 
 /// One run to execute.
@@ -239,8 +361,12 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
         .transpose()
         .map_err(RunError::ModelHeaders)?;
     let key = RunKey::new(request.run_id.as_str());
-    let (stall_timeout, resume_inspection) = match &request.execution {
-        Execution::Start(graphs) => (graphs.graph.policy.stall_timeout, None),
+    let (stall_timeout, max_active_duration, resume_inspection) = match &request.execution {
+        Execution::Start(graphs) => (
+            graphs.graph.policy.stall_timeout,
+            graphs.graph.policy.max_active_duration,
+            None,
+        ),
         Execution::Resume(graphs) => {
             let logs = request
                 .store
@@ -252,11 +378,13 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
             let stored = host::stored_root_graph(&*logs)
                 .await
                 .map_err(RunError::Read)?;
-            let timeout = stored
-                .as_ref()
-                .map_or(graphs.graph.policy.stall_timeout, |graph| {
-                    graph.policy.stall_timeout
-                });
+            let (stall_timeout, max_active_duration) = stored.as_ref().map_or(
+                (
+                    graphs.graph.policy.stall_timeout,
+                    graphs.graph.policy.max_active_duration,
+                ),
+                |graph| (graph.policy.stall_timeout, graph.policy.max_active_duration),
+            );
             let inspection = if stored.is_some() {
                 Some(
                     inspect::inspect_run(&*logs)
@@ -266,10 +394,11 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
             } else {
                 None
             };
-            (timeout, inspection)
+            (stall_timeout, max_active_duration, inspection)
         }
     };
-    let watchdog = stall_timeout.map(StallWatchdog::new);
+    let watchdog = (stall_timeout.is_some() || max_active_duration.is_some())
+        .then(|| FabroWatchdog::new(RunWatchdog::with_limits(stall_timeout, max_active_duration)));
     let mut options = RunOptions::new(&request.run_dir);
     options.run_key = Some(key.clone());
     options.retention = RETENTION;

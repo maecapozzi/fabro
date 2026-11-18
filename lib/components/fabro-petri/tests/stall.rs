@@ -31,9 +31,23 @@ fn request(
     budget: &str,
     runtime: RuntimeSpec,
 ) -> RunRequest {
+    request_with_max_active_duration(root, store, body, budget, None, runtime)
+}
+
+fn request_with_max_active_duration(
+    root: &std::path::Path,
+    store: Arc<MemoryRunStore>,
+    body: &str,
+    budget: &str,
+    max_active_duration: Option<&str>,
+    runtime: RuntimeSpec,
+) -> RunRequest {
+    let max_active_attribute = max_active_duration.map_or_else(String::new, |duration| {
+        format!(r#", max_active_duration="{duration}""#)
+    });
     let graph = format!(
         r#"digraph Stall {{
-        graph [stall_timeout="{budget}", default_model="test/model"]
+        graph [stall_timeout="{budget}"{max_active_attribute}, default_model="test/model"]
         start [shape=Mdiamond]
         exit [shape=Msquare]
         {body}
@@ -52,6 +66,21 @@ fn request(
             Some(Duration::from_secs(1))
         }
     );
+    assert_eq!(
+        graphs.graph.policy.max_active_duration,
+        match max_active_duration {
+            Some("0s") => None,
+            Some(duration) => Some(
+                duration
+                    .strip_suffix('s')
+                    .and_then(|seconds| seconds.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .expect("the test uses whole-second durations"),
+            ),
+            None => Some(Duration::from_secs(90 * 60)),
+        },
+        "the native policy preserves an override or supplies the public active-runtime default"
+    );
     run_request(
         "stall",
         root,
@@ -60,6 +89,30 @@ fn request(
         runtime,
         no_questions(Arc::new(Silent)),
     )
+}
+
+async fn assert_maximum_active_duration(store: &MemoryRunStore) {
+    assert!(matches!(
+        stall_reason(store).await,
+        Some(CancelReason::MaximumActiveDuration {
+            maximum_active_duration_ms: 1000,
+            active_duration_ms,
+        }) if active_duration_ms >= 1000
+    ));
+    let logs = store
+        .open(&RunKey::new("stall"), Access::Read)
+        .await
+        .expect("the run opens for inspection");
+    let events = events::replay_run(&*logs)
+        .await
+        .expect("the run events replay");
+    assert!(events.iter().any(|event| matches!(
+        event.view(),
+        Some(ViewEvent::RunMaximumActiveDurationExceeded {
+            maximum_active_duration_ms: 1000,
+            ..
+        })
+    )));
 }
 
 async fn stall_reason(store: &MemoryRunStore) -> Option<CancelReason> {
@@ -171,6 +224,52 @@ async fn one_active_child_keeps_the_whole_parallel_run_alive() {
         RunStatus::Success,
     )
     .await;
+}
+
+#[tokio::test]
+async fn continuous_output_refreshes_inactivity_but_not_the_active_runtime_backstop() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let request = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        ACTIVE,
+        "1s",
+        Some("1s"),
+        RuntimeSpec::default(),
+    );
+    let outcome = engine::run(request)
+        .await
+        .expect("the adapter returns an outcome");
+    assert_eq!(outcome.status, RunStatus::Cancelled);
+    assert_maximum_active_duration(&store).await;
+    let engine::Conclusion::Failed { message, .. } = engine::conclusion(&Ok(outcome)) else {
+        panic!("maximum active duration must fail");
+    };
+    assert!(
+        message.contains("maximum active duration: 1000 ms"),
+        "{message}"
+    );
+    assert_no_tasks().await;
+}
+
+#[tokio::test]
+async fn zero_disables_the_active_runtime_backstop() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let request = request_with_max_active_duration(
+        root.path(),
+        store,
+        ACTIVE,
+        "0s",
+        Some("0s"),
+        RuntimeSpec::default(),
+    );
+    let outcome = engine::run(request)
+        .await
+        .expect("the adapter returns an outcome");
+    assert_eq!(outcome.status, RunStatus::Success);
+    assert_no_tasks().await;
 }
 
 #[tokio::test]
