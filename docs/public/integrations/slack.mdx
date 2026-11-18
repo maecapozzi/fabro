@@ -164,6 +164,89 @@ When a user interacts:
 
 The connection is maintained with automatic reconnection and exponential backoff (1s initial, 30s max). If the WebSocket disconnects, Fabro reconnects transparently — no manual intervention needed.
 
+## Command-only Yes/No run
+
+An external coordinator can register a command-only workflow once, then create one
+native human-question run when it needs a Slack answer. The workflow configuration
+selects the private interview channel for this run; invite the bot to that channel
+first. Replace the example channel ID and add your server's authentication headers:
+
+```bash
+server=http://localhost:3000
+api=$server/api/v1
+
+# Authenticate the CLI once when the server requires it. Use browser OAuth:
+# fabro auth login --server "$server"
+# Or use a dev token:
+# fabro auth login --server "$server" --dev-token "$FABRO_DEV_TOKEN"
+
+version_id=$(
+  jq -n '{
+    entrypoint: "workflow.fabro",
+    files: {
+      "workflow.toml": "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\ngoal = \"Ask the standup attendance question\"\n\n[run.interviews]\nprovider = \"slack\"\n\n[run.interviews.slack]\nchannel = \"C012STANDUP\"\n",
+      "workflow.fabro": "digraph Standup { start [shape=Mdiamond]; ask [shape=hexagon, label=\"Will you join standup today?\", question_type=\"yes_no\"]; yes [shape=parallelogram, label=\"Record Yes\", script=\"printf '\''Yes\\n'\''\"]; no [shape=parallelogram, label=\"Record No\", script=\"printf '\''No\\n'\''\"]; done [shape=Msquare]; start -> ask; ask -> yes [label=\"[Y] Yes\"]; ask -> no [label=\"[N] No\"]; yes -> done; no -> done; }"
+    },
+    workflow_dependencies: {}
+  }' |
+    curl --fail-with-body -sS "$api/workflow-versions" \
+      -H 'Content-Type: application/json' \
+      --data-binary @- |
+    jq -r '.workflow_version_id'
+)
+
+question_run_id=$(
+  jq -n --arg version_id "$version_id" \
+    '{workflow_version_id:$version_id,target:{kind:"none"},environment_id:"default",args:{auto_approve:false}}' |
+    curl --fail-with-body -sS "$api/runs" \
+      -H 'Content-Type: application/json' \
+      --data-binary @- |
+    jq -r '.id'
+)
+
+curl --fail-with-body -sS -X POST "$api/runs/$question_run_id/start"
+fabro wait "$question_run_id" --server "$server" --timeout 300
+```
+
+The `none` target gives the run an empty workspace in the selected clone-based
+environment (`default` in this example): there is no source clone, run branch,
+push, or pull request. A Local environment does not support `none`. The graph
+has no agent stage and offers exactly the native `Yes` and `No` choices. The
+final command is only a bounded wait for terminal state. If it times out, it
+does not answer or cancel the question, and the coordinator must inspect the
+existing run rather than assume that creating a replacement is safe.
+
+This is a dedicated operational question run, not the originating work run for
+the agent whose standup response is being coordinated. Keep the originating
+work run's real URL and display name in the external coordinator; this workflow
+does not replace that run or rewrite the coordinator's existing work-agent
+message. Naming agents after cities remains a coordinator presentation choice,
+not interview-routing behavior.
+
+After the run completes, the host can read the durable native answer and Slack
+principal from the run stream:
+
+```bash
+curl --fail-with-body -sS "$api/runs/$question_run_id/events?after=0" |
+  jq '.data[]
+    | select(.kind == "platform")
+    | .item.record
+    | select(.kind == "interview.answered")
+    | {answer, principal}'
+```
+
+The `principal` is recorded by the existing Socket Mode answer handler from the
+Slack workspace and user that clicked the button. The external coordinator
+should relay that recorded answer and actor to the already-owning chat; it must
+not invent an actor or treat either choice as an automatic launch approval.
+Fabro does not become the daily scheduler in this pattern—the coordinator
+remains the sole scheduler.
+
+When scheduler capacity is unavailable, a valid answer may be queued for
+readmission. During that interval the Slack question can remain visibly
+unanswered even though the click was accepted; wait for the existing run to
+advance, and do not use a client timeout as a reason to resubmit.
+
 ## Run lifecycle notifications
 
 Slack run lifecycle notifications are opt-in per run or workflow through the `[run.notifications]` namespace. Notification settings do not live in server config.

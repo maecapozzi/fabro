@@ -91,7 +91,7 @@ use fabro_store::{
 #[cfg(test)]
 use fabro_types::BlockedReason;
 use fabro_types::settings::RunNamespace;
-use fabro_types::settings::run::NotificationRouteSettings;
+use fabro_types::settings::run::{NotificationRouteSettings, RunInterviewsSettings};
 use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
 };
@@ -848,7 +848,7 @@ impl SlackService {
         }
     }
 
-    /// Post a pending question to the default channel, once.
+    /// Post a pending question to its run channel or the server default, once.
     async fn post_question(
         &self,
         state: &AppState,
@@ -856,9 +856,6 @@ impl SlackService {
         question_id: &str,
         run_web_url: Option<&str>,
     ) {
-        let Some(default_channel) = self.default_channel.as_deref() else {
-            return;
-        };
         let key = (run_id, question_id.to_string());
         if self
             .posted_messages
@@ -875,6 +872,12 @@ impl SlackService {
                 warn!(run_id = %run_id, error = %err, "Skipping Slack question: the run's projection could not be loaded");
                 return;
             }
+        };
+        let Some(channel) = resolve_slack_interview_channel(
+            &projection.spec.settings.run.interviews,
+            self.default_channel.as_deref(),
+        ) else {
+            return;
         };
         let Some(pending) = projection.pending_interviews.get(question_id) else {
             return;
@@ -900,12 +903,7 @@ impl SlackService {
         );
         if let Ok(posted) = self
             .client
-            .post_message(
-                default_channel,
-                &message.fallback_text,
-                &message.blocks,
-                None,
-            )
+            .post_message(&channel, &message.fallback_text, &message.blocks, None)
             .await
         {
             if question.allow_freeform || question.question_type == QuestionType::Freeform {
@@ -1548,6 +1546,28 @@ fn slack_lifecycle_pull_request_from_link(link: &PullRequestLink) -> SlackLifecy
         title:  None,
         url:    Some(link.html_url()),
     }
+}
+
+fn resolve_slack_interview_channel(
+    interviews: &RunInterviewsSettings,
+    default_channel: Option<&str>,
+) -> Option<String> {
+    let run_channel = (interviews.provider.as_deref() == Some("slack"))
+        .then(|| {
+            interviews
+                .slack
+                .as_ref()
+                .and_then(|slack| slack.channel.as_ref())
+        })
+        .flatten()
+        .and_then(|channel| {
+            channel
+                .resolve_with(&mut fabro_types::settings::ResolveCtx::new())
+                .ok()
+        })
+        .filter(|channel| !channel.trim().is_empty());
+
+    run_channel.or_else(|| default_channel.map(ToOwned::to_owned))
 }
 
 fn resolve_slack_lifecycle_route_channel(
