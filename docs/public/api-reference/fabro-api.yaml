@@ -7710,6 +7710,7 @@ components:
         - draft
         - updated_at
         - run_ids
+        - review_readiness
       properties:
         owner:
           type: string
@@ -7740,6 +7741,53 @@ components:
           uniqueItems: true
           items:
             type: string
+        review_readiness:
+          $ref: "#/components/schemas/ReviewReadiness"
+
+    ReviewReadinessStatus:
+      description: >-
+        Whether fresh GitHub evidence says the pull request is ready for human
+        review. Draft state, approvals, and mergeability do not affect this value.
+      type: string
+      enum:
+        - ready
+        - ci_running
+        - ci_failed
+        - unresolved_comments
+        - no_checks
+        - unavailable
+
+    ReviewReadiness:
+      description: >-
+        Review-readiness evidence for the pull request's current head. A ready
+        result requires at least one reported successful check or commit status
+        and no unresolved GitHub review threads.
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - head_sha
+        - unresolved_thread_count
+        - checked_at
+      properties:
+        status:
+          $ref: "#/components/schemas/ReviewReadinessStatus"
+        head_sha:
+          oneOf:
+            - type: string
+              pattern: "^[0-9a-fA-F]{40}$"
+            - type: "null"
+          description: Exact pull request head evaluated, or null when it could not be verified.
+        unresolved_thread_count:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 0
+            - type: "null"
+          description: Count of unresolved review threads, or null when thread data was unavailable.
+        checked_at:
+          type: string
+          format: date-time
 
     InReviewPullRequestListStatus:
       description: Whether every GitHub search page was fetched successfully.

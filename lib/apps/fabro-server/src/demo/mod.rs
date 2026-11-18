@@ -55,6 +55,70 @@ pub(crate) async fn list_runs(
     paginated_response(runs::summaries(), &pagination)
 }
 
+pub(crate) async fn list_in_review_pull_requests(_auth: RequiredUser) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": [
+                {
+                    "owner": "fabro-sh",
+                    "repo": "fabro",
+                    "number": 482,
+                    "title": "Keep review readiness fresh on the Runs board",
+                    "html_url": "https://github.com/fabro-sh/fabro/pull/482",
+                    "draft": true,
+                    "updated_at": "2026-11-18T14:30:00Z",
+                    "run_ids": [],
+                    "review_readiness": {
+                        "status": "ready",
+                        "head_sha": "1111111111111111111111111111111111111111",
+                        "unresolved_thread_count": 0,
+                        "checked_at": "2026-11-18T14:31:00Z"
+                    }
+                },
+                {
+                    "owner": "acme",
+                    "repo": "payments",
+                    "number": 97,
+                    "title": "Harden webhook retry handling",
+                    "html_url": "https://github.com/acme/payments/pull/97",
+                    "draft": false,
+                    "updated_at": "2026-11-18T13:45:00Z",
+                    "run_ids": [],
+                    "review_readiness": {
+                        "status": "ci_running",
+                        "head_sha": "2222222222222222222222222222222222222222",
+                        "unresolved_thread_count": 0,
+                        "checked_at": "2026-11-18T14:31:00Z"
+                    }
+                },
+                {
+                    "owner": "acme",
+                    "repo": "console",
+                    "number": 314,
+                    "title": "Polish audit log filters",
+                    "html_url": "https://github.com/acme/console/pull/314",
+                    "draft": false,
+                    "updated_at": "2026-11-18T12:10:00Z",
+                    "run_ids": [],
+                    "review_readiness": {
+                        "status": "unresolved_comments",
+                        "head_sha": "3333333333333333333333333333333333333333",
+                        "unresolved_thread_count": 2,
+                        "checked_at": "2026-11-18T14:31:00Z"
+                    }
+                }
+            ],
+            "meta": {
+                "author": "demo-user",
+                "status": "complete",
+                "warning": null
+            }
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) async fn create_run_stub(
     _auth: RequiredUser,
     State(_state): State<Arc<AppState>>,

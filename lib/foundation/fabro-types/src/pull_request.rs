@@ -19,6 +19,31 @@ pub enum PullRequestCreationStatus {
     Failed,
 }
 
+/// Fresh GitHub evidence about whether a pull request is ready for a person to
+/// review. This is intentionally independent of GitHub's draft state.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReviewReadinessStatus {
+    Ready,
+    CiRunning,
+    CiFailed,
+    UnresolvedComments,
+    NoChecks,
+    Unavailable,
+}
+
+/// Review-readiness evidence collected from the pull request's current head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewReadiness {
+    pub status:                  ReviewReadinessStatus,
+    pub head_sha:                Option<String>,
+    pub unresolved_thread_count: Option<u64>,
+    pub checked_at:              DateTime<Utc>,
+}
+
 /// Latest explicit pull request creation requested for a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestCreation {

@@ -371,6 +371,8 @@ models/repo-check-response-permissions.ts
 models/repo-check-response.ts
 models/repository-ref.ts
 models/resolved-automation-git-workflow-source.ts
+models/review-readiness-status.ts
+models/review-readiness.ts
 models/review-target-kind.ts
 models/review-target.ts
 models/rewind-request.ts

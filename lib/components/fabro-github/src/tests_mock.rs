@@ -15,6 +15,9 @@ pub(crate) struct MockRoute {
     path:             String,
     status:           u16,
     response_body:    String,
+    error_message:    Option<String>,
+    max_hits:         Option<usize>,
+    hits:             AtomicUsize,
     assert_header:    Option<(String, MockHeaderCheck)>,
     assert_body_json: Option<serde_json::Value>,
 }
@@ -42,6 +45,45 @@ impl MockHttpClient {
             path: path.to_string(),
             status,
             response_body: body.to_string(),
+            error_message: None,
+            max_hits: None,
+            hits: AtomicUsize::new(0),
+            assert_header: None,
+            assert_body_json: None,
+        });
+        self
+    }
+
+    pub(crate) fn on_once(
+        mut self,
+        method: HttpMethod,
+        path: &str,
+        status: u16,
+        body: &str,
+    ) -> Self {
+        self.routes.push(MockRoute {
+            method,
+            path: path.to_string(),
+            status,
+            response_body: body.to_string(),
+            error_message: None,
+            max_hits: Some(1),
+            hits: AtomicUsize::new(0),
+            assert_header: None,
+            assert_body_json: None,
+        });
+        self
+    }
+
+    pub(crate) fn fails(mut self, method: HttpMethod, path: &str, message: &str) -> Self {
+        self.routes.push(MockRoute {
+            method,
+            path: path.to_string(),
+            status: 0,
+            response_body: String::new(),
+            error_message: Some(message.to_string()),
+            max_hits: None,
+            hits: AtomicUsize::new(0),
             assert_header: None,
             assert_body_json: None,
         });
@@ -76,6 +118,16 @@ impl HttpClient for MockHttpClient {
         self.request_count.fetch_add(1, Ordering::SeqCst);
         for route in &self.routes {
             if method == route.method && url.ends_with(&route.path) {
+                if route
+                    .max_hits
+                    .is_some_and(|max_hits| route.hits.load(Ordering::SeqCst) >= max_hits)
+                {
+                    continue;
+                }
+                route.hits.fetch_add(1, Ordering::SeqCst);
+                if let Some(message) = &route.error_message {
+                    anyhow::bail!("{message}");
+                }
                 if let Some((name, MockHeaderCheck::Equals(expected))) = &route.assert_header {
                     let (_, v) = headers
                         .iter()

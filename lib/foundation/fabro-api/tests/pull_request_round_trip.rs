@@ -4,7 +4,7 @@ use fabro_api::types::MergeRunPullRequestRequest;
 use fabro_types::settings::run::MergeStrategy;
 use fabro_types::{
     PullRequest, PullRequestCreation, PullRequestCreationId, PullRequestCreationStatus,
-    PullRequestLink, PullRequestResponse,
+    PullRequestLink, PullRequestResponse, ReviewReadiness, ReviewReadinessStatus,
 };
 use serde_json::json;
 
@@ -73,6 +73,28 @@ fn merge_request_reuses_run_merge_strategy_type() {
         .expect("merge request should deserialize");
 
     assert_same_type_as_merge_strategy(&request.method);
+}
+
+#[test]
+fn review_readiness_reuses_domain_types_and_openapi_shape() {
+    assert_eq!(
+        TypeId::of::<fabro_api::types::ReviewReadiness>(),
+        TypeId::of::<ReviewReadiness>()
+    );
+    assert_eq!(
+        TypeId::of::<fabro_api::types::ReviewReadinessStatus>(),
+        TypeId::of::<ReviewReadinessStatus>()
+    );
+
+    let fixture = json!({
+        "status": "ready",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "unresolved_thread_count": 0,
+        "checked_at": "2026-11-18T12:00:00Z"
+    });
+    let readiness: ReviewReadiness =
+        serde_json::from_value(fixture.clone()).expect("readiness should deserialize");
+    assert_eq!(serde_json::to_value(readiness).unwrap(), fixture);
 }
 
 #[test]

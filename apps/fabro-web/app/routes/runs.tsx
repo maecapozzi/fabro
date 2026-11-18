@@ -1,7 +1,14 @@
 import { useState, useCallback, useMemo, useRef } from "react";
 import { Link, Navigate, useNavigate } from "react-router";
 import { CheckIcon, ChevronDownIcon, CommandLineIcon } from "@heroicons/react/24/outline";
-import { EllipsisVerticalIcon } from "@heroicons/react/20/solid";
+import {
+  ChatBubbleLeftRightIcon,
+  CheckCircleIcon,
+  ClockIcon,
+  EllipsisVerticalIcon,
+  ExclamationCircleIcon,
+  XCircleIcon,
+} from "@heroicons/react/20/solid";
 import { Menu, MenuButton, MenuItem, MenuItems } from "@headlessui/react";
 import { useSWRConfig } from "swr";
 import {
@@ -37,6 +44,7 @@ import {
 import { RunsListView } from "../components/runs-list/runs-list-view";
 import { mutateRunListCaches } from "../lib/board-cache";
 import { shouldRefreshBoardForEvent, useBoardEvents } from "../lib/board-events";
+import { useDemoMode } from "../lib/demo-mode";
 import { useAllRuns, useAuthConfig, useInReviewPullRequests, useRunsPage, useSystemInfo } from "../lib/queries";
 import { approveRun, archiveRuns, canArchive, mapError } from "../lib/run-actions";
 import { plural } from "../lib/plural";
@@ -666,6 +674,7 @@ function InReviewCard({ pullRequest }: { pullRequest: InReviewPullRequest }) {
       >
         {pullRequest.title}
       </a>
+      <ReviewReadinessMarker pullRequest={pullRequest} />
       {pullRequest.run_ids.length > 0 ? (
         <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-line pt-3">
           <span className="mr-0.5 text-[10px] uppercase tracking-wide text-fg-muted">
@@ -686,6 +695,54 @@ function InReviewCard({ pullRequest }: { pullRequest: InReviewPullRequest }) {
   );
 }
 
+function ReviewReadinessMarker({ pullRequest }: { pullRequest: InReviewPullRequest }) {
+  const readiness = pullRequest.review_readiness;
+  const unresolved = readiness.unresolved_thread_count ?? 0;
+  const marker = {
+    ready: {
+      Icon: CheckCircleIcon,
+      copy: "Ready for your review",
+      className: "border-mint/20 bg-mint/10 text-mint",
+    },
+    ci_running: {
+      Icon: ClockIcon,
+      copy: "CI running",
+      className: "border-amber/20 bg-amber/10 text-amber",
+    },
+    ci_failed: {
+      Icon: XCircleIcon,
+      copy: "CI failed",
+      className: "border-coral/20 bg-coral/10 text-coral",
+    },
+    unresolved_comments: {
+      Icon: ChatBubbleLeftRightIcon,
+      copy: `${unresolved} unresolved ${unresolved === 1 ? "comment" : "comments"}`,
+      className: "border-amber/20 bg-amber/10 text-amber",
+    },
+    no_checks: {
+      Icon: ExclamationCircleIcon,
+      copy: "No checks reported",
+      className: "border-fg-muted/20 bg-overlay text-fg-muted",
+    },
+    unavailable: {
+      Icon: ExclamationCircleIcon,
+      copy: "Status unavailable",
+      className: "border-fg-muted/20 bg-overlay text-fg-muted",
+    },
+  }[readiness.status];
+  const Icon = marker.Icon;
+
+  return (
+    <div
+      className={`mt-3 inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium ${marker.className}`}
+      data-review-readiness={readiness.status}
+    >
+      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+      <span>{marker.copy}</span>
+    </div>
+  );
+}
+
 function InReviewColumn({
   pullRequests,
   loading,
@@ -697,6 +754,8 @@ function InReviewColumn({
   error: boolean;
   partialWarning?: string | null;
 }) {
+  const demoMode = useDemoMode();
+
   return (
     <div className="flex min-w-0 flex-col" data-testid="in-review-column">
       <div className="mb-3 flex items-center gap-3">
@@ -705,6 +764,11 @@ function InReviewColumn({
         <span className="rounded-full bg-overlay px-2 py-0.5 font-mono text-xs text-fg-muted">
           {pullRequests.length}
         </span>
+        {demoMode ? (
+          <span className="rounded-full border border-violet-400/25 px-2 py-0.5 text-[10px] uppercase tracking-wide text-violet-300">
+            Demo data
+          </span>
+        ) : null}
       </div>
       <div className="flex flex-1 flex-col gap-3">
         {partialWarning ? (

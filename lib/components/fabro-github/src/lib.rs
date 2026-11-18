@@ -16,6 +16,7 @@ use crate::token_source::SecretString;
 
 pub mod access;
 pub mod identity;
+mod review_readiness;
 pub mod token_source;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -26,6 +27,7 @@ pub(crate) mod tests_mock;
 pub use access::GitHubRepositoryAccess;
 pub use identity::GitHubAccountIdentity;
 use identity::lookup_token_identity;
+pub use review_readiness::review_readiness_for_pull_requests;
 
 pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 

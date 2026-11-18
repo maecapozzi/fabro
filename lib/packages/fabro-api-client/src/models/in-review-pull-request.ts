@@ -13,6 +13,9 @@
  */
 
 
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ReviewReadiness } from './review-readiness';
 
 /**
  * An open GitHub pull request authored by the current user.
@@ -29,4 +32,5 @@ export interface InReviewPullRequest {
      * Fabro runs linked to this pull request, with duplicates removed.
      */
     'run_ids': Array<string>;
+    'review_readiness': ReviewReadiness;
 }

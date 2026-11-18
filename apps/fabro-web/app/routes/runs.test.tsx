@@ -82,6 +82,12 @@ describe("runs route board mapping", () => {
         draft:      true,
         updated_at: "2026-04-19T12:00:00Z",
         run_ids:    ["run-1"],
+        review_readiness: {
+          status: "ready" as const,
+          head_sha: "1111111111111111111111111111111111111111",
+          unresolved_thread_count: 0,
+          checked_at: "2026-04-19T12:01:00Z",
+        },
       },
       {
         owner:      "acme",
@@ -92,6 +98,12 @@ describe("runs route board mapping", () => {
         draft:      false,
         updated_at: "2026-04-18T12:00:00Z",
         run_ids:    [],
+        review_readiness: {
+          status: "ci_failed" as const,
+          head_sha: "2222222222222222222222222222222222222222",
+          unresolved_thread_count: 0,
+          checked_at: "2026-04-19T12:01:00Z",
+        },
       },
     ];
 

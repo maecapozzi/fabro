@@ -128,7 +128,8 @@ pub use pull_request::{
     CheckRun, CheckRunStatus, PullRequest, PullRequestCreation, PullRequestCreationId,
     PullRequestCreationStatus, PullRequestDetails, PullRequestDetailsStatus,
     PullRequestDetailsUnavailableReason, PullRequestGithubDetail, PullRequestLink, PullRequestMeta,
-    PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
+    PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser, ReviewReadiness,
+    ReviewReadinessStatus,
 };
 pub use reference::ReferenceKind;
 pub use repository::{

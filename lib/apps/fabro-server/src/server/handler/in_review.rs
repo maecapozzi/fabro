@@ -61,20 +61,40 @@ async fn list_in_review_pull_requests(
         }
     };
     let run_ids = associated_run_ids(&runs);
+    let readiness =
+        match fabro_github::review_readiness_for_pull_requests(&github, search.items.clone()).await
+        {
+            Ok(readiness) => readiness,
+            Err(err) => {
+                warn!(error = %err, "Failed to load GitHub review readiness");
+                search
+                    .items
+                    .iter()
+                    .map(|_| fabro_types::ReviewReadiness {
+                        status:                  fabro_types::ReviewReadinessStatus::Unavailable,
+                        head_sha:                None,
+                        unresolved_thread_count: None,
+                        checked_at:              chrono::Utc::now(),
+                    })
+                    .collect()
+            }
+        };
     let data = search
         .items
         .into_iter()
-        .map(|item| {
+        .zip(readiness)
+        .map(|(item, review_readiness)| {
             let key = (item.owner.clone(), item.repo.clone(), item.number.get());
             InReviewPullRequest {
-                owner:      item.owner,
-                repo:       item.repo,
-                number:     item.number,
-                title:      item.title,
-                html_url:   item.html_url,
-                draft:      item.draft,
+                owner: item.owner,
+                repo: item.repo,
+                number: item.number,
+                title: item.title,
+                html_url: item.html_url,
+                draft: item.draft,
                 updated_at: item.updated_at,
-                run_ids:    run_ids.get(&key).cloned().unwrap_or_default(),
+                run_ids: run_ids.get(&key).cloned().unwrap_or_default(),
+                review_readiness,
             }
         })
         .collect();
