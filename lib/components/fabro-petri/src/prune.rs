@@ -68,10 +68,12 @@ pub async fn prune(request: PruneRequest) -> Result<PruneReport, PruneError> {
         engine::backend(&request.provider).ok_or_else(|| PruneError::UnsupportedProvider {
             provider: request.provider.clone(),
         })?;
-    let mut options = RunOptions::new(&request.run_dir);
-    options.run_key = Some(RunKey::new(request.run_id.as_str()));
-    options.retention = engine::RETENTION;
-    options.sandbox.backend = backend;
+    let options = prune_options(
+        &request.run_dir,
+        &request.run_id,
+        backend,
+        request.sandbox.docker_host_network(),
+    );
     let runtime = providers::bare_runtime(&request.sandbox)
         .store(request.store)
         .options(options);
@@ -81,4 +83,37 @@ pub async fn prune(request: PruneRequest) -> Result<PruneReport, PruneError> {
             petri_prune::PruneError::RunHeld(locator) => PruneError::RunHeld { locator },
             other => PruneError::Petri(other),
         })
+}
+
+fn prune_options(
+    run_dir: &std::path::Path,
+    run_id: &str,
+    backend: petri_runtime::SandboxBackend,
+    docker_host_network: bool,
+) -> RunOptions {
+    let mut options = RunOptions::new(run_dir);
+    options.run_key = Some(RunKey::new(run_id));
+    options.retention = engine::RETENTION;
+    options.sandbox.backend = backend;
+    options.sandbox.docker_host_network = docker_host_network;
+    options
+}
+
+#[cfg(test)]
+mod tests {
+    use petri_runtime::SandboxBackend;
+
+    use super::*;
+
+    #[test]
+    fn prune_reconstructs_the_docker_host_network_lease_identity() {
+        let options = prune_options(
+            std::path::Path::new("/tmp/fabro-petri-prune-options-test"),
+            "run-id",
+            SandboxBackend::Docker,
+            true,
+        );
+
+        assert!(options.sandbox.docker_host_network);
+    }
 }

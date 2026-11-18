@@ -241,6 +241,16 @@ impl DockerFactory {
     fn seed(&self) -> String {
         fingerprint::docker(self.host.as_deref())
     }
+
+    fn provider_network(&self) -> ProviderNetwork {
+        let host = self.host.as_deref();
+        let host_address = if self.host_network && docker_host_is_local(host) {
+            self.host_address.as_deref().or(Some("127.0.0.1"))
+        } else {
+            self.host_address.as_deref()
+        };
+        ProviderNetwork::docker(host, host_address)
+    }
 }
 
 #[async_trait]
@@ -254,11 +264,7 @@ impl ProviderFactory for DockerFactory {
     }
 
     fn network(&self) -> ProviderNetwork {
-        if self.host_network {
-            ProviderNetwork::host()
-        } else {
-            ProviderNetwork::docker(self.host.as_deref(), self.host_address.as_deref())
-        }
+        self.provider_network()
     }
 
     async fn connect(
@@ -267,6 +273,14 @@ impl ProviderFactory for DockerFactory {
     ) -> sandbox_driver::Result<Arc<dyn SandboxProvider>> {
         connect_docker()
     }
+}
+
+/// Matches Petri's Docker endpoint classification. Host networking changes
+/// the route from a local sandbox to this process, but it does not make a
+/// remote Docker daemon local or make its host filesystem mountable.
+fn docker_host_is_local(docker_host: Option<&str>) -> bool {
+    let value = docker_host.unwrap_or_default().trim();
+    value.is_empty() || value.starts_with("unix://") || value.starts_with("npipe://")
 }
 
 struct DaytonaFactory(Option<DaytonaCredentials>);
@@ -376,15 +390,83 @@ mod tests {
     }
 
     #[test]
-    fn provider_configuration_defaults_host_network_off_and_keeps_explicit_opt_in() {
+    fn provider_configuration_defaults_host_network_off() {
         let default = SandboxProviderConfig::from_lookup(None, |_| None);
         assert!(!default.docker_host_network());
+    }
 
-        let enabled = default.with_docker_host_network(true);
-        assert!(enabled.docker_host_network());
+    #[test]
+    fn bridge_docker_uses_the_gateway_and_keeps_local_workspace_mounts() {
+        let factory = DockerFactory {
+            host:         None,
+            host_address: None,
+            host_network: false,
+        };
+        assert_eq!(
+            format!("{:?}", factory.provider_network()),
+            "ProviderNetwork { host_address: Ok(Some(\"host.docker.internal\")), \
+             supports_host_workspace: true }"
+        );
+    }
+
+    #[test]
+    fn local_host_network_uses_loopback_and_keeps_local_workspace_mounts() {
+        let factory = DockerFactory {
+            host:         Some("unix:///var/run/docker.sock".to_string()),
+            host_address: None,
+            host_network: true,
+        };
+        assert_eq!(
+            format!("{:?}", factory.provider_network()),
+            "ProviderNetwork { host_address: Ok(Some(\"127.0.0.1\")), \
+             supports_host_workspace: true }"
+        );
+    }
+
+    #[test]
+    fn local_host_network_preserves_an_explicit_callback_address() {
+        let factory = DockerFactory {
+            host:         None,
+            host_address: Some("fabro.internal".to_string()),
+            host_network: true,
+        };
+        assert_eq!(
+            format!("{:?}", factory.provider_network()),
+            "ProviderNetwork { host_address: Ok(Some(\"fabro.internal\")), \
+             supports_host_workspace: true }"
+        );
+    }
+
+    #[test]
+    fn remote_host_network_keeps_the_explicit_callback_address_and_disables_mounts() {
+        let factory = DockerFactory {
+            host:         Some("tcp://docker.example:2376".to_string()),
+            host_address: Some("fabro.internal".to_string()),
+            host_network: true,
+        };
+        assert_eq!(
+            format!("{:?}", factory.provider_network()),
+            "ProviderNetwork { host_address: Ok(Some(\"fabro.internal\")), \
+             supports_host_workspace: false }"
+        );
+    }
+
+    #[test]
+    fn remote_host_network_still_requires_a_callback_address() {
+        let factory = DockerFactory {
+            host:         Some("ssh://builder@docker.example".to_string()),
+            host_address: None,
+            host_network: true,
+        };
+        let network = format!("{:?}", factory.provider_network());
+        assert!(network.contains("Err("), "{network}");
         assert!(
-            format!("{:?}", built_in_providers(&enabled)).contains("docker"),
-            "the enabled setting keeps the built-in Docker provider installed"
+            network.contains("ssh://builder@docker.example"),
+            "{network}"
+        );
+        assert!(
+            network.contains("supports_host_workspace: false"),
+            "{network}"
         );
     }
 }
