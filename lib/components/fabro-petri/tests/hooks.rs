@@ -423,12 +423,11 @@ async fn every_finish_is_committed_and_recorded() {
         .iter()
         .map(|(_, subject, _)| subject.as_str())
         .collect();
-    let run_id = harness.run_id.to_string();
     assert_eq!(subjects, vec![
-        format!("fabro({run_id}): start (success)"),
-        format!("fabro({run_id}): write (success)"),
-        format!("fabro({run_id}): check (success)"),
-        format!("fabro({run_id}): exit (success)"),
+        "Start completed (no source changes)",
+        "Update source during Write",
+        "Check completed (no source changes)",
+        "Exit completed (no source changes)",
     ]);
     assert!(
         commits.iter().all(|(_, _, key)| key.is_some()),
@@ -713,8 +712,7 @@ async fn a_failed_stage_is_committed_and_its_route_sees_the_files() {
     let workspace = harness.workspace().await;
     let path = harness.workspace_path(&workspace);
     let commits = commits(&path).await;
-    let run_id = harness.run_id.to_string();
-    assert_eq!(commits[1].1, format!("fabro({run_id}): work (failure)"));
+    assert_eq!(commits[1].1, "Work failed after changing source");
     assert_eq!(
         git(&path, &["show", &format!("{}:out.txt", commits[1].0)]).await,
         "partial",

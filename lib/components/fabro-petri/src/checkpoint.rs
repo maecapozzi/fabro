@@ -3,6 +3,17 @@
 //! No repository or Git bundle is kept on the server for a remote sandbox.
 //! Checkpoint commits stay on the run branch, which the worker pushes after
 //! each checkpoint. Forks fetch that branch from the origin.
+//!
+//! Checkpoint subjects describe the stage result in plain language. After
+//! staging, a successful source-changing stage uses the first non-empty line
+//! of its existing result summary when that line is prose. Known `summary` and
+//! `notes` fields are also read from structured routing output. Markdown
+//! heading and list prefixes are removed, control characters and whitespace
+//! are collapsed, and subjects are limited to 72 Unicode characters. The
+//! fallback is `Update source during <stage>`. Empty checkpoints and
+//! unsuccessful source-changing checkpoints always use honest stage/status
+//! wording. The body records the stage and status; run, execution, firing,
+//! attempt, and co-author identity remain in trailers.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,6 +45,9 @@ pub const FIRING_TRAILER: &str = "Fabro-Firing";
 pub const ATTEMPT_TRAILER: &str = "Fabro-Attempt";
 
 const FOOTER: &str = "\u{2692}\u{fe0f} Generated with [Fabro](https://fabro.sh)";
+
+/// Conventional Git subject width, counted as Unicode scalar values.
+const SUBJECT_MAX_CHARS: usize = 72;
 
 /// How long a fetch from the run's origin may take.
 const SOURCE_FETCH_TIMEOUT: Duration = Duration::from_mins(5);
@@ -481,6 +495,7 @@ impl RunWorkspaces {
         key: CheckpointKey,
         node: &str,
         status: &str,
+        summary: Option<&str>,
     ) -> Result<Snapshot, CheckpointError> {
         if let Site::Host(path) = site {
             if !fs::try_exists(path).await.unwrap_or(false) {
@@ -519,7 +534,11 @@ impl RunWorkspaces {
                 .map(|glob| format!(":(glob,exclude){glob}")),
         );
         self.git(site, "add", &add).await?;
-        let message = self.message(key, node, status);
+        let source_changed = !self
+            .git(site, "diff --cached", &["diff", "--cached", "--name-only"])
+            .await?
+            .is_empty();
+        let message = self.message(key, node, status, summary, source_changed);
         let user_name = format!("user.name={}", self.author.name);
         let user_email = format!("user.email={}", self.author.email);
         self.git_as_author(
@@ -728,11 +747,23 @@ impl RunWorkspaces {
         Ok(())
     }
 
-    /// The commit message: Fabro's subject, the footer, and the identity
-    /// trailers last, so `git interpret-trailers` and
+    /// The commit message: a readable subject, stage/status details, Fabro's
+    /// footer, and the identity trailers last, so `git interpret-trailers` and
     /// [`CheckpointKey::from_message`] both read them.
-    fn message(&self, key: CheckpointKey, node: &str, status: &str) -> String {
-        let subject = format!("fabro({}): {node} ({status})", self.run_id);
+    fn message(
+        &self,
+        key: CheckpointKey,
+        node: &str,
+        status: &str,
+        summary: Option<&str>,
+        source_changed: bool,
+    ) -> String {
+        let stage = readable_stage(node);
+        let subject = checkpoint_subject(&stage, status, summary, source_changed);
+        let body = format!(
+            "Fabro checkpoint\n\nStage: {stage}\nStatus: {}\n\n{FOOTER}",
+            readable_status(status)
+        );
         let execution = key.execution.to_string();
         let firing = key.firing.to_string();
         let attempt = key.attempt.to_string();
@@ -762,7 +793,7 @@ impl RunWorkspaces {
                 value: &co_author,
             });
         }
-        trailer::format_message(&subject, FOOTER, &trailers)
+        trailer::format_message(&subject, &body, &trailers)
     }
 
     /// A repository on the run branch, initialised when the workspace has
@@ -1015,6 +1046,113 @@ impl RunWorkspaces {
     }
 }
 
+fn checkpoint_subject(
+    stage: &str,
+    status: &str,
+    summary: Option<&str>,
+    source_changed: bool,
+) -> String {
+    let subject = if source_changed && status == "success" {
+        summary
+            .and_then(readable_summary)
+            .unwrap_or_else(|| format!("Update source during {stage}"))
+    } else if source_changed {
+        format!("{stage} {} after changing source", readable_status(status))
+    } else {
+        format!("{stage} {} (no source changes)", readable_status(status))
+    };
+    truncate_subject(&subject)
+}
+
+fn readable_summary(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.starts_with('{') {
+        let structured = serde_json::from_str::<serde_json::Value>(summary).ok()?;
+        return structured_summary(&structured).and_then(readable_summary);
+    }
+    let line = summary
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line = line.trim_start_matches('#').trim_start();
+    let line = line.strip_prefix("- ").unwrap_or(line).trim();
+    if line.is_empty() || line.starts_with('[') {
+        return None;
+    }
+    let sanitized = line
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn structured_summary(value: &serde_json::Value) -> Option<&str> {
+    let object = value.as_object()?;
+    ["summary", "notes"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            object
+                .get("context_updates")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|updates| {
+                    ["summary", "notes"]
+                        .into_iter()
+                        .find_map(|key| updates.get(key).and_then(serde_json::Value::as_str))
+                })
+        })
+}
+
+fn readable_stage(node: &str) -> String {
+    let words = node
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .replace(['_', '-'], " ");
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let words = if words.is_empty() {
+        "Stage".to_string()
+    } else {
+        words
+    };
+    let mut chars = words.chars();
+    let Some(first) = chars.next() else {
+        return "Stage".to_string();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
+fn readable_status(status: &str) -> &str {
+    match status {
+        "success" => "completed",
+        "partial_success" => "completed with partial results",
+        "failure" => "failed",
+        "skipped" => "was skipped",
+        "cancelled" => "was cancelled",
+        "timed_out" => "timed out",
+        _ => "finished",
+    }
+}
+
+fn truncate_subject(subject: &str) -> String {
+    if subject.chars().count() <= SUBJECT_MAX_CHARS {
+        return subject.to_string();
+    }
+    let mut truncated = subject
+        .chars()
+        .take(SUBJECT_MAX_CHARS - 1)
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 /// The summary `git diff --numstat` lines add up to: one line per file,
 /// `<additions>\t<deletions>\t<path>`, with `-` for a binary file.
 fn numstat_summary(numstat: &str) -> DiffSummary {
@@ -1093,10 +1231,70 @@ mod tests {
             firing:    4,
             attempt:   1,
         };
-        let message = workspaces(dir.path()).message(key, "build", "success");
-        assert!(message.starts_with("fabro(run-1): build (success)\n\n"));
+        // Petri stores an agent's response excerpt in `last_response` as a
+        // string, including when the response itself is routing JSON.
+        let native_change_last_response = r#"{"outcome":"succeeded","context_updates":{"summary":"\n## Add Unicode café support 🚀\n\nMore detail"}}"#;
+        let message = workspaces(dir.path()).message(
+            key,
+            "build_stage",
+            "success",
+            Some(native_change_last_response),
+            true,
+        );
+        assert!(
+            message.starts_with(
+                "Add Unicode café support 🚀\n\nFabro checkpoint\n\nStage: Build stage\nStatus: \
+                 completed\n\n"
+            ),
+            "{message:?}"
+        );
         assert_eq!(CheckpointKey::from_message(&message), Some(key));
         assert_eq!(trailer::parse(&message, RUN_TRAILER), Some("run-1"));
+        assert!(message.ends_with(
+            "Fabro-Run: run-1\nFabro-Execution: 0\nFabro-Firing: 4\nFabro-Attempt: 1\n"
+        ));
+
+        let authored = RunWorkspaces::new(
+            dir.path().to_path_buf(),
+            "run-1".to_string(),
+            GitAuthor {
+                name:  "Run Author".to_string(),
+                email: "run@example.com".to_string(),
+            },
+            &RunCheckpointSettings::default(),
+        )
+        .message(key, "build", "success", None, false);
+        let defaults = GitAuthor::default();
+        assert!(authored.ends_with(&format!(
+            "Fabro-Attempt: 1\nCo-Authored-By: {} <{}>\n",
+            defaults.name, defaults.email
+        )));
+    }
+
+    #[test]
+    fn subjects_sanitize_controls_truncate_unicode_and_fallback_conservatively() {
+        assert_eq!(
+            checkpoint_subject(
+                "Implement",
+                "success",
+                Some("  Ship\0 the café safely\t\nIgnore this line"),
+                true,
+            ),
+            "Ship the café safely"
+        );
+        assert_eq!(
+            checkpoint_subject(
+                "Implement",
+                "success",
+                Some(r#"{"outcome":"succeeded","context_updates":{"ready":true}}"#),
+                true,
+            ),
+            "Update source during Implement"
+        );
+        let long = "界".repeat(80);
+        let subject = checkpoint_subject("Implement", "success", Some(&long), true);
+        assert_eq!(subject.chars().count(), SUBJECT_MAX_CHARS);
+        assert!(subject.ends_with('…'));
     }
 
     #[tokio::test]
@@ -1186,6 +1384,7 @@ mod tests {
                 key,
                 "build",
                 "success",
+                Some("Implement\0 readable checkpoint messages"),
             )
             .await
             .expect("the commit");
@@ -1202,6 +1401,7 @@ mod tests {
                 key,
                 "build",
                 "success",
+                Some("This replacement must not rewrite the checkpoint"),
             )
             .await
             .expect("the second commit");
@@ -1210,6 +1410,18 @@ mod tests {
             reused:   true,
             branched: None,
         });
+        assert_eq!(
+            workspaces
+                .git(&workspaces.host(workspace), "show", &[
+                    "show",
+                    "-s",
+                    "--format=%s",
+                    &again.sha
+                ],)
+                .await
+                .expect("the reused subject"),
+            "Implement readable checkpoint messages"
+        );
         assert_eq!(
             workspaces
                 .commit_parent(&workspaces.host(workspace), &first.sha)
@@ -1281,6 +1493,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_use_honest_subjects_for_empty_and_failed_stages() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let workspaces = workspaces(dir.path());
+        let workspace = "invocation-0-scope-0";
+        let path = workspaces.workspace_path(workspace);
+        fs::create_dir_all(&path).await.expect("the workspace");
+        let site = workspaces.host(workspace);
+
+        let empty_key = CheckpointKey {
+            execution: 0,
+            firing:    1,
+            attempt:   1,
+        };
+        let empty = workspaces
+            .commit(
+                &site,
+                workspace,
+                empty_key,
+                "review-results",
+                "success",
+                Some("Ship an imaginary feature"),
+            )
+            .await
+            .expect("the empty commit");
+        let empty_message = workspaces
+            .git(&site, "show", &["show", "-s", "--format=%B", &empty.sha])
+            .await
+            .expect("the empty commit message");
+        assert!(
+            empty_message
+                .starts_with("Review results completed (no source changes)\n\nFabro checkpoint\n")
+        );
+        assert_eq!(CheckpointKey::from_message(&empty_message), Some(empty_key));
+
+        fs::write(path.join("partial.txt"), "partial\n")
+            .await
+            .expect("a source change");
+        let failure_key = CheckpointKey {
+            execution: 0,
+            firing:    2,
+            attempt:   1,
+        };
+        let failure = workspaces
+            .commit(
+                &site,
+                workspace,
+                failure_key,
+                "apply_fix",
+                "failure",
+                Some("Everything is complete"),
+            )
+            .await
+            .expect("the failed-stage commit");
+        let failure_message = workspaces
+            .git(&site, "show", &["show", "-s", "--format=%B", &failure.sha])
+            .await
+            .expect("the failed-stage commit message");
+        assert!(failure_message.starts_with(
+            "Apply fix failed after changing source\n\nFabro checkpoint\n\nStage: Apply fix\nStatus: \
+             failed\n"
+        ));
+        assert_eq!(
+            CheckpointKey::from_message(&failure_message),
+            Some(failure_key)
+        );
+
+        fs::write(path.join("partial.txt"), "recovered\n")
+            .await
+            .expect("another source change");
+        let malformed_key = CheckpointKey {
+            execution: 0,
+            firing:    3,
+            attempt:   1,
+        };
+        let malformed = workspaces
+            .commit(
+                &site,
+                workspace,
+                malformed_key,
+                "implement",
+                "success",
+                Some("{\"summary\":\"unterminated\0"),
+            )
+            .await
+            .expect("malformed agent output falls back without breaking Git");
+        let malformed_message = workspaces
+            .git(&site, "show", &[
+                "show",
+                "-s",
+                "--format=%B",
+                &malformed.sha,
+            ])
+            .await
+            .expect("the fallback commit message");
+        assert!(malformed_message.starts_with(
+            "Update source during Implement\n\nFabro checkpoint\n\nStage: Implement\nStatus: \
+             completed\n"
+        ));
+        assert_eq!(
+            CheckpointKey::from_message(&malformed_message),
+            Some(malformed_key)
+        );
+        assert!(
+            malformed_message.ends_with(
+                "Fabro-Run: run-1\nFabro-Execution: 0\nFabro-Firing: 3\nFabro-Attempt: 1"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn an_unusable_repository_fails_the_commit() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let workspaces = workspaces(dir.path());
@@ -1302,6 +1624,7 @@ mod tests {
                 key,
                 "build",
                 "success",
+                None,
             )
             .await
             .expect_err("the commit fails");
@@ -1362,6 +1685,7 @@ mod tests {
                 first_key,
                 "start",
                 "success",
+                None,
             )
             .await
             .expect("the first commit");
@@ -1386,6 +1710,7 @@ mod tests {
                 second_key,
                 "write",
                 "success",
+                None,
             )
             .await
             .expect("the second commit");

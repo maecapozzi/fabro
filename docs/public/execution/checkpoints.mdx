@@ -22,19 +22,52 @@ The run branch is a regular Git branch. Checkpoint events record its commit SHAs
 After each node finishes, Fabro stages file changes and creates a commit on the run branch. Files matching `[run.checkpoint] exclude_globs` patterns (configured in [run.toml](/execution/run-configuration#runcheckpoint) or [settings.toml](/administration/server-configuration#runcheckpoint-section)) are excluded from staging:
 
 ```
-fabro(01JKXYZ...): plan (succeeded)
+Add readable checkpoint messages
+
+Fabro checkpoint
+
+Stage: Implement
+Status: completed
+
+⚒️ Generated with [Fabro](https://fabro.sh)
 
 Fabro-Run: 01JKXYZ...
-Fabro-Completed: 2
+Fabro-Execution: 0
+Fabro-Firing: 2
+Fabro-Attempt: 1
 ```
 
-The commit message follows a structured format:
+For a successful checkpoint that changes source files, Fabro uses an existing
+masked stage result when it contains a useful `summary`, `notes`, or
+`last_response`. Routing JSON may provide `summary` or `notes` inside
+`context_updates`. Fabro uses the first non-empty prose line, removes a leading
+Markdown heading or list marker, collapses whitespace and control characters,
+and limits the subject to 72 Unicode characters. It does not make another model
+request to write the subject.
+
+If no usable summary is available, Fabro uses the conservative
+`Update source during Implement` form. It does not infer a feature claim from a
+successful status alone. Checkpoints with no source changes and unsuccessful
+checkpoints use explicit stage/status wording instead:
+
+```text
+Review completed (no source changes)
+Apply fix failed after changing source
+```
+
+Malformed or truncated structured output also uses the conservative fallback;
+it does not prevent the checkpoint commit. The commit body and trailers retain
+the native checkpoint identity:
 
 | Part | Description |
 |---|---|
-| Subject line | `fabro({run_id}): {node_id} ({status})` |
+| Subject line | Existing stage summary when usable, otherwise readable stage/status fallback |
+| Body | Stage name, status, and the Fabro generation footer |
 | `Fabro-Run` trailer | The run ID |
-| `Fabro-Completed` trailer | Number of completed nodes so far |
+| `Fabro-Execution` trailer | Execution containing the checkpoint |
+| `Fabro-Firing` trailer | Stage firing containing the checkpoint |
+| `Fabro-Attempt` trailer | Attempt that produced the checkpoint |
+| `Co-Authored-By` trailer | Fabro's native identity when the run uses a different author |
 
 The `git_commit_sha` in a `checkpoint.completed` event identifies the run branch commit. New commits do not include a `Fabro-Checkpoint` trailer.
 

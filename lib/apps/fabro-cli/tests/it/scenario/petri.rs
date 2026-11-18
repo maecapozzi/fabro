@@ -2027,11 +2027,18 @@ fn subjects(commits: &[(String, Option<CheckpointKey>)]) -> Vec<&str> {
 
 /// The commit subjects one run of the three-stage bundle produces; its goal
 /// gate on `three` adds the `goal_check` stage.
-fn three_stage_subjects(run_id: &str) -> Vec<String> {
-    ["start", "one", "two", "three", "goal_check", "exit"]
-        .iter()
-        .map(|node| format!("fabro({run_id}): {node} (success)"))
-        .collect()
+fn three_stage_subjects(_run_id: &str) -> Vec<String> {
+    [
+        "Start completed (no source changes)",
+        "Update source during One",
+        "Update source during Two",
+        "Update source during Three",
+        "Goal check completed (no source changes)",
+        "Exit completed (no source changes)",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// A worker killed after a stage's finish is durable: on the restart the
@@ -2214,10 +2221,10 @@ async fn a_failure_route_sees_the_same_committed_files_after_a_crash() {
 
     let (path, commits) = server.workspace_commits(&run_id);
     assert_eq!(subjects(&commits), vec![
-        format!("fabro({run_id}): start (success)"),
-        format!("fabro({run_id}): work (failure)"),
-        format!("fabro({run_id}): fix (success)"),
-        format!("fabro({run_id}): exit (success)"),
+        "Start completed (no source changes)",
+        "Work failed after changing source",
+        "Update source during Fix",
+        "Exit completed (no source changes)",
     ]);
     assert_eq!(
         std::fs::read_to_string(path.join("out.txt")).expect("out.txt"),
