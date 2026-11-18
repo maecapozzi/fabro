@@ -660,6 +660,12 @@ fn main() {
         ("RunGraphEdge", "fabro_types::RunGraphEdge", &[]),
         ("PullRequest", "fabro_types::PullRequest", &[]),
         ("PullRequestLink", "fabro_types::PullRequestLink", &[]),
+        ("ReviewReadiness", "fabro_types::ReviewReadiness", &[]),
+        (
+            "ReviewReadinessStatus",
+            "fabro_types::ReviewReadinessStatus",
+            &[],
+        ),
         (
             "PullRequestCreationId",
             "fabro_types::PullRequestCreationId",

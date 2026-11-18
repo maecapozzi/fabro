@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 import { createMemoryRouter, RouterProvider } from "react-router";
-import type { PaginatedRunList, Run } from "@qltysh/fabro-api-client";
+import type {
+  InReviewPullRequestListResponse,
+  PaginatedRunList,
+  Run,
+} from "@qltysh/fabro-api-client";
 
 import { ToastProvider } from "../components/toast";
 import { CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY } from "../components/runs-list/preferences";
@@ -85,6 +89,12 @@ const completeInReviewQuery = {
         draft:      true,
         updated_at: "2026-04-19T12:00:00Z",
         run_ids:    ["run-1"],
+        review_readiness: {
+          status: "ready" as const,
+          head_sha: "1111111111111111111111111111111111111111",
+          unresolved_thread_count: 0,
+          checked_at: "2026-04-19T12:01:00Z",
+        },
       },
     ],
     meta: { author: "octocat", status: "complete", warning: null },
@@ -93,7 +103,7 @@ const completeInReviewQuery = {
   error:     undefined,
 };
 let inReviewQuery: {
-  data?: typeof completeInReviewQuery.data;
+  data?: InReviewPullRequestListResponse;
   isLoading: boolean;
   error?: Error;
 } = completeInReviewQuery;
@@ -283,22 +293,95 @@ describe("Runs workspace preference restoration", () => {
     expect(rendered).toContain("In review");
     expect(rendered).toContain("Show authored pull requests on Runs");
     expect(rendered).toContain("Draft");
+    expect(rendered).toContain("Ready for your review");
     expect(rendered).toContain("Open qlty/fabro pull request 42 on GitHub");
     expect(rendered).toContain("run-1".slice(-6));
   });
 
-  test("an In review failure leaves run columns usable and shows a scoped error", async () => {
+  test("In review cards render accessible readiness blocker copy", async () => {
+    const base = completeInReviewQuery.data.data[0];
     inReviewQuery = {
-      data:      undefined,
+      data: {
+        data: [
+          {
+            ...base,
+            number: 43,
+            review_readiness: {
+              ...base.review_readiness,
+              status: "ci_running",
+            },
+          },
+          {
+            ...base,
+            number: 44,
+            review_readiness: {
+              ...base.review_readiness,
+              status: "ci_failed",
+            },
+          },
+          {
+            ...base,
+            number: 45,
+            review_readiness: {
+              ...base.review_readiness,
+              status: "unresolved_comments",
+              unresolved_thread_count: 2,
+            },
+          },
+          {
+            ...base,
+            number: 46,
+            review_readiness: {
+              ...base.review_readiness,
+              status: "no_checks",
+            },
+          },
+          {
+            ...base,
+            number: 47,
+            review_readiness: {
+              status: "unavailable",
+              head_sha: null,
+              unresolved_thread_count: null,
+              checked_at: "2026-04-19T12:01:00Z",
+            },
+          },
+        ],
+        meta: completeInReviewQuery.data.meta,
+      },
       isLoading: false,
-      error:     new Error("GitHub unavailable"),
+      error: undefined,
     };
 
     const { renderer } = await renderRuns("/runs?view=columns");
     await flushEffects();
 
     const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("CI running");
+    expect(rendered).toContain("CI failed");
+    expect(rendered).toContain("2 unresolved comments");
+    expect(rendered).toContain("No checks reported");
+    expect(rendered).toContain("Status unavailable");
+  });
+
+  test("a failed refresh suppresses a previously ready marker and leaves run columns usable", async () => {
+    const { renderer, router } = await renderRuns("/runs?view=columns");
+    await flushEffects();
+    expect(JSON.stringify(renderer.toJSON())).toContain("Ready for your review");
+
+    inReviewQuery = {
+      data:      completeInReviewQuery.data,
+      isLoading: false,
+      error:     new Error("GitHub unavailable"),
+    };
+    await act(async () => {
+      await router.navigate("/runs?view=columns&query=refresh");
+    });
+    await flushEffects();
+
+    const rendered = JSON.stringify(renderer.toJSON());
     expect(rendered).toContain("Open pull requests are unavailable");
+    expect(rendered).not.toContain("Ready for your review");
     expect(rendered).toContain("Run run-1");
     expect(rendered).toContain("Succeeded");
   });

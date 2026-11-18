@@ -11705,6 +11705,33 @@ async fn demo_list_runs_returns_run_list_items() {
 }
 
 #[tokio::test]
+async fn demo_in_review_returns_ready_and_blocked_pull_requests() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri(api("/runs/in-review"))
+        .header("X-Fabro-Demo", "1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let data = body["data"].as_array().expect("data should be array");
+
+    assert!(
+        data.iter()
+            .any(|pull_request| pull_request["review_readiness"]["status"] == "ready")
+    );
+    assert!(data.iter().any(|pull_request| {
+        pull_request["review_readiness"]["status"] == "unresolved_comments"
+    }));
+    assert!(
+        data.iter()
+            .any(|pull_request| pull_request["draft"] == true)
+    );
+}
+
+#[tokio::test]
 async fn demo_get_run_returns_run_summary_shape() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(state);
