@@ -93,11 +93,15 @@ fn message(body: &str) -> String {
     )
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This standalone preview writes its output synchronously, outside a Tokio runtime."
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let output = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/slack-child-dm-preview.html"));
+    let output = std::env::args_os().nth(1).map_or_else(
+        || PathBuf::from("target/slack-child-dm-preview.html"),
+        PathBuf::from,
+    );
 
     let approval = blocks::launch_approval_message(
         "01JSYNTHETICCHILD",
@@ -222,6 +226,5 @@ h2 {{ margin: 0 0 18px; font-size: 19px; }} h3 {{ margin: 22px 0 10px; font-size
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&output, html)?;
-    println!("{}", output.display());
     Ok(())
 }
