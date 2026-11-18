@@ -94,8 +94,8 @@ GIT_COMMITTER_EMAIL = "stage-committer@example.invalid"
     let verify = format!(
         "set -eu; {check_env}; git log --format=%s | grep -Fx command-commit; \
          git log --format=%s | grep -Fx agent-commit; \
-         git log --format=%s | grep -F 'fabro('; \
-         test \"$(git log --format='%an|%ae|%cn|%ce' --extended-regexp --grep='^(fabro\\(|command-commit$|agent-commit$)' | sort -u)\" = {expected}; \
+         test \"$(git log --format='%an|%ae|%cn|%ce%x09%s' | awk -F '\\t' '$2 == \"command-commit\" || $2 == \"agent-commit\" {{ print $1 }}' | sort -u)\" = {expected}; \
+         test \"$(git log --format='%an|%ae|%cn|%ce%x09%(trailers:key=Fabro-Run,valueonly)' | awk -F '\\t' '$2 != \"\" {{ print $1 }}' | sort -u)\" = {expected}; \
          test \"$(git -C extra log -1 --format='%an|%ae|%cn|%ce')\" = {expected}; \
          ! git config --get user.name; ! git config --get user.email; \
          ! git -C extra config --get user.name; ! git -C extra config --get user.email"
