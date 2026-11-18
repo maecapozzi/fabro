@@ -88,6 +88,18 @@ fn normalize_attach_json_progress_event(mut event: Value) -> Value {
     event
 }
 
+/// Scheduler admission notices are administrative records whose position
+/// relative to a pending question depends on the worker/server mirror. The
+/// raw stream assertion still checks that attach delivered them exactly.
+fn is_scheduler_admission_notice(event: &Value) -> bool {
+    let record = &event["item"]["record"];
+    record["kind"] == "run.notice"
+        && matches!(
+            record["code"].as_str(),
+            Some("scheduler.admission_released" | "scheduler.readmission_requested")
+        )
+}
+
 /// Replace, at every depth, the wall-clock epoch milliseconds a stream
 /// item carries, the content digests of the graph, which hashes the
 /// fixture's temporary path, and the commit shas of the fixture's repository.
@@ -1023,6 +1035,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
     // actual interleaving, cursors, and absence of skipped or duplicate items.
     let mut progress: Vec<Value> = progress
         .into_iter()
+        .filter(|event| !is_scheduler_admission_notice(event))
         .map(normalize_attach_json_progress_event)
         .collect();
     progress.sort_by_key(|item| item["kind"] != "platform");

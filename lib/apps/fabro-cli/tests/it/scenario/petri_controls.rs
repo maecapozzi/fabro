@@ -228,13 +228,20 @@ fn interrupt_refused_by_cli(
     );
 }
 
-/// The stream's `run.notice` records, as `(code, message)`, in order.
-fn notices(items: &[Value]) -> Vec<(String, String)> {
+/// The stream's semantic control notices, excluding scheduler-admission
+/// bookkeeping whose interleaving with a human wait is asynchronous.
+fn control_notices(items: &[Value]) -> Vec<(String, String)> {
     items
         .iter()
         .filter(|item| item["kind"] == "platform")
         .map(|item| &item["item"]["record"])
         .filter(|record| record["kind"] == "run.notice")
+        .filter(|record| {
+            !matches!(
+                record["code"].as_str(),
+                Some("scheduler.admission_released" | "scheduler.readmission_requested")
+            )
+        })
         .map(|record| {
             (
                 record["code"].as_str().unwrap_or_default().to_string(),
@@ -545,7 +552,7 @@ async fn a_steer_reaches_the_agent_stage_on_the_twin() {
     );
     assert_petri_succeeded(&server, &run_id).await;
     assert_eq!(
-        notices(&items),
+        control_notices(&items),
         [(
             "no_such_stage".to_string(),
             "Steer of stage `nope` refused: no stage named `nope` is running".to_string()
@@ -826,7 +833,7 @@ async fn an_interrupt_ends_the_turn_and_its_text_is_the_next_input() {
     );
     assert!(!gate.exists(), "nothing opened the gate");
     assert_petri_succeeded(&server, &run_id).await;
-    assert_eq!(notices(&items), Vec::new(), "nothing was refused");
+    assert_eq!(control_notices(&items), Vec::new(), "nothing was refused");
 
     let delivery = items
         .iter()
@@ -925,7 +932,7 @@ async fn an_interrupt_of_a_gate_stage_is_refused_with_no_live_turn() {
     interrupt_refused_by_cli(&context, &server, &run_id, "gate", GATE_INTERRUPT_REFUSAL);
     let names = wait_for_stream_count(&server, &run_id, "run.notice", 3).await;
     assert_eq!(count_of(&names, "control.requested"), 0, "{names:?}");
-    let refused = notices(&run_stream(&server, &run_id).await);
+    let refused = control_notices(&run_stream(&server, &run_id).await);
     // The notice names the stage and carries Petri's reason as it spells
     // it, so the web and the CLI can show both.
     assert_eq!(refused, [
@@ -1001,7 +1008,7 @@ async fn a_control_the_worker_never_answers_is_pending() {
         "the endpoint waited its bound for the answer: {:?}",
         asked.elapsed()
     );
-    let refused = notices(&run_stream(&server, &run_id).await);
+    let refused = control_notices(&run_stream(&server, &run_id).await);
     assert_eq!(refused, [(
         "no_live_turn".to_string(),
         GATE_INTERRUPT_REFUSAL.to_string()

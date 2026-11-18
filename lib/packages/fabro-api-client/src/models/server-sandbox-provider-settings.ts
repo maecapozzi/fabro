@@ -19,5 +19,9 @@ import type { SandboxPluginSettings } from './sandbox-plugin-settings';
 
 export interface ServerSandboxProviderSettings {
     'enabled': boolean;
+    /**
+     * Whether Docker sandboxes use the Docker daemon host\'s network namespace. Always false for non-Docker providers.
+     */
+    'host_network': boolean;
     'plugin'?: SandboxPluginSettings;
 }

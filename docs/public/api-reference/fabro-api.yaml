@@ -15732,10 +15732,15 @@ components:
 
     ServerSandboxProviderSettings:
       type: object
-      required: [enabled]
+      required: [enabled, host_network]
       properties:
         enabled:
           type: boolean
+        host_network:
+          type: boolean
+          description: |
+            Whether Docker sandboxes use the Docker daemon host's network
+            namespace. Always false for non-Docker providers.
         plugin:
           $ref: "#/components/schemas/SandboxPluginSettings"
 

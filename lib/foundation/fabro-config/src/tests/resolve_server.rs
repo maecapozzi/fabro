@@ -68,6 +68,7 @@ fn resolves_server_defaults_from_empty_settings() {
     assert_eq!(settings.web.url, "http://localhost:3000");
     assert_eq!(settings.scheduler.max_concurrent_runs, 5);
     assert_eq!(settings.logging.destination, LogDestination::File);
+    assert!(!settings.sandbox.providers.docker_host_network());
 
     match settings.listen {
         ServerListenSettings::Unix { path } => {
@@ -89,6 +90,49 @@ fn resolves_server_defaults_from_empty_settings() {
         ObjectStoreSettings::S3 { .. } => panic!("expected local artifact store by default"),
     }
     assert_eq!(settings.artifacts.prefix, "");
+}
+
+#[test]
+fn resolves_docker_host_network_when_explicitly_enabled() {
+    let settings = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.docker]
+host_network = true
+"#,
+    )
+    .expect("Docker host networking should resolve");
+
+    assert!(settings.server.sandbox.providers.docker_host_network());
+}
+
+#[test]
+fn server_sandbox_rejects_host_network_for_non_docker_providers() {
+    for provider in ["local", "daytona", "e2b"] {
+        let source = format!(
+            r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.{provider}]
+host_network = true
+"#
+        );
+        let error = ServerSettingsBuilder::from_toml(&source)
+            .expect_err("host networking should be Docker-only");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("server.sandbox.providers.{provider}.host_network")),
+            "unexpected error for {provider}: {error}"
+        );
+    }
 }
 
 #[test]

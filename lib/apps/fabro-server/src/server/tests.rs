@@ -2293,6 +2293,41 @@ fn worker_command_sets_worker_args() {
 
 #[cfg(unix)]
 #[test]
+fn worker_command_propagates_explicit_docker_host_network_setting() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let state = worker_command_test_state_with_extra_config(
+        storage_dir.path(),
+        &["dev-token"],
+        Some(TEST_DEV_TOKEN),
+        r"
+[server.sandbox.providers.docker]
+host_network = true
+",
+    );
+
+    let cmd = worker_command(
+        state.as_ref(),
+        RunId::new(),
+        RunExecutionMode::Start,
+        storage_dir.path(),
+        false,
+    )
+    .unwrap();
+    let args = cmd
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+
+    assert!(args.iter().any(|arg| arg == "--docker-host-network"));
+    assert!(
+        state.sandbox_provider_config(None).docker_host_network(),
+        "the in-process runtime receives the same resolved setting"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn worker_command_default_token_omits_agent_run_tools_scope() {
     let storage_dir = tempfile::tempdir().unwrap();
     let state = worker_command_test_state(storage_dir.path(), &["dev-token"], Some(TEST_DEV_TOKEN));

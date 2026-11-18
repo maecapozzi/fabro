@@ -51,6 +51,7 @@ enabled = true
 
 [server.sandbox.providers.docker]
 enabled = true
+host_network = false
 
 [server.sandbox.providers.daytona]
 enabled = true
@@ -181,6 +182,7 @@ enabled = true
 
 [server.sandbox.providers.docker]
 enabled = true
+host_network = false
 
 [server.sandbox.providers.daytona]
 enabled = true
@@ -190,6 +192,19 @@ The built-in `local`, `docker`, and `daytona` providers run in process. `local` 
 Host provider. Built-in entries reject `path`, `sha256`, `dev`, `args`, `env`, and `inherit_env`;
 no plugin executable or checksum is needed. The legacy built-in
 `PETRI_SANDBOX_{HOST,DOCKER,DAYTONA}_{PLUGIN,SHA256}` variables are ignored.
+
+`server.sandbox.providers.docker.host_network` is an explicit, default-off Docker-only setting.
+When it is `true`, Docker environments with `network.mode = "allow_all"` use the Docker daemon
+host's network namespace instead of a bridge. This is useful for Linux deployments such as
+Cloudflare containers that run Fabro and Docker-in-Docker in one shared network namespace, where
+native agent callbacks must reach the Fabro worker over loopback.
+
+Host networking removes Docker's per-container network isolation. Sandboxes share the daemon
+host's interfaces and port space, so concurrent workloads can collide on ports. Fabro rejects
+host networking combined with `block`, `cidr_allow_list`, or sidecar services rather than
+weakening those requests. The setting is rejected under `local`, `daytona`, and plugin provider
+entries. It does not change the portable environment network modes or persisted environment
+schema.
 
 Any other key names a [sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) plugin:
 an executable that speaks the sandbox-driver JSON-RPC protocol on stdin and stdout. The kind must
@@ -216,6 +231,7 @@ E2B_API_URL = "https://api.e2b.example"
 | Key | Description | Default |
 |---|---|---|
 | `enabled` | Whether runs may select this provider | `true` |
+| `host_network` | Use the daemon host's network namespace (built-in Docker only) | `false` |
 | `path` | Plugin executable path | `sandbox-driver-<kind>` on `PATH` |
 | `sha256` | Pinned SHA-256 of the executable, hex | none |
 | `dev` | Allow launching without a checksum | `false` |

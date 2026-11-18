@@ -98,6 +98,7 @@ impl std::fmt::Debug for DaytonaCredentials {
 pub struct SandboxProviderConfig {
     docker_host:         Option<String>,
     docker_host_address: Option<String>,
+    docker_host_network: bool,
     daytona:             Option<DaytonaCredentials>,
 }
 
@@ -122,8 +123,23 @@ impl SandboxProviderConfig {
             docker_host,
             docker_host_address: lookup(EnvVars::PETRI_SANDBOX_DOCKER_HOST_ADDRESS)
                 .filter(|value| !value.trim().is_empty()),
+            docker_host_network: false,
             daytona,
         }
+    }
+
+    /// Use the Docker daemon host's network namespace for Docker sandboxes.
+    #[must_use]
+    pub fn with_docker_host_network(mut self, enabled: bool) -> Self {
+        self.docker_host_network = enabled;
+        self
+    }
+
+    /// Whether Docker sandboxes use the Docker daemon host's network
+    /// namespace.
+    #[must_use]
+    pub fn docker_host_network(&self) -> bool {
+        self.docker_host_network
     }
 }
 
@@ -178,6 +194,7 @@ fn built_in_providers(config: &SandboxProviderConfig) -> InProcessProviders {
         .with(Arc::new(DockerFactory {
             host:         config.docker_host.clone(),
             host_address: config.docker_host_address.clone(),
+            host_network: config.docker_host_network,
         }))
         .with(Arc::new(DaytonaFactory(config.daytona.clone())))
 }
@@ -217,6 +234,7 @@ impl ProviderFactory for HostFactory {
 struct DockerFactory {
     host:         Option<String>,
     host_address: Option<String>,
+    host_network: bool,
 }
 
 impl DockerFactory {
@@ -236,7 +254,11 @@ impl ProviderFactory for DockerFactory {
     }
 
     fn network(&self) -> ProviderNetwork {
-        ProviderNetwork::docker(self.host.as_deref(), self.host_address.as_deref())
+        if self.host_network {
+            ProviderNetwork::host()
+        } else {
+            ProviderNetwork::docker(self.host.as_deref(), self.host_address.as_deref())
+        }
     }
 
     async fn connect(
@@ -304,6 +326,7 @@ mod tests {
             let factory = DockerFactory {
                 host:         host.map(str::to_owned),
                 host_address: None,
+                host_network: false,
             };
             assert_eq!(factory.seed(), expected);
         }
@@ -350,5 +373,18 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains(key));
         assert!(rendered.contains("org-1"));
+    }
+
+    #[test]
+    fn provider_configuration_defaults_host_network_off_and_keeps_explicit_opt_in() {
+        let default = SandboxProviderConfig::from_lookup(None, |_| None);
+        assert!(!default.docker_host_network());
+
+        let enabled = default.with_docker_host_network(true);
+        assert!(enabled.docker_host_network());
+        assert!(
+            format!("{:?}", built_in_providers(&enabled)).contains("docker"),
+            "the enabled setting keeps the built-in Docker provider installed"
+        );
     }
 }

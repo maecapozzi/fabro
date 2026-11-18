@@ -880,8 +880,9 @@ mod tests {
         providers
             .entries
             .insert(kind(name), ServerSandboxProviderSettings {
-                enabled: true,
-                plugin:  Some(SandboxPluginSettings {
+                enabled:      true,
+                host_network: false,
+                plugin:       Some(SandboxPluginSettings {
                     path: Some(format!("/nonexistent/sandbox-driver-{name}")),
                     dev: true,
                     ..SandboxPluginSettings::default()
@@ -1056,8 +1057,9 @@ mod tests {
         providers
             .entries
             .insert(SandboxProviderKind::DOCKER, ServerSandboxProviderSettings {
-                enabled: false,
-                plugin:  None,
+                enabled:      false,
+                host_network: false,
+                plugin:       None,
             });
         let access = ProviderAccess {
             providers,

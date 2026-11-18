@@ -1120,6 +1120,10 @@ pub(crate) struct RunWorkerArgs {
     /// understands the worker-control protocol.
     #[arg(long, hide = true)]
     pub(crate) scheduler_admission: bool,
+
+    /// Use the Docker daemon host's network namespace for Docker sandboxes.
+    #[arg(long, hide = true)]
+    pub(crate) docker_host_network: bool,
 }
 
 #[derive(Args, Debug, Clone, Default)]

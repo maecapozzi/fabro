@@ -130,6 +130,8 @@ pub(super) struct PetriWorker<'a> {
     /// Enabled only when the spawning server advertised support on the
     /// hidden worker command line.
     pub(super) scheduler_admission: bool,
+    /// Whether the spawning server resolved Docker host networking on.
+    pub(super) docker_host_network: bool,
     pub(super) worker_token:        &'a str,
 }
 
@@ -214,6 +216,7 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
         worker
             .scheduler_admission
             .then(|| controls.scheduler_admission()),
+        worker.docker_host_network,
     )
     .await?;
     let client = worker.client.clone_for_reuse();
@@ -772,6 +775,7 @@ async fn runtime_spec(
     fabro_home: Option<PathBuf>,
     run_tools: Option<FabroRunToolServices>,
     scheduler_admission: Option<SchedulerAdmission>,
+    docker_host_network: bool,
 ) -> Result<RuntimeSpec> {
     let credentials: Arc<dyn CredentialProvider> =
         Arc::new(VaultCredentialSource::new(Arc::clone(vault)));
@@ -794,7 +798,8 @@ async fn runtime_spec(
     });
     Ok(RuntimeSpec {
         stage_credentials: None,
-        sandbox: SandboxProviderConfig::from_lookup(daytona, crate::process_env_var),
+        sandbox: SandboxProviderConfig::from_lookup(daytona, crate::process_env_var)
+            .with_docker_host_network(docker_host_network),
         settings_toml: None,
         mcp_catalog_toml: None,
         model_client,

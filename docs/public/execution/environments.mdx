@@ -225,6 +225,14 @@ Install seeds a `default` environment into SQLite. It is a normal persisted envi
 | `env` | Process environment overlay | Container environment | Sandbox environment |
 | `cwd` | Does not override the managed run workspace | Warning; ignored | Warning; ignored |
 
+The Docker `allow_all` mapping remains the default bridge unless the server operator explicitly
+sets `server.sandbox.providers.docker.host_network = true`. With that server-owned option,
+`allow_all` uses the Docker daemon host's network namespace. The option is intended for trusted
+Linux deployments such as Docker-in-Docker where Fabro and the daemon share a host network. It
+also means Docker sandboxes share the host's interfaces and port space, so concurrent runs can
+have port collisions. Blocked and CIDR-restricted modes, and environments with sidecars, are
+incompatible and fail instead of falling back to less restrictive networking.
+
 ## Local
 
 `local` runs tools on the Fabro host, in a workspace under the run's directory. It offers no filesystem or network isolation, so use it only for trusted workflows.

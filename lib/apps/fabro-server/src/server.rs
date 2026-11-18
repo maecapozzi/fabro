@@ -2061,6 +2061,13 @@ impl AppState {
             daytona_api_key.map(|key| self.daytona_credentials(key)),
             |name| self.config_env_lookup(name),
         )
+        .with_docker_host_network(
+            self.server_settings()
+                .server
+                .sandbox
+                .providers
+                .docker_host_network(),
+        )
     }
 
     /// [`Self::sandbox_provider_config`] for a server-side prune of
@@ -4490,6 +4497,12 @@ fn worker_launch_spec(
         fabro_log,
         active_config_path: state.active_config_path().to_path_buf(),
         github_app_private_key,
+        docker_host_network: state
+            .server_settings()
+            .server
+            .sandbox
+            .providers
+            .docker_host_network(),
         fabro_home: fabro_config::Home::from_env().root().to_path_buf(),
     })
 }

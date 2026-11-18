@@ -66,6 +66,7 @@ pub(crate) async fn execute(
     mode: RunWorkerMode,
     fabro_home: Option<PathBuf>,
     scheduler_admission: bool,
+    docker_host_network: bool,
     worker_token: &str,
 ) -> Result<()> {
     let _ = fabro_proc::title_init();
@@ -98,6 +99,7 @@ pub(crate) async fn execute(
         mode,
         fabro_home,
         scheduler_admission,
+        docker_host_network,
         worker_token,
     }))
     .await

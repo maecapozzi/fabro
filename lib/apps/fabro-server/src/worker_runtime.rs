@@ -49,6 +49,8 @@ pub(crate) struct WorkerLaunchSpec {
     pub(crate) fabro_log:              Option<String>,
     pub(crate) active_config_path:     PathBuf,
     pub(crate) github_app_private_key: Option<String>,
+    /// Whether the spawning server resolved Docker host networking on.
+    pub(crate) docker_host_network:    bool,
     /// The Fabro home the server resolved, so a Petri run's skills step
     /// reads the same home whatever the worker's environment says.
     pub(crate) fabro_home:             PathBuf,
@@ -124,6 +126,9 @@ impl LocalWorkerRuntime {
             cmd.env(EnvVars::FABRO_LOG, level);
         }
         cmd.env(EnvVars::FABRO_LOG_DESTINATION, log_destination_env);
+        if spec.docker_host_network {
+            cmd.arg("--docker-host-network");
+        }
         cmd.env(EnvVars::FABRO_CONFIG, &spec.active_config_path);
         cmd.env_remove(EnvVars::FABRO_WORKER_TOKEN);
         cmd.env(EnvVars::FABRO_WORKER_TOKEN, &spec.worker_token);

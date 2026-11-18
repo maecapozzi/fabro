@@ -119,8 +119,9 @@ mod tests {
         providers
             .entries
             .insert(kind.clone(), ServerSandboxProviderSettings {
-                enabled: true,
-                plugin:  Some(SandboxPluginSettings {
+                enabled:      true,
+                host_network: false,
+                plugin:       Some(SandboxPluginSettings {
                     path: Some(format!("/nonexistent/sandbox-driver-{name}")),
                     dev: true,
                     ..SandboxPluginSettings::default()

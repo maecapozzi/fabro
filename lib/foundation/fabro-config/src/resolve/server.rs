@@ -79,20 +79,33 @@ fn resolve_sandbox(
         let layer = configured.and_then(|entries| entries.get(&kind));
         let path = format!("server.sandbox.providers.{kind}");
         if let Some(layer) = layer {
-            reject_plugin_fields_for_bundled(layer, &path, errors);
+            reject_provider_specific_fields(layer, &kind, &path, errors);
         }
+        let host_network = (kind == SandboxProviderKind::DOCKER)
+            && layer
+                .and_then(|provider| provider.host_network)
+                .unwrap_or(false);
         entries.insert(kind, ServerSandboxProviderSettings {
             enabled: layer.and_then(|provider| provider.enabled).unwrap_or(true),
-            plugin:  None,
+            host_network,
+            plugin: None,
         });
     }
     for (kind, layer) in configured.into_iter().flatten() {
         if kind.bundled().is_some() {
             continue;
         }
+        if layer.host_network.is_some() {
+            errors.push(ResolveError::Invalid {
+                path:   format!("server.sandbox.providers.{kind}.host_network"),
+                reason: "host_network is supported only by the bundled Docker sandbox provider"
+                    .to_string(),
+            });
+        }
         entries.insert(kind.clone(), ServerSandboxProviderSettings {
-            enabled: layer.enabled.unwrap_or(true),
-            plugin:  Some(SandboxPluginSettings {
+            enabled:      layer.enabled.unwrap_or(true),
+            host_network: false,
+            plugin:       Some(SandboxPluginSettings {
                 path:        layer.path.clone(),
                 sha256:      layer.sha256.clone(),
                 dev:         layer.dev.unwrap_or(false),
@@ -114,6 +127,7 @@ fn reject_plugin_fields_for_bundled(
 ) {
     let ServerSandboxProviderLayer {
         enabled: _,
+        host_network: _,
         path: plugin_path,
         sha256,
         dev,
@@ -137,6 +151,22 @@ fn reject_plugin_fields_for_bundled(
                     .to_string(),
             });
         }
+    }
+}
+
+fn reject_provider_specific_fields(
+    layer: &ServerSandboxProviderLayer,
+    kind: &SandboxProviderKind,
+    path: &str,
+    errors: &mut Vec<ResolveError>,
+) {
+    reject_plugin_fields_for_bundled(layer, path, errors);
+    if kind != &SandboxProviderKind::DOCKER && layer.host_network.is_some() {
+        errors.push(ResolveError::Invalid {
+            path:   format!("{path}.host_network"),
+            reason: "host_network is supported only by the bundled Docker sandbox provider"
+                .to_string(),
+        });
     }
 }
 

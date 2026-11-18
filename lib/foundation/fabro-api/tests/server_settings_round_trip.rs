@@ -52,6 +52,9 @@ allowed_usernames = ["alice"]
 [server.sandbox.providers.daytona]
 enabled = false
 
+[server.sandbox.providers.docker]
+host_network = true
+
 [server.storage]
 root = "/srv/fabro"
 
@@ -82,6 +85,10 @@ strategy = "tailscale_funnel"
     );
     assert_eq!(
         json["server"]["sandbox"]["providers"]["docker"]["enabled"],
+        true
+    );
+    assert_eq!(
+        json["server"]["sandbox"]["providers"]["docker"]["host_network"],
         true
     );
     assert_eq!(

@@ -103,6 +103,95 @@ async fn docker_block_prevents_canary_access_while_allow_all_preserves_it() {
     }
 }
 
+#[fabro_macros::e2e_test()]
+async fn docker_host_network_uses_host_mode_and_rejects_blocked_networking() {
+    let root = tempfile::tempdir().unwrap();
+    let run_id = RunId::new().to_string();
+    let store = Arc::new(MemoryRunStore::new());
+    let runtime = RuntimeSpec {
+        sandbox: SandboxProviderConfig::default().with_docker_host_network(true),
+        ..Default::default()
+    };
+    let request = probe_request(
+        &run_id,
+        root.path(),
+        &store,
+        runtime.clone(),
+        SandboxProviderKind::DOCKER,
+        EnvironmentNetworkMode::AllowAll,
+        "true",
+        "true",
+    );
+    let outcome = engine::run(request).await.unwrap();
+    let containers = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=petri.run={run_id}"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    let ids = String::from_utf8(containers.stdout).unwrap();
+    let inspected = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            ids.trim(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    let cleanup = prune::prune(PruneRequest {
+        sandbox: runtime.sandbox.clone(),
+        run_id,
+        run_dir: root.path().to_path_buf(),
+        store,
+        provider: SandboxProviderKind::DOCKER,
+    })
+    .await
+    .unwrap();
+    assert!(cleanup.is_clean());
+    assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+    assert!(inspected.status.success(), "{inspected:?}");
+    assert_eq!(String::from_utf8(inspected.stdout).unwrap().trim(), "host");
+
+    for mode in [
+        EnvironmentNetworkMode::Block,
+        EnvironmentNetworkMode::CidrAllowList,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let run_id = RunId::new().to_string();
+        let store = Arc::new(MemoryRunStore::new());
+        let request = probe_request(
+            &run_id,
+            root.path(),
+            &store,
+            runtime.clone(),
+            SandboxProviderKind::DOCKER,
+            mode,
+            "true",
+            "true",
+        );
+        let error = engine::run(request)
+            .await
+            .expect_err("host networking must not weaken a restricted policy");
+        assert!(error.to_string().contains("host networking"), "{error}");
+        let cleanup = prune::prune(PruneRequest {
+            sandbox: runtime.sandbox.clone(),
+            run_id,
+            run_dir: root.path().to_path_buf(),
+            store,
+            provider: SandboxProviderKind::DOCKER,
+        })
+        .await
+        .unwrap();
+        assert!(cleanup.is_clean());
+    }
+}
+
 /// Runs only when explicitly requested with live credentials. It reuses the
 /// runner snapshot and deletes both task-owned sandboxes through Petri.
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("FABRO_TEST_DAYTONA_RUNNER_SNAPSHOT"))]

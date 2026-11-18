@@ -108,6 +108,7 @@ pub(crate) async fn dispatch(
             mode,
             fabro_home,
             scheduler_admission,
+            docker_host_network,
         }) => {
             let worker_token = worker_token
                 .filter(|token| !token.trim().is_empty())
@@ -124,6 +125,7 @@ pub(crate) async fn dispatch(
                     mode,
                     fabro_home,
                     scheduler_admission,
+                    docker_host_network,
                     &worker_token,
                 )
                 .instrument(run_span),

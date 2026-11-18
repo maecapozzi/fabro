@@ -139,6 +139,14 @@ impl ServerSandboxProvidersSettings {
         self.get(provider).is_some_and(|entry| entry.enabled)
     }
 
+    /// Whether Docker sandboxes use the Docker daemon host's network
+    /// namespace. The resolver rejects this setting for every other kind.
+    #[must_use]
+    pub fn docker_host_network(&self) -> bool {
+        self.get(&SandboxProviderKind::DOCKER)
+            .is_some_and(|entry| entry.host_network)
+    }
+
     /// Kinds the server may launch, in key order.
     pub fn enabled_kinds(&self) -> impl Iterator<Item = &SandboxProviderKind> {
         self.entries
@@ -163,10 +171,14 @@ impl ServerSandboxProvidersSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSandboxProviderSettings {
-    pub enabled: bool,
+    pub enabled:      bool,
+    /// Use the Docker daemon host's network namespace. Always false for
+    /// non-Docker providers.
+    #[serde(default)]
+    pub host_network: bool,
     /// Launch settings for a plugin provider. Absent for bundled kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin:  Option<SandboxPluginSettings>,
+    pub plugin:       Option<SandboxPluginSettings>,
 }
 
 impl Default for ServerSandboxProviderSettings {
@@ -175,8 +187,9 @@ impl Default for ServerSandboxProviderSettings {
     // identically.
     fn default() -> Self {
         Self {
-            enabled: true,
-            plugin:  None,
+            enabled:      true,
+            host_network: false,
+            plugin:       None,
         }
     }
 }

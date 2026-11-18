@@ -127,20 +127,24 @@ impl Combine for ServerSandboxProvidersLayer {
 #[serde(deny_unknown_fields)]
 pub struct ServerSandboxProviderLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled:     Option<bool>,
+    pub enabled:      Option<bool>,
+    /// Use the Docker daemon host's network namespace. Rejected for every
+    /// provider except the bundled Docker provider at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_network: Option<bool>,
     /// Plugin executable path. Rejected for bundled kinds at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path:        Option<String>,
+    pub path:         Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256:      Option<String>,
+    pub sha256:       Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dev:         Option<bool>,
+    pub dev:          Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args:        Option<Vec<String>>,
+    pub args:         Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env:         Option<BTreeMap<String, String>>,
+    pub env:          Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherit_env: Option<Vec<String>>,
+    pub inherit_env:  Option<Vec<String>>,
 }
 
 /// `[server.storage]` — single managed local disk root.
