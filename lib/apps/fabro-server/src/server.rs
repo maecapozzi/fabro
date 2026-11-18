@@ -629,8 +629,12 @@ struct SlackLifecyclePullRequest {
 /// the update that closes it.
 #[derive(Debug, Clone)]
 struct SlackPostedQuestion {
-    message: SlackPostedMessage,
-    text:    String,
+    message:     SlackPostedMessage,
+    text:        String,
+    task:        String,
+    repository:  Option<String>,
+    run_web_url: Option<String>,
+    child_run:   bool,
 }
 
 #[derive(Debug, Clone)]
@@ -881,14 +885,17 @@ impl SlackService {
             Some(RunTarget::Git(target)) => Some(target.repo.clone()),
             Some(RunTarget::None {} | RunTarget::Folder { .. }) | None => None,
         };
+        let child_action_url = verified_child_action_url(state, run_id, &question).await;
         let message = slack_blocks::question_message(
             &run_id.to_string(),
             question_id,
             &question,
             run_web_url,
             slack_blocks::QuestionIdentity {
-                task:       Some(&task),
-                repository: repository.as_deref(),
+                task:             Some(&task),
+                repository:       repository.as_deref(),
+                child_run:        projection.parent_id.is_some(),
+                child_action_url: child_action_url.as_deref(),
             },
         );
         if let Ok(posted) = self
@@ -910,7 +917,11 @@ impl SlackService {
                 .expect("slack posted messages lock poisoned")
                 .insert(key, SlackPostedQuestion {
                     message: posted,
-                    text:    pending.question.text.clone(),
+                    text: pending.question.text.clone(),
+                    task,
+                    repository,
+                    run_web_url: run_web_url.map(ToOwned::to_owned),
+                    child_run: projection.parent_id.is_some(),
                 });
         }
     }
@@ -1086,14 +1097,24 @@ impl SlackService {
         };
 
         self.thread_registry.remove(&posted.message.ts);
-        let blocks = slack_blocks::answered_blocks(question_text, answer_text);
+        let message = slack_blocks::answered_message(
+            question_text,
+            answer_text,
+            slack_blocks::QuestionIdentity {
+                task:             Some(&posted.task),
+                repository:       posted.repository.as_deref(),
+                child_run:        posted.child_run,
+                child_action_url: None,
+            },
+            posted.run_web_url.as_deref(),
+        );
         let _ = self
             .client
             .update_message(
                 &posted.message.channel_id,
                 &posted.message.ts,
-                "Interview answered",
-                &blocks,
+                &message.fallback_text,
+                &message.blocks,
             )
             .await;
     }
@@ -1410,6 +1431,40 @@ impl SlackService {
             .await;
         }
     }
+}
+
+async fn verified_child_action_url(
+    state: &AppState,
+    parent_run_id: RunId,
+    question: &Question,
+) -> Option<String> {
+    if !slack_blocks::is_child_navigation_question(question) {
+        return None;
+    }
+    let context =
+        serde_json::from_str::<serde_json::Value>(question.context_display.as_deref()?.trim())
+            .ok()?;
+    let child_run_id = context
+        .get("child_run_id")
+        .or_else(|| {
+            context
+                .get("context_updates")
+                .and_then(|updates| updates.get("child_run_id"))
+        })
+        .and_then(serde_json::Value::as_str)?
+        .parse::<RunId>()
+        .ok()?;
+    let child = run_records::projection(state, child_run_id)
+        .await
+        .ok()
+        .flatten()?;
+    if child.parent_id != Some(parent_run_id) {
+        return None;
+    }
+    child
+        .web_url
+        .clone()
+        .or_else(|| state.run_web_url(&child_run_id))
 }
 
 fn slack_lifecycle_details(record: &RunLifecycleRecord) -> Option<SlackLifecycleDetails> {
