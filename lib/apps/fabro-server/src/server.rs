@@ -120,7 +120,9 @@ use tokio::process::Command;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast, mpsc, oneshot};
-use tokio::task::{self, spawn_blocking};
+#[cfg(any(test, feature = "test-support"))]
+use tokio::task;
+use tokio::task::spawn_blocking;
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
@@ -1712,6 +1714,7 @@ impl AppState {
     /// A response is published before its in-flight entry is removed, so
     /// tests that need a subsequent request to rematerialize must wait for
     /// this condition rather than sleeping for an assumed cleanup duration.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn test_wait_for_run_files_quiescence(&self) {
         timeout(Duration::from_secs(1), async {
             loop {

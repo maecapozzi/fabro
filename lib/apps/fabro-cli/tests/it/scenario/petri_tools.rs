@@ -220,6 +220,47 @@ async fn wait_for_children(server: &RunningServer, parent_id: &str) -> Vec<Value
     }
 }
 
+/// Wait for admission to publish the child's approval boundary.
+///
+/// The children list can expose the newly created run before its lifecycle
+/// projection includes the admission status.
+async fn wait_for_approval_required(server: &RunningServer, run_id: &str) -> Value {
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    loop {
+        let run = run_json(server, &format!("runs/{run_id}")).await;
+        let status = &run["lifecycle"]["status"];
+        if status["reason"] == "approval_required" {
+            return run;
+        }
+
+        match status["kind"].as_str() {
+            None | Some("submitted") => {}
+            Some("pending") => {
+                panic!(
+                    "child run {run_id} reached pending without the approval boundary: \
+                     {status}\nserver stderr:\n{}",
+                    server.stderr_text()
+                );
+            }
+            Some(kind) => {
+                panic!(
+                    "child run {run_id} advanced to {kind} before approval: \
+                     {status}\nserver stderr:\n{}",
+                    server.stderr_text()
+                );
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "child run {run_id} did not reach the approval boundary; last status: \
+             {status}\nserver stderr:\n{}",
+            server.stderr_text()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// The agent calls `fabro_run_create` from inside the Petri run: the child
 /// run is created under the Petri run as its parent and runs to its end,
 /// the model reads the tool's answer, the run succeeds, and the call is in
@@ -364,8 +405,9 @@ async fn an_agent_gathering_its_child_makes_progress_with_one_scheduler_slot() {
         .as_str()
         .expect("the child run has an id")
         .to_string();
+    let child = wait_for_approval_required(&server, &child_id).await;
     assert_eq!(
-        children[0]["lifecycle"]["status"]["reason"], "approval_required",
+        child["lifecycle"]["status"]["reason"], "approval_required",
         "the scheduler fix must preserve the child's approval boundary"
     );
     approve_run(&server, &child_id).await;
