@@ -105,7 +105,7 @@ fn scripted_events_model(run_id: RunId) -> (lithos_llm::Client, Arc<ScriptedProv
                 "run_id": run_id,
                 "direction": "asc",
                 "first": 200,
-                "max_content_length": 262144,
+                "max_content_length": 262_144,
                 "output_path": ".fabro-observe/events-001.json",
             }),
         )),
@@ -493,7 +493,7 @@ async fn a_petri_stage_saves_native_run_events_in_its_sandbox() {
             "run_id": run_id,
             "direction": "asc",
             "first": 200,
-            "max_content_length": 262144
+            "max_content_length": 262_144
         })
     );
     assert_eq!(saved["response"]["run_id"], run_id.to_string());
