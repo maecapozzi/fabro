@@ -39,6 +39,7 @@ const MCP_RUN_TOOL_NAMES: &[&str] = &[
     "fabro_run_pair",
     "fabro_run_search",
     "fabro_workflow_version_create",
+    "fabro_workflow_version_lookup",
 ];
 
 async fn assert_mcp_run_tool_count(client: &McpClient) {

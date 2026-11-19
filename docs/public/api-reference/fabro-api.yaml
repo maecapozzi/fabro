@@ -1120,7 +1120,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "422":
-          description: A stored dependency is absent, invalid, or non-canonical
+          description: >-
+            The requested root is invalid or non-canonical
+            (`workflow_version_invalid`), or a stored dependency is absent,
+            invalid, or non-canonical
+            (`workflow_version_dependency_not_found`)
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"

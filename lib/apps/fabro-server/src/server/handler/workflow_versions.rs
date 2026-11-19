@@ -113,6 +113,14 @@ fn json_rejection(rejection: JsonRejection) -> ApiError {
 
 fn store_error(err: WorkflowVersionStoreError) -> ApiError {
     match err {
+        WorkflowVersionStoreError::InvalidVersion(_)
+        | WorkflowVersionStoreError::InvalidShape(_)
+        | WorkflowVersionStoreError::Decode { .. }
+        | WorkflowVersionStoreError::NonCanonical { .. } => ApiError::with_code(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stored workflow version is invalid or non-canonical",
+            INVALID_VERSION_CODE,
+        ),
         // The top-level message names the offending dependency without its
         // internal source chain, so it is safe to surface to the caller.
         err @ (WorkflowVersionStoreError::DependencyNotFound { .. }
@@ -273,6 +281,97 @@ mod tests {
         let missing = WorkflowVersionId::from(BlobHash::new(b"missing workflow closure"));
         let miss = app.oneshot(lookup_request(&missing)).await.unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_invalid_and_noncanonical_roots_without_internal_details() {
+        let state = TestAppStateBuilder::new().build();
+        let app = test_support::build_test_router(Arc::clone(&state));
+        let invalid = state
+            .store_ref()
+            .blobs()
+            .write(b"not a workflow version")
+            .await
+            .unwrap();
+        let noncanonical = state
+            .store_ref()
+            .blobs()
+            .write(&serde_json::to_vec_pretty(&version(GRAPH)).unwrap())
+            .await
+            .unwrap();
+
+        for root_id in [invalid, noncanonical].map(WorkflowVersionId::from) {
+            let response = app.clone().oneshot(lookup_request(&root_id)).await.unwrap();
+            let body = fabro_test::expect_axum_json(
+                response,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "GET /api/v1/workflow-versions with invalid stored root",
+            )
+            .await;
+
+            assert_eq!(error_code(&body), INVALID_VERSION_CODE);
+            assert_eq!(
+                body["errors"][0]["detail"],
+                "stored workflow version is invalid or non-canonical"
+            );
+            assert!(!body.to_string().contains("cannot be decoded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_invalid_and_noncanonical_dependencies_without_internal_details() {
+        let state = TestAppStateBuilder::new().build();
+        let app = test_support::build_test_router(Arc::clone(&state));
+        let invalid = state
+            .store_ref()
+            .blobs()
+            .write(b"not a workflow version")
+            .await
+            .unwrap();
+        let noncanonical = state
+            .store_ref()
+            .blobs()
+            .write(&serde_json::to_vec_pretty(&version(GRAPH)).unwrap())
+            .await
+            .unwrap();
+
+        for dependency_id in [invalid, noncanonical].map(WorkflowVersionId::from) {
+            let root = serde_json::from_value::<WorkflowVersion>(json!({
+                "entrypoint": "workflow.fabro",
+                "files": {
+                    "workflow.fabro":
+                        "digraph W { child [stack.child_workflow=\"child.fabro\"] }"
+                },
+                "workflow_dependencies": { "child.fabro": dependency_id }
+            }))
+            .unwrap();
+            let root_id = WorkflowVersionId::from(
+                state
+                    .store_ref()
+                    .blobs()
+                    .write(&root.canonical_bytes().unwrap())
+                    .await
+                    .unwrap(),
+            );
+
+            let response = app.clone().oneshot(lookup_request(&root_id)).await.unwrap();
+            let body = fabro_test::expect_axum_json(
+                response,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "GET /api/v1/workflow-versions with invalid stored dependency",
+            )
+            .await;
+
+            assert_eq!(error_code(&body), DEPENDENCY_NOT_FOUND_CODE);
+            assert!(
+                body["errors"][0]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("child.fabro")
+            );
+            assert!(!body.to_string().contains("cannot be decoded"));
+            assert!(!body.to_string().contains("not canonical"));
+        }
     }
 
     #[tokio::test]
