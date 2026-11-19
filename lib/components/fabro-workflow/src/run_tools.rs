@@ -2029,7 +2029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_version_native_dispatch_registers_and_returns_version() {
+    async fn workflow_version_native_dispatch_registers_looks_up_and_returns_version() {
         let server = httpmock::MockServer::start_async().await;
         let version = WorkflowVersion::new(
             "workflow".parse().unwrap(),
@@ -2047,6 +2047,15 @@ mod tests {
                     .json_body(json!({"workflow_version_id": id}));
             })
             .await;
+        let lookup = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/api/v1/workflow-versions")
+                    .query_param("workflow_version_id", id.to_string());
+                then.status(200)
+                    .json_body(json!({"workflow_version_id": id}));
+            })
+            .await;
         let client = fabro_client::Client::new_no_proxy(&server.url("")).unwrap();
         let services = FabroRunToolServices {
             backend:        Arc::new(
@@ -2055,10 +2064,14 @@ mod tests {
             ),
             current_run_id: "01KRBZW4DW0000000000000002".parse().unwrap(),
         };
-        let name = fabro_tool::FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME;
-        assert_eq!(register_named_fabro_run_tools(&services, &[name]).len(), 1);
+        let create_name = fabro_tool::FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME;
+        let lookup_name = fabro_tool::FABRO_WORKFLOW_VERSION_LOOKUP_TOOL_NAME;
+        assert_eq!(
+            register_named_fabro_run_tools(&services, &[create_name, lookup_name]).len(),
+            2
+        );
         let output = execute_fabro_run_tool_with_environment(
-            name,
+            create_name,
             json!({"entrypoint":"workflow", "files":{"workflow":"digraph W {}"}}),
             &services,
             None,
@@ -2071,8 +2084,22 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body).unwrap(),
             json!({"workflow_version_id": id})
         );
+        let output = execute_fabro_run_tool_with_environment(
+            lookup_name,
+            json!({"workflow_version_id": id}),
+            &services,
+            None,
+        )
+        .await
+        .unwrap();
+        let (summary, body) = output.split_once('\n').unwrap();
+        assert_eq!(summary, format!("Workflow version {id} is available"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({"workflow_version_id": id, "available": true})
+        );
         let error = execute_fabro_run_tool_with_environment(
-            name,
+            create_name,
             json!({"entrypoint":"missing", "files":{"workflow":"digraph W {}"}}),
             &services,
             None,
@@ -2081,5 +2108,6 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("not present"));
         upload.assert_calls_async(1).await;
+        lookup.assert_calls_async(1).await;
     }
 }
