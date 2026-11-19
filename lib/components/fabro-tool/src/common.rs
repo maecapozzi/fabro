@@ -198,7 +198,7 @@ static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         ),
         tool_definition::<crate::FabroRunGatherParams>(
             FABRO_RUN_GATHER_TOOL_NAME,
-            "Wait for Fabro runs to reach terminal states, returning current state on timeout.",
+            "Wait for Fabro runs to reach terminal states. Returns promptly when a child needs operator approval or has a pending human question; otherwise returns terminal state or current state on timeout. It never approves or answers a child.",
         ),
         tool_definition::<crate::FabroRunPairParams>(
             FABRO_RUN_PAIR_TOOL_NAME,
