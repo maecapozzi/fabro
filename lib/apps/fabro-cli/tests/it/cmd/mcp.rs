@@ -1394,6 +1394,7 @@ async fn mcp_lifecycle_tools_manage_real_run() {
             "goal": "Run tests and report results"
           }
         ],
+        "attention_required": [],
         "timed_out": false,
         "elapsed_seconds": "[ELAPSED]"
       },
