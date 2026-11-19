@@ -5,6 +5,7 @@ mod slow_stream;
 mod support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fabro_petri::check::Launch;
@@ -12,7 +13,11 @@ use fabro_petri::engine::{self, Execution, RunRequest, RunStatus};
 use fabro_petri::runtime::RuntimeSpec;
 use pebble_coding_agent::test_support::{self, ScriptedCompletion, ScriptedProvider};
 use petri_execution::events::{self, ViewEvent};
-use petri_execution::{CancelReason, InterviewReply, InterviewRequest, Interviewer, host, inspect};
+use petri_execution::{
+    CancelReason, CoordinatorEvent, CoordinatorRecord, CoordinatorState, ExecutionId,
+    ExecutionObserver, InterviewReply, InterviewRequest, Interviewer, host, inspect,
+};
+use petri_runtime::engine::{EngineState, Event, EventRecord};
 use petri_runtime::steps::Answer;
 use petri_store::{Access, MemoryRunStore, OwnerId, RunKey, RunStore};
 use support::{SETTINGS, Silent, admit, no_questions, run_request, wait_until};
@@ -77,7 +82,7 @@ fn request_with_max_active_duration(
                     .map(Duration::from_secs)
                     .expect("the test uses whole-second durations"),
             ),
-            None => Some(Duration::from_secs(90 * 60)),
+            None => Some(Duration::from_mins(90)),
         },
         "the native policy preserves an override or supplies the public active-runtime default"
     );
@@ -375,10 +380,12 @@ struct HeldQuestion {
 
 #[async_trait::async_trait]
 impl Interviewer for HeldQuestion {
-    async fn reply(&self, _: InterviewRequest, _: CancellationToken) -> InterviewReply {
+    async fn reply(&self, _: InterviewRequest, cancel: CancellationToken) -> InterviewReply {
         self.asked.notify_one();
-        self.answer.notified().await;
-        InterviewReply::Answered(Answer::choice("Y"))
+        tokio::select! {
+            () = self.answer.notified() => InterviewReply::Answered(Answer::choice("Y")),
+            () = cancel.cancelled() => InterviewReply::Cancelled,
+        }
     }
 }
 
@@ -416,6 +423,113 @@ async fn pending_question_parks_the_clock_and_answer_gets_a_full_budget() {
 }
 
 #[tokio::test]
+async fn pending_question_parks_the_maximum_active_duration() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let mut request = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        r#"
+        gate [shape=hexagon, label="Go?", question_type="yes_no"]
+        work [shape=parallelogram, script="sleep 3", timeout="10s"]
+        start -> gate; gate -> work [label="[Y] Yes"]; work -> exit
+    "#,
+        "0s",
+        Some("1s"),
+        RuntimeSpec::default(),
+    );
+    let asked = Arc::new(Notify::new());
+    let answer = Arc::new(Notify::new());
+    request.interviewer = Arc::new(HeldQuestion {
+        asked:  asked.clone(),
+        answer: answer.clone(),
+    });
+    let task = tokio::spawn(engine::run(request));
+    asked.notified().await;
+    time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !task.is_finished(),
+        "a human wait must not consume active runtime"
+    );
+    answer.notify_one();
+    time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !task.is_finished(),
+        "answering gives the active work its remaining budget"
+    );
+    assert_eq!(task.await.unwrap().unwrap().status, RunStatus::Cancelled);
+    assert_maximum_active_duration(&store).await;
+    assert_no_tasks().await;
+}
+
+#[tokio::test]
+async fn explicit_pause_parks_the_maximum_active_duration() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let request = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        QUIET,
+        "0s",
+        Some("1s"),
+        RuntimeSpec::default(),
+    );
+    let controls = request.controls.clone();
+    controls.pause();
+    let task = tokio::spawn(engine::run(request));
+    time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !task.is_finished(),
+        "an explicit pause must not consume active runtime"
+    );
+    controls.unpause().await;
+    time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !task.is_finished(),
+        "unpause gives active work its remaining budget"
+    );
+    assert_eq!(task.await.unwrap().unwrap().status, RunStatus::Cancelled);
+    assert_maximum_active_duration(&store).await;
+    assert_no_tasks().await;
+}
+
+#[tokio::test]
+async fn a_human_wait_does_not_exempt_an_active_parallel_sibling() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let mut request = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        r#"
+        fan [shape=component]
+        gate [shape=hexagon, label="Go?", question_type="yes_no"]
+        active [shape=parallelogram, script="while true; do echo tick; sleep 0.2; done", timeout="10s"]
+        join [shape=tripleoctagon]
+        start -> fan; fan -> gate; fan -> active
+        gate -> join [label="[Y] Yes"]; active -> join; join -> exit
+    "#,
+        "1s",
+        Some("1s"),
+        RuntimeSpec::default(),
+    );
+    let asked = Arc::new(Notify::new());
+    request.interviewer = Arc::new(HeldQuestion {
+        asked:  asked.clone(),
+        answer: Arc::new(Notify::new()),
+    });
+    let task = tokio::spawn(engine::run(request));
+    asked.notified().await;
+    let outcome = time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the active sibling remains bounded")
+        .expect("the run task joins")
+        .expect("the adapter returns an outcome");
+    assert_eq!(outcome.status, RunStatus::Cancelled);
+    assert_maximum_active_duration(&store).await;
+    assert_no_tasks().await;
+}
+
+#[tokio::test]
 async fn streaming_model_activity_in_child_branches_refreshes_the_budget() {
     case(r#"
         fan [shape=component]
@@ -424,6 +538,102 @@ async fn streaming_model_activity_in_child_branches_refreshes_the_budget() {
         join [shape=tripleoctagon]
         start -> fan; fan -> a; fan -> b; a -> join; b -> join; join -> exit
     "#, "1s", RuntimeSpec { model_client: Some(slow_stream::client()), ..RuntimeSpec::default() }, RunStatus::Success).await;
+}
+
+#[tokio::test]
+async fn restart_preserves_accumulated_active_runtime() {
+    let root = tempfile::tempdir().expect("a temporary run directory");
+    let store = Arc::new(MemoryRunStore::new());
+    let first = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        ACTIVE,
+        "0s",
+        Some("2s"),
+        RuntimeSpec::default(),
+    );
+    let task = tokio::spawn(engine::run(first));
+    time::sleep(Duration::from_millis(1300)).await;
+    assert!(
+        !task.is_finished(),
+        "the first lifetime should still be active"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_no_tasks().await;
+
+    let mut next = request_with_max_active_duration(
+        root.path(),
+        store.clone(),
+        ACTIVE,
+        "0s",
+        Some("0s"),
+        RuntimeSpec::default(),
+    );
+    let Execution::Start(graphs) = next.execution else {
+        unreachable!()
+    };
+    next.execution = Execution::Resume(graphs);
+    let resumed_at = Instant::now();
+    let outcome = time::timeout(Duration::from_secs(4), engine::run(next))
+        .await
+        .expect("resume and timeout cleanup are bounded")
+        .expect("the adapter returns an outcome");
+    assert_eq!(outcome.status, RunStatus::Cancelled);
+    assert!(
+        resumed_at.elapsed() < Duration::from_millis(1900),
+        "resume reset accumulated active runtime: {:?}",
+        resumed_at.elapsed()
+    );
+    assert!(
+        matches!(
+            stall_reason(&store).await,
+            Some(CancelReason::MaximumActiveDuration {
+                maximum_active_duration_ms: 2000,
+                active_duration_ms,
+            }) if active_duration_ms >= 2000
+        ),
+        "the stored policy and accounting should survive restart"
+    );
+    assert_no_tasks().await;
+}
+
+#[derive(Clone, Default, Debug)]
+struct ResumeProbe {
+    coordinator_resumed: Arc<AtomicUsize>,
+    execution_resumed:   Arc<AtomicUsize>,
+    resumed_live:        Arc<AtomicUsize>,
+    resumed_started:     Arc<AtomicUsize>,
+    step_started:        Arc<AtomicUsize>,
+    run_unpaused:        Arc<AtomicUsize>,
+}
+
+impl ExecutionObserver for ResumeProbe {
+    fn on_engine_record(&self, _: ExecutionId, record: &EventRecord, _: u64, _: &EngineState) {
+        if matches!(record.event, Event::StepStarted { .. }) {
+            self.step_started.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn on_lifecycle(&self, record: &CoordinatorRecord) {
+        if matches!(record.body, CoordinatorEvent::RunUnpaused) {
+            self.run_unpaused.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn on_resumed(&self, _: &CoordinatorState) {
+        self.coordinator_resumed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_execution_resumed(&self, _: ExecutionId, state: &EngineState) {
+        self.execution_resumed.fetch_add(1, Ordering::SeqCst);
+        self.resumed_live
+            .fetch_add(state.live_firings().count(), Ordering::SeqCst);
+        self.resumed_started.fetch_add(
+            state.live_firings().filter(|firing| firing.started).count(),
+            Ordering::SeqCst,
+        );
+    }
 }
 
 #[tokio::test]
@@ -470,7 +680,9 @@ async fn a_dropped_paused_execution_stops_its_monitor_and_resumes_parked() {
     };
     next.execution = Execution::Resume(graphs);
     let controls = next.controls.clone();
-    let task = tokio::spawn(engine::run(next));
+    let probe = ResumeProbe::default();
+    next.observers.push(Arc::new(probe.clone()));
+    let mut task = tokio::spawn(engine::run(next));
     wait_until("restored pause", || controls.is_paused()).await;
     time::sleep(Duration::from_millis(1500)).await;
     assert!(
@@ -480,7 +692,26 @@ async fn a_dropped_paused_execution_stops_its_monitor_and_resumes_parked() {
     controls.unpause().await;
     time::sleep(Duration::from_millis(600)).await;
     assert!(!task.is_finished(), "resumed unpause gets a full budget");
-    assert_eq!(task.await.unwrap().unwrap().status, RunStatus::Cancelled);
+    let joined = time::timeout(Duration::from_secs(5), &mut task).await;
+    let outcome = if let Ok(joined) = joined {
+        joined.unwrap().unwrap()
+    } else {
+        task.abort();
+        let _ = task.await;
+        let logs = store
+            .open(&RunKey::new("stall"), Access::Read)
+            .await
+            .expect("the timed-out run opens");
+        let state = host::stored_state(&*logs)
+            .await
+            .expect("the timed-out state replays");
+        panic!(
+            "resumed watchdog stayed parked after actual dispatch: probe={probe:?}, \
+             paused={}, timeout={:?}",
+            state.paused, state.timeout
+        );
+    };
+    assert_eq!(outcome.status, RunStatus::Cancelled);
     assert_stalled(&store).await;
     assert_no_tasks().await;
 }

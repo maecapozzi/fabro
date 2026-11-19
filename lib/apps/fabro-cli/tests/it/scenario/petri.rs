@@ -643,6 +643,141 @@ pub(super) fn count_of(names: &[String], expected: &str) -> usize {
     names.iter().filter(|name| *name == expected).count()
 }
 
+/// A maximum-active timeout goes through the real worker cancellation path:
+/// the quiet command is stopped, the scheduler admits the queued run, and
+/// evidence committed before the timeout stays readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn maximum_active_timeout_releases_one_scheduler_slot_and_retains_evidence() {
+    let context = test_context!();
+    let server =
+        RunningServer::start_with("\n[server.scheduler]\nmax_concurrent_runs = 1\n", &[]).await;
+    let first_started = context.temp_dir.join("timeout-first-started");
+    let leaked_completion = context.temp_dir.join("timeout-command-completed");
+    let second_finished = context.temp_dir.join("timeout-second-finished");
+    let first = format!(
+        r#"digraph Timeout {{
+    graph [goal="Keep timeout evidence", stall_timeout="30s", max_active_duration="2s", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    save [shape=parallelogram, script="mkdir -p assets; printf saved > assets/report.txt; echo checkpoint-output"]
+    quiet [shape=parallelogram, script="touch {first_started}; echo quiet-started; sleep 30; touch {leaked_completion}", timeout="40s"]
+    start -> save -> quiet -> exit
+}}"#,
+        first_started = first_started.display(),
+        leaked_completion = leaked_completion.display(),
+    );
+    let workspace = write_petri_workflow(&context, &first);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(workspace.join("workflow.toml"))
+        .expect("the workflow settings open")
+        .write_all(b"\n[run.artifacts]\ninclude = [\"assets/**\"]\n")
+        .expect("the artifact settings append");
+    let first_run = run_detached(&context, &server, &workspace);
+    wait_for_path(
+        &first_started,
+        "the first run should occupy the scheduler slot",
+    )
+    .await;
+    let timeout_started = Instant::now();
+
+    let second = format!(
+        r#"digraph AfterTimeout {{
+    graph [goal="Use the released slot", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    work [shape=parallelogram, script="touch {second_finished}"]
+    start -> work -> exit
+}}"#,
+        second_finished = second_finished.display(),
+    );
+    std::fs::write(workspace.join("workflow.fabro"), second)
+        .expect("the queued workflow replaces the source fixture");
+    std::fs::write(
+        workspace.join("workflow.toml"),
+        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\ngoal = \"Use the \
+         released slot\"\n",
+    )
+    .expect("the queued workflow settings replace the fixture");
+    let second_run = run_detached(&context, &server, &workspace);
+
+    assert_eq!(
+        wait_for_status(&server, &first_run, &["failed", "succeeded"]).await,
+        "failed",
+        "the timed-out run must not succeed"
+    );
+    assert!(
+        timeout_started.elapsed() < Duration::from_secs(15),
+        "native cancellation and cleanup exceeded their bound: {:?}",
+        timeout_started.elapsed()
+    );
+    assert_eq!(
+        wait_for_status(&server, &second_run, &["failed", "succeeded"]).await,
+        "succeeded",
+        "the queued run did not acquire the released scheduler slot; server stderr:\n{}",
+        server.stderr_text()
+    );
+    assert!(
+        second_finished.exists(),
+        "the queued command should execute"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !leaked_completion.exists(),
+        "the cancelled command must not survive terminal cleanup"
+    );
+
+    let stream = settled_stream(&server, &first_run).await;
+    let timeout = stream
+        .iter()
+        .find(|item| item["item"]["derived"]["event"] == "run.maximum_active_duration_exceeded")
+        .expect("the stream reports the distinct active-runtime timeout");
+    assert_eq!(
+        timeout["item"]["derived"]["maximum_active_duration_ms"], 2000,
+        "{timeout:#}"
+    );
+    assert!(
+        timeout["item"]["derived"]["active_duration_ms"]
+            .as_u64()
+            .is_some_and(|elapsed| elapsed >= 2000),
+        "{timeout:#}"
+    );
+    assert!(
+        serde_json::to_string(&stream)
+            .expect("the stream serializes")
+            .contains("quiet-started"),
+        "command log output before cancellation remains readable"
+    );
+    assert!(
+        server.checkpoints(&first_run).await.len() >= 2,
+        "start and the completed save stage should remain checkpointed"
+    );
+
+    let target = server.target();
+    let output = context
+        .command()
+        .args([
+            "artifact", "list", &first_run, "--json", "--server", &target,
+        ])
+        .output()
+        .expect("artifact list executes");
+    assert!(
+        output.status.success(),
+        "saved artifacts should remain readable\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifacts: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("artifact list is JSON");
+    assert!(
+        artifacts
+            .iter()
+            .any(|artifact| artifact["relative_path"] == "assets/report.txt"),
+        "{artifacts:#?}"
+    );
+    server.shutdown();
+}
+
 /// The run's whole stream once it is settled: Fabro's terminal lifecycle
 /// record lands a moment after the engine's finish (the worker exits, the
 /// server records the status, the projector folds it), so a reader that
