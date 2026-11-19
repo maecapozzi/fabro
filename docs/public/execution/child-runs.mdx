@@ -33,6 +33,7 @@ This exposes the same Fabro run tools available through [MCP](/agents/mcp):
 | Tool | Purpose |
 |---|---|
 | `fabro_workflow_version_create` | Register supplied workflow files and return an immutable version ID |
+| `fabro_workflow_version_lookup` | Verify a prepared immutable version and its complete dependency closure |
 | `fabro_run_create` | Create one or more child runs, starting them by default |
 | `fabro_run_search` | Search runs, including direct children by `parent_id` |
 | `fabro_run_get` | Inspect a run without mutating it |
@@ -78,12 +79,38 @@ A version can be reused for several children, each with its own goal, target, an
 the agent's read tool and pass literal `goal` text. Workflow names, paths, inline
 source objects, and `goal_file` are no longer run-create inputs.
 
+For a prepared-version cache, verify the cached ID with
+`fabro_workflow_version_lookup` before using it. A hit validates the immutable
+root and its complete dependency closure on the current server; a miss returns
+`available: false` and must fall back to normal package registration. Keep cache
+keys bound to the exact package closure and all variant selectors, including the
+selected workflow revision, route, environment, and repository where relevant.
+
 This flow works in Local, Docker, and Daytona environments. The agent can clone a
 remote workflow in its sandbox and submit the resulting contents. Fabro's native
 tool handler executes outside the sandbox, so registration treats file-map keys
 as virtual relative paths and never reads sandbox paths from the worker host.
 Include the workflow's referenced configuration, prompts, and child workflows in
 the supplied tree. See [MCP](/agents/mcp) for package limits.
+
+To observe a long-running child without returning to the model at ordinary
+timer intervals, call `fabro_run_gather` with:
+
+```json
+{
+  "run_ids": ["<child-run-id>"],
+  "wait_until_terminal_or_attention": true
+}
+```
+
+This mode keeps the native gather active through running and other ordinary
+nonterminal states. It returns when every selected run is terminal or any run
+needs operator approval or an answer to a human question. It does not approve
+or answer the child. Do not also set `timeout_seconds`; omitting the opt-in
+preserves the bounded gather contract (300-second default, 600-second maximum).
+The parent releases scheduler admission while gathering and requests
+readmission before the result reaches its agent. Tool cancellation and the
+parent stage's execution budget still stop the wait.
 
 Workflow content and workspace target are independent. If `target` is omitted,
 a native child inherits the parent's canonical target: `none` or folder as-is,

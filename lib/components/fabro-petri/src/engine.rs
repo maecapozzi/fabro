@@ -64,6 +64,7 @@ use fabro_types::settings::size::Size;
 use fabro_types::{FailureReason, RunId, SandboxProviderKind};
 use fabro_util::sync;
 use lithos_llm::types::Error as LlmError;
+use petri_attractor_steps::stage::RunInfo;
 use petri_execution::host::{self, HostError, HostRun};
 use petri_execution::inspect::{self, InspectError, RunInspection};
 use petri_execution::watchdog::{StallWatchdog, WatchdogTask};
@@ -288,6 +289,11 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     let mut runtime = request
         .runtime
         .runtime(true)
+        // Hooks and native stages use the same identity as the durable run
+        // key, independent of the storage directory's layout.
+        .capability(RunInfo {
+            run_id: request.run_id.clone(),
+        })
         .store(Arc::clone(&request.store))
         .options(options);
     if let Some(secrets) = request.secrets {

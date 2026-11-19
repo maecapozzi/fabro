@@ -34,3 +34,4 @@ fabro-types = { path = "../../foundation/fabro-types", features = ["test-support
 httpmock = "0.8"
 jsonschema.workspace = true
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

@@ -3,6 +3,7 @@ use std::any::{TypeId, type_name};
 use fabro_api::types::{
     CreateWorkflowVersionResponse, WorkflowPath as ApiWorkflowPath,
     WorkflowVersion as ApiWorkflowVersion, WorkflowVersionId as ApiWorkflowVersionId,
+    WorkflowVersionLookupResponse,
 };
 use fabro_types::{WorkflowPath, WorkflowVersion, WorkflowVersionId};
 use serde_json::json;
@@ -36,6 +37,14 @@ fn create_workflow_version_response_round_trips_exact_wire_shape() {
     let value = json!({ "workflow_version_id": DEPENDENCY_ID });
 
     let response: CreateWorkflowVersionResponse = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&response).unwrap(), value);
+}
+
+#[test]
+fn workflow_version_lookup_response_round_trips_exact_wire_shape() {
+    let value = json!({ "workflow_version_id": DEPENDENCY_ID });
+
+    let response: WorkflowVersionLookupResponse = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(&response).unwrap(), value);
 }
 

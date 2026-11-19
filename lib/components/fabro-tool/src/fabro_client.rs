@@ -81,6 +81,19 @@ impl FabroToolBackend for ClientBackend {
         Ok(packaged.root_id())
     }
 
+    async fn lookup_workflow_version(
+        &self,
+        workflow_version_id: &fabro_types::WorkflowVersionId,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.run_scope.is_none(),
+            "workflow version lookup is outside this tool session's run scope"
+        );
+        self.client
+            .lookup_workflow_version(workflow_version_id)
+            .await
+    }
+
     async fn create_run_from_intent(&self, intent: RunIntent) -> anyhow::Result<RunId> {
         anyhow::ensure!(
             self.run_scope.is_none(),
@@ -389,5 +402,53 @@ mod tests {
                 crate::FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME
             )
         );
+    }
+
+    #[tokio::test]
+    async fn lookup_workflow_version_reports_verified_cache_hit_and_miss() {
+        let server = httpmock::MockServer::start_async().await;
+        let version = version("root", BTreeMap::new());
+        let version_id = version.id().unwrap();
+        let hit = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/api/v1/workflow-versions")
+                    .query_param("workflow_version_id", version_id.to_string());
+                then.status(200)
+                    .json_body(json!({"workflow_version_id": version_id}));
+            })
+            .await;
+        let client = ::fabro_client::Client::new_no_proxy(&server.url("")).unwrap();
+        let backend = ClientBackend::new(Arc::new(client));
+
+        assert!(
+            backend.lookup_workflow_version(&version_id).await.unwrap(),
+            "a complete immutable closure is a reusable cache hit"
+        );
+        hit.assert_calls_async(1).await;
+
+        hit.delete_async().await;
+        let miss = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/api/v1/workflow-versions")
+                    .query_param("workflow_version_id", version_id.to_string());
+                then.status(404)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "errors": [{
+                            "status": "404",
+                            "title": "Not Found",
+                            "detail": "workflow version was not found",
+                            "code": "workflow_version_not_found"
+                        }]
+                    }));
+            })
+            .await;
+        assert!(
+            !backend.lookup_workflow_version(&version_id).await.unwrap(),
+            "a missing prepared version is a normal cache miss"
+        );
+        miss.assert_calls_async(1).await;
     }
 }

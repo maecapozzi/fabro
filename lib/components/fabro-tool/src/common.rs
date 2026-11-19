@@ -54,6 +54,15 @@ pub trait FabroToolBackend: Send + Sync {
         Err(workflow_version_tool_unavailable_error())
     }
 
+    /// Verifies that the immutable root version and all of its dependencies
+    /// are present and canonical. `Ok(false)` is a cache miss, not an error.
+    async fn lookup_workflow_version(
+        &self,
+        _workflow_version_id: &fabro_types::WorkflowVersionId,
+    ) -> anyhow::Result<bool> {
+        Err(workflow_version_tool_unavailable_error())
+    }
+
     async fn create_run_from_intent(&self, intent: fabro_types::RunIntent)
     -> anyhow::Result<RunId>;
 
@@ -166,6 +175,7 @@ pub struct ToolDefinition {
 }
 
 pub const FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME: &str = "fabro_workflow_version_create";
+pub const FABRO_WORKFLOW_VERSION_LOOKUP_TOOL_NAME: &str = "fabro_workflow_version_lookup";
 pub const FABRO_RUN_CREATE_TOOL_NAME: &str = "fabro_run_create";
 pub const FABRO_RUN_SEARCH_TOOL_NAME: &str = "fabro_run_search";
 pub const FABRO_RUN_GET_TOOL_NAME: &str = "fabro_run_get";
@@ -179,6 +189,10 @@ static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         tool_definition::<crate::FabroWorkflowVersionCreateParams>(
             FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME,
             "Register supplied workflow file contents and all local dependencies as a reusable immutable workflow version ID. Obtain files with shell/read tools first; this does not create or start a run.",
+        ),
+        tool_definition::<crate::FabroWorkflowVersionLookupParams>(
+            FABRO_WORKFLOW_VERSION_LOOKUP_TOOL_NAME,
+            "Verify that a reusable immutable workflow version ID and its complete dependency closure are present and canonical. Returns available=false for a cache miss; this does not create or start a run.",
         ),
         tool_definition::<crate::FabroRunCreateParams>(
             FABRO_RUN_CREATE_TOOL_NAME,
@@ -198,7 +212,7 @@ static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
         ),
         tool_definition::<crate::FabroRunGatherParams>(
             FABRO_RUN_GATHER_TOOL_NAME,
-            "Wait for Fabro runs to reach terminal states, returning current state on timeout.",
+            "Wait for Fabro runs to reach terminal states. Returns promptly when a child needs operator approval or has a pending human question. Bounded waits return current state on timeout; wait_until_terminal_or_attention=true observes through ordinary active periods until meaningful state or caller cancellation. It never approves or answers a child.",
         ),
         tool_definition::<crate::FabroRunPairParams>(
             FABRO_RUN_PAIR_TOOL_NAME,
@@ -325,6 +339,7 @@ mod tests {
     fn shared_tool_definitions_include_run_management_catalog() {
         assert_eq!(shared_tool_names(), vec![
             FABRO_WORKFLOW_VERSION_CREATE_TOOL_NAME,
+            FABRO_WORKFLOW_VERSION_LOOKUP_TOOL_NAME,
             FABRO_RUN_CREATE_TOOL_NAME,
             FABRO_RUN_SEARCH_TOOL_NAME,
             FABRO_RUN_GET_TOOL_NAME,

@@ -109,6 +109,24 @@ impl FabroMcpServer {
     }
 
     #[tool(
+        name = "fabro_workflow_version_lookup",
+        description = "Verify that a reusable immutable workflow version ID and its complete dependency closure are present and canonical. Returns available=false for a cache miss; this does not create or start a run."
+    )]
+    async fn fabro_workflow_version_lookup(
+        &self,
+        params: Parameters<run_tools::FabroWorkflowVersionLookupParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let backend = match self.backend().await {
+            Ok(backend) => backend,
+            Err(err) => return Ok(error_result(&err)),
+        };
+        match run_tools::lookup_workflow_version(backend, params.0).await {
+            Ok(result) => success_result(&result, run_tools::workflow_version_lookup_text(&result)),
+            Err(err) => Ok(error_result(&err)),
+        }
+    }
+
+    #[tool(
         name = "fabro_run_create",
         description = "Create runs from registered workflow_version_id values and canonical RunIntent settings. Register contents with fabro_workflow_version_create first. Standalone calls require an explicit target; native workers may inherit the parent target. Starts runs by default."
     )]
@@ -198,7 +216,7 @@ impl FabroMcpServer {
 
     #[tool(
         name = "fabro_run_gather",
-        description = "Wait for Fabro runs to reach terminal states, returning current state on timeout."
+        description = "Wait for Fabro runs to reach terminal states or operator attention. Bounded waits return current state on timeout; wait_until_terminal_or_attention=true observes until meaningful state or caller cancellation."
     )]
     async fn fabro_run_gather(
         &self,
@@ -363,6 +381,108 @@ mod tests {
         );
         assert_ne!(result.is_error, Some(true));
         upload.assert_calls_async(1).await;
+    }
+
+    #[test]
+    fn workflow_version_lookup_mcp_surface_matches_catalog() {
+        let settings = FabroMcpServerSettings {
+            client_factory: Arc::new(|| {
+                Box::pin(async { panic!("client should not be constructed while listing tools") })
+            }),
+        };
+        let server = FabroMcpServer::new(Arc::new(settings));
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "fabro_workflow_version_lookup")
+            .expect("fabro_workflow_version_lookup should be registered");
+        let definition = run_tools::tool_definitions()
+            .iter()
+            .find(|tool| tool.name == "fabro_workflow_version_lookup")
+            .unwrap();
+        let mut expected = definition.parameters.clone();
+        expected.as_object_mut().unwrap().remove("$schema");
+        let mut actual = Value::Object(tool.input_schema.as_ref().clone());
+        actual.as_object_mut().unwrap().remove("$schema");
+
+        assert_eq!(actual, expected);
+        assert_eq!(tool.description.as_deref(), Some(definition.description));
+    }
+
+    #[tokio::test]
+    async fn workflow_version_lookup_reports_cache_hit_and_miss() {
+        let mock = httpmock::MockServer::start_async().await;
+        let hit_id = fabro_types::WorkflowVersionId::from(fabro_types::BlobHash::new(b"hit"));
+        let miss_id = fabro_types::WorkflowVersionId::from(fabro_types::BlobHash::new(b"miss"));
+        let hit = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/api/v1/workflow-versions")
+                    .query_param("workflow_version_id", hit_id.to_string());
+                then.status(200)
+                    .json_body(serde_json::json!({"workflow_version_id": hit_id}));
+            })
+            .await;
+        let miss = mock
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/api/v1/workflow-versions")
+                    .query_param("workflow_version_id", miss_id.to_string());
+                then.status(404)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "errors": [{
+                            "status": "404",
+                            "title": "Not Found",
+                            "detail": "workflow version was not found",
+                            "code": "workflow_version_not_found"
+                        }]
+                    }));
+            })
+            .await;
+        let url = mock.url("");
+        let server = FabroMcpServer::new(Arc::new(FabroMcpServerSettings {
+            client_factory: Arc::new(move || {
+                let url = url.clone();
+                Box::pin(async move { fabro_client::Client::new_no_proxy(&url) })
+            }),
+        }));
+
+        let hit_result = server
+            .fabro_workflow_version_lookup(Parameters(
+                run_tools::FabroWorkflowVersionLookupParams {
+                    workflow_version_id: hit_id,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_result.structured_content,
+            Some(serde_json::json!({
+                "workflow_version_id": hit_id.to_string(),
+                "available": true
+            }))
+        );
+        assert_ne!(hit_result.is_error, Some(true));
+
+        let miss_result = server
+            .fabro_workflow_version_lookup(Parameters(
+                run_tools::FabroWorkflowVersionLookupParams {
+                    workflow_version_id: miss_id,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            miss_result.structured_content,
+            Some(serde_json::json!({
+                "workflow_version_id": miss_id.to_string(),
+                "available": false
+            }))
+        );
+        assert_ne!(miss_result.is_error, Some(true));
+        hit.assert_calls_async(1).await;
+        miss.assert_calls_async(1).await;
     }
 
     #[test]

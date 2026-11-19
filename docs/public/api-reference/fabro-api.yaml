@@ -1089,6 +1089,49 @@ paths:
   # ── Workflow Versions ─────────────────────────────────────────────────
 
   /api/v1/workflow-versions:
+    get:
+      operationId: lookupWorkflowVersion
+      tags: [Workflow Versions]
+      summary: Verify Workflow Version
+      description: >-
+        Verifies that an immutable workflow version and its complete dependency
+        closure are present and canonical. This does not create, modify, or
+        execute a workflow.
+      parameters:
+        - name: workflow_version_id
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/WorkflowVersionId"
+      responses:
+        "200":
+          description: Workflow version and every dependency are available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowVersionLookupResponse"
+        "404":
+          description: Workflow version is not present
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            The requested root is invalid or non-canonical
+            (`workflow_version_invalid`), or a stored dependency is absent,
+            invalid, or non-canonical
+            (`workflow_version_dependency_not_found`)
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
     post:
       operationId: createWorkflowVersion
       tags: [Workflow Versions]
@@ -9821,6 +9864,16 @@ components:
 
     CreateWorkflowVersionResponse:
       description: Identity of the stored immutable workflow version.
+      type: object
+      additionalProperties: false
+      required:
+        - workflow_version_id
+      properties:
+        workflow_version_id:
+          $ref: "#/components/schemas/WorkflowVersionId"
+
+    WorkflowVersionLookupResponse:
+      description: Identity of an available immutable workflow-version closure.
       type: object
       additionalProperties: false
       required:

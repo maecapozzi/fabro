@@ -40,11 +40,12 @@ fabro mcp init claude --name fabro-testing --server https://fabro-testing.exampl
 | Tool | Purpose |
 |---|---|
 | `fabro_workflow_version_create` | Register supplied workflow contents and local dependencies as an immutable version ID, without creating a run. |
+| `fabro_workflow_version_lookup` | Verify that a cached immutable version ID and its full dependency closure are available; returns `available: false` for a cache miss. |
 | `fabro_run_create` | Create one or more workflow runs, optionally under a parent run, starting them by default. |
 | `fabro_run_search` | Search runs by ID, parent, workflow, labels, status, archive state, and creation time. |
 | `fabro_run_get` | Read-only inspection of a run: returns its summary, projection, and pending questions without mutating state. |
 | `fabro_run_interact` | Control a run: start, approve, deny, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. |
-| `fabro_run_gather` | Wait for runs to reach terminal states, returning current state on timeout. |
+| `fabro_run_gather` | Wait for terminal state or operator attention. Bounded waits return current state on timeout; `wait_until_terminal_or_attention: true` observes through ordinary active periods until meaningful state or caller cancellation. |
 | `fabro_run_pair` | Inspect, start, message, end, or read transcript for a live run pairing session. |
 | `fabro_run_events` | List, inspect, or search stored events for a run. |
 
@@ -69,6 +70,14 @@ Call `fabro_workflow_version_create` with this object and keep the returned
 `workflow_version_id`. You can reuse it in a `RunIntent` submitted through the
 [Create Run API](/api-reference/runs/create-run). Registration packages and uploads
 child workflows before their parents; callers do not calculate dependency IDs.
+
+When a caller has a cached `workflow_version_id`, call
+`fabro_workflow_version_lookup` before using it. A hit proves that the server
+still has a canonical complete dependency closure; a miss returns
+`available: false`, so package and register the contents normally before
+creating the run. The cache key remains the caller's responsibility: it must
+bind the exact package/dependency closure and every input that selects its
+variant, such as a workflow revision, route, environment, or repository.
 
 `entrypoint` is an exact supplied key, including when it has no extension. File
 values are text, never host paths or URLs to fetch. Missing references and paths
