@@ -593,5 +593,6 @@ models/workflow-ref.ts
 models/workflow-reference.ts
 models/workflow-schedule-summary.ts
 models/workflow-settings.ts
+models/workflow-version-lookup-response.ts
 models/workflow-version.ts
 models/write-blob-response.ts

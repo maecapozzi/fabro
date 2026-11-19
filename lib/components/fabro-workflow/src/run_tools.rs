@@ -823,12 +823,12 @@ mod tests {
     use fabro_tool::fabro_client::ClientBackend;
     use fabro_tool::{FabroToolBackend, ValidatedWorkflowVersionCreate, WorkflowVersionPackager};
     use fabro_types::{
-        Run, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunStatus,
-        RunStreamItem, RunStreamItemKind, RunTimestamps, WorkflowRef, WorkflowVersion,
-        test_support,
+        AskFabro, Run, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunSize,
+        RunStatus, RunStreamItem, RunStreamItemKind, RunTimestamps, SuccessReason, WorkflowRef,
+        WorkflowVersion, test_support,
     };
     use fabro_workflow_version::{CollectedWorkflowClosure, ValidatedWorkflowVersion};
-    use lithos_llm::types::ToolCall;
+    use lithos_llm::types::{ToolCall, Usage};
     use pebble_coding_agent::environment::{
         DirEntry, EnvResult, Environment as _, EnvironmentError, EnvironmentErrorKind, GrepOptions,
         LocalEnvironment,
@@ -956,6 +956,58 @@ mod tests {
         FabroRunToolServices {
             backend:        Arc::new(ClientBackend::new(Arc::new(client))),
             current_run_id: fabro_types::RunId::new(),
+        }
+    }
+
+    fn terminal_run(id: RunId) -> Run {
+        Run {
+            id,
+            parent_id: None,
+            children_count: 0,
+            title: "Child".to_string(),
+            goal: "Child".to_string(),
+            workflow: WorkflowRef {
+                slug:       None,
+                name:       None,
+                graph_name: None,
+                node_count: 0,
+                edge_count: 0,
+            },
+            automation: None,
+            repository: None,
+            created_by: test_support::test_principal(),
+            origin: RunOrigin::default(),
+            labels: HashMap::new(),
+            lifecycle: RunLifecycle {
+                status:          RunStatus::Succeeded {
+                    reason: SuccessReason::Completed,
+                },
+                approval:        None,
+                pending_control: None,
+                queue_position:  None,
+                error:           None,
+                archived:        false,
+                archived_at:     None,
+            },
+            sandbox: None,
+            models: Vec::new(),
+            source_directory: None,
+            timestamps: RunTimestamps {
+                created_at:    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                started_at:    None,
+                last_event_at: None,
+                completed_at:  None,
+            },
+            timing: None,
+            usage: Usage::default(),
+            size: RunSize::default(),
+            ask_fabro: AskFabro::default(),
+            diff: None,
+            pull_request: None,
+            current_question: None,
+            superseded_by: None,
+            retried_from: None,
+            links: RunLinks { web: None },
         }
     }
 
@@ -1885,6 +1937,63 @@ mod tests {
                 .all(|definition| !definition.description.contains(&current_run_id.to_string())),
             "external MCP definitions stay free of native run context"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_gather_result_is_held_until_scheduler_readmission() {
+        let server = httpmock::MockServer::start_async().await;
+        let child_id = RunId::new();
+        let child = terminal_run(child_id);
+        let retrieved = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(format!("/api/v1/runs/{child_id}"));
+                then.status(200).json_body_obj(&child);
+            })
+            .await;
+        let client = fabro_client::Client::new_no_proxy(&server.url("")).unwrap();
+        let services = FabroRunToolServices {
+            backend:        Arc::new(ClientBackend::new(Arc::new(client)).with_run_scope(child_id)),
+            current_run_id: RunId::new(),
+        };
+        let admission = Arc::new(CountingAdmission::new());
+        let admission_for_tool: Arc<dyn GatherAdmission> = admission.clone();
+        let gather = task::spawn(async move {
+            invoke_fabro_run_tool(
+                fabro_tool::FABRO_RUN_GATHER_TOOL_NAME,
+                json!({
+                    "run_ids": [child_id],
+                    "timeout_seconds": 0,
+                    "poll_interval_seconds": 5,
+                }),
+                &services,
+                Some(admission_for_tool),
+                None,
+            )
+            .await
+        });
+
+        admission.entered.notified().await;
+        retrieved.assert_calls_async(2).await;
+        assert!(
+            !gather.is_finished(),
+            "the terminal observation is ready but parent model work remains admission-bound"
+        );
+
+        admission.grant.notify_one();
+        let output = gather
+            .await
+            .expect("gather task joins")
+            .expect("gather returns after readmission");
+        let (_, body) = output
+            .split_once('\n')
+            .expect("tool output includes a structured result");
+        let result: serde_json::Value =
+            serde_json::from_str(body).expect("gather result is valid JSON");
+        assert_eq!(result["runs"][0]["run_id"], child_id.to_string());
+        assert_eq!(result["runs"][0]["status"], "succeeded");
+        assert_eq!(result["timed_out"], false);
+        assert_eq!(result["attention_required"], json!([]));
     }
 
     #[tokio::test]
