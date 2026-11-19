@@ -67,7 +67,16 @@ Then save one selected run's bounded ascending event page:
 
 `output_path` must be a new workspace-relative path. Absolute paths, path
 traversal, symlinked components, and existing files are refused. Query and
-write failures return an error and no saved receipt.
+write failures return an error and no saved receipt. Passing `null` is the
+same as omitting `output_path`, so the tool returns its ordinary response.
+Persistence requires a sandbox with Python 3's POSIX `dir_fd`, `O_DIRECTORY`,
+and `O_NOFOLLOW` support. Fabro checks those capabilities before staging any
+data, so unsupported environments fail without a saved receipt. Host sandboxes
+on Linux and macOS and the standard Docker and Daytona worker images support
+the bounded staging used for large event pages. Each directory is opened
+without following symlinks. Copied bytes are verified in an exclusive
+temporary file before that inode is atomically published under the new
+destination name and the receipt is returned.
 
 ## Fabro as an MCP server
 

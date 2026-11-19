@@ -5,13 +5,15 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fabro_util::shell;
 use pebble_agent::ToolScheduling;
-use pebble_coding_agent::environment::Environment;
+use pebble_coding_agent::environment::{Environment, ExecOutcome, ExecRequest};
 use pebble_coding_agent::tools::{RegisteredTool, ToolError, ToolSource};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use ulid::Ulid;
 
 use crate::services::FabroRunToolServices;
 
@@ -309,8 +311,8 @@ fn native_tool_definition(definition: &fabro_tool::ToolDefinition) -> fabro_tool
             _ => unreachable!("only search and events receive native output_path"),
         };
         definition.parameters["properties"]["output_path"] = serde_json::json!({
-            "type": "string",
-            "description": "Optional new workspace-relative file that receives a versioned envelope containing the tool name, query arguments, and exact JSON response. Native workflow sandboxes only; absolute paths, traversal, symlinks, and existing files are refused."
+            "type": ["string", "null"],
+            "description": "Optional new workspace-relative file that receives a versioned envelope containing the tool name, query arguments, and exact JSON response. Null is treated as absent. Native workflow sandboxes with Python 3 POSIX dir_fd, O_DIRECTORY, and O_NOFOLLOW support only; absolute paths, traversal, symlinks, and existing files are refused."
         });
     }
     definition
@@ -326,6 +328,9 @@ fn take_output_path(
     let Some(output_path) = object.remove("output_path") else {
         return Ok(None);
     };
+    if output_path.is_null() {
+        return Ok(None);
+    }
     let output_path = output_path
         .as_str()
         .ok_or_else(|| fabro_tool::ToolError::message("output_path must be a non-empty string"))?;
@@ -370,7 +375,6 @@ async fn save_result<T>(
 where
     T: Serialize,
 {
-    ensure_new_workspace_file(environment, output_path).await?;
     let envelope = SavedResultEnvelope {
         version: 1,
         tool_name,
@@ -380,14 +384,7 @@ where
     let contents = serde_json::to_string_pretty(&envelope).map_err(|error| {
         fabro_tool::ToolError::message(format!("failed to serialize saved tool result: {error}"))
     })?;
-    environment
-        .write_file(output_path, &contents)
-        .await
-        .map_err(|error| {
-            fabro_tool::ToolError::message(format!(
-                "failed to save tool result to {output_path}: {error}"
-            ))
-        })?;
+    write_new_workspace_file(environment, output_path, &contents).await?;
     let response = serde_json::to_value(result).map_err(|error| {
         fabro_tool::ToolError::message(format!("failed to serialize saved tool receipt: {error}"))
     })?;
@@ -419,49 +416,400 @@ fn validate_output_path(output_path: &str) -> fabro_tool::ToolResult<()> {
     Ok(())
 }
 
-async fn ensure_new_workspace_file(
+// Daytona's direct filesystem write buffers at most 16 MiB. Keeping every
+// staging file below that limit lets the final sandbox-side copy stream pages
+// of any supported result size on capable Host, Docker, and Daytona sandboxes
+// alike.
+const RESULT_STAGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+const SECURE_CREATE_CAPABILITY_SCRIPT: &str = r#"
+import os
+import sys
+
+missing = []
+if os.name != "posix":
+    missing.append("POSIX")
+for name in ("O_DIRECTORY", "O_NOFOLLOW"):
+    if not hasattr(os, name):
+        missing.append(name)
+for function in (os.open, os.mkdir, os.stat, os.unlink, os.link):
+    if function not in os.supports_dir_fd:
+        missing.append(f"{function.__name__}(dir_fd)")
+for function in (os.stat, os.link):
+    if function not in os.supports_follow_symlinks:
+        missing.append(f"{function.__name__}(follow_symlinks)")
+if missing:
+    print(
+        "output_path persistence requires Python 3 POSIX dir_fd/O_NOFOLLOW support; "
+        + "missing "
+        + ", ".join(missing),
+        file=sys.stderr,
+    )
+    sys.exit(78)
+"#;
+
+const SECURE_CREATE_SCRIPT: &str = r#"
+import errno
+import hashlib
+import os
+import stat
+import sys
+
+
+class PersistenceFailure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def same_file(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def open_directory(name, parent_fd):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise PersistenceFailure(
+                73, "output_path traverses a non-directory or symlink"
+            ) from error
+    except OSError as error:
+        raise PersistenceFailure(
+            73, "output_path traverses a non-directory or symlink"
+        ) from error
+
+
+def verify_directory_chain(root_fd, components, expected_stats):
+    current_fd = os.dup(root_fd)
+    try:
+        for component, expected in zip(components, expected_stats):
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+            if not same_file(os.fstat(current_fd), expected):
+                raise PersistenceFailure(
+                    73, "output_path directory changed during persistence"
+                )
+    except OSError as error:
+        raise PersistenceFailure(
+            73, "output_path traverses a non-directory or symlink"
+        ) from error
+    finally:
+        os.close(current_fd)
+
+
+def write_all(file_descriptor, content):
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(file_descriptor, remaining)
+        if written == 0:
+            raise PersistenceFailure(75, "sandbox stopped writing the result file")
+        remaining = remaining[written:]
+
+
+_, _, output_path, temporary_name, expected_sha256, *stage_names = sys.argv
+components = output_path.split("/")
+directory_components = components[:-1]
+destination_name = components[-1]
+directory_fds = []
+directory_stats = []
+stage_files = []
+temporary_fd = None
+temporary_stat = None
+published = False
+succeeded = False
+exit_code = 0
+
+try:
+    root_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory_fds.append(root_fd)
+    parent_fd = root_fd
+    for component in directory_components:
+        parent_fd = open_directory(component, parent_fd)
+        directory_fds.append(parent_fd)
+        directory_stats.append(os.fstat(parent_fd))
+
+    verify_directory_chain(root_fd, directory_components, directory_stats)
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        if error.errno in (errno.EEXIST, errno.EISDIR, errno.ELOOP):
+            raise PersistenceFailure(
+                76, "could not reserve a temporary result file"
+            ) from error
+        raise
+    temporary_stat = os.fstat(temporary_fd)
+
+    for stage_name in stage_names:
+        stage_fd = os.open(
+            stage_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd
+        )
+        stage_stat = os.fstat(stage_fd)
+        if not stat.S_ISREG(stage_stat.st_mode):
+            os.close(stage_fd)
+            raise PersistenceFailure(78, "staged result is not a regular file")
+        stage_files.append((stage_name, stage_fd, stage_stat))
+        while True:
+            chunk = os.read(stage_fd, 1024 * 1024)
+            if not chunk:
+                break
+            write_all(temporary_fd, chunk)
+
+    os.fsync(temporary_fd)
+    os.lseek(temporary_fd, 0, os.SEEK_SET)
+    actual_hash = hashlib.sha256()
+    while True:
+        chunk = os.read(temporary_fd, 1024 * 1024)
+        if not chunk:
+            break
+        actual_hash.update(chunk)
+    if actual_hash.hexdigest() != expected_sha256:
+        raise PersistenceFailure(
+            78, "staged result changed during persistence; SHA-256 verification failed"
+        )
+
+    verify_directory_chain(root_fd, directory_components, directory_stats)
+    current_temporary = os.stat(
+        temporary_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    if not same_file(current_temporary, temporary_stat):
+        raise PersistenceFailure(
+            77, "temporary result file changed during persistence"
+        )
+    try:
+        os.link(
+            temporary_name,
+            destination_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        if error.errno in (errno.EEXIST, errno.EISDIR, errno.ELOOP):
+            raise PersistenceFailure(
+                76, "output_path must name a new workspace file"
+            ) from error
+        raise
+    published = True
+    current_destination = os.stat(
+        destination_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    if not same_file(current_destination, temporary_stat):
+        raise PersistenceFailure(
+            77, "output_path destination changed during publication"
+        )
+    succeeded = True
+except PersistenceFailure as error:
+    print(error, file=sys.stderr)
+    exit_code = error.code
+except OSError as error:
+    print(f"secure result persistence failed: {error}", file=sys.stderr)
+    exit_code = 79
+finally:
+    for stage_name, stage_fd, stage_stat in stage_files:
+        os.close(stage_fd)
+        try:
+            current_stage = os.stat(
+                stage_name, dir_fd=directory_fds[0], follow_symlinks=False
+            )
+            if same_file(current_stage, stage_stat):
+                os.unlink(stage_name, dir_fd=directory_fds[0])
+        except FileNotFoundError:
+            pass
+    if temporary_fd is not None:
+        os.close(temporary_fd)
+    if temporary_stat is not None:
+        try:
+            current_temporary = os.stat(
+                temporary_name,
+                dir_fd=directory_fds[-1],
+                follow_symlinks=False,
+            )
+            if same_file(current_temporary, temporary_stat):
+                os.unlink(temporary_name, dir_fd=directory_fds[-1])
+        except FileNotFoundError:
+            pass
+    if published and not succeeded:
+        try:
+            current_destination = os.stat(
+                destination_name,
+                dir_fd=directory_fds[-1],
+                follow_symlinks=False,
+            )
+            if same_file(current_destination, temporary_stat):
+                os.unlink(destination_name, dir_fd=directory_fds[-1])
+        except FileNotFoundError:
+            pass
+    for directory_fd in reversed(directory_fds):
+        os.close(directory_fd)
+
+sys.exit(exit_code)
+"#;
+
+struct StagedResult {
+    paths:  Vec<String>,
+    sha256: String,
+}
+
+async fn write_new_workspace_file(
     environment: &dyn Environment,
     output_path: &str,
+    contents: &str,
 ) -> fabro_tool::ToolResult<()> {
-    let components = Path::new(output_path)
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(component) => component.to_str(),
-            _ => None,
+    ensure_secure_create_support(environment).await?;
+    let staged = stage_result(environment, contents).await?;
+    commit_staged_result(environment, output_path, staged).await
+}
+
+async fn ensure_secure_create_support(environment: &dyn Environment) -> fabro_tool::ToolResult<()> {
+    let command = format!(
+        "if ! command -v python3 >/dev/null 2>&1; then\n\
+           echo 'output_path persistence requires Python 3' >&2\n\
+           exit 78\n\
+         fi\n{}",
+        shell::shell_join(["python3", "-c", SECURE_CREATE_CAPABILITY_SCRIPT])
+    );
+    let outcome = environment
+        .exec(ExecRequest {
+            output_bytes_cap: Some(4 * 1024),
+            ..ExecRequest::new(&command)
         })
-        .collect::<Vec<_>>();
-    let mut directory = ".".to_string();
-    for (index, component) in components.iter().enumerate() {
-        let entries = environment
-            .list_directory(&directory, Some(1))
-            .await
-            .map_err(|error| {
-                fabro_tool::ToolError::message(format!(
-                    "failed to validate output_path {output_path}: {error}"
-                ))
-            })?;
-        let entry = entries.iter().find(|entry| entry.name == *component);
-        let is_file = index + 1 == components.len();
-        match (is_file, entry) {
-            (true, Some(_)) => {
-                return Err(fabro_tool::ToolError::message(format!(
-                    "output_path must name a new workspace file: {output_path}"
-                )));
-            }
-            (false, Some(entry)) if !entry.is_dir => {
-                return Err(fabro_tool::ToolError::message(format!(
-                    "output_path traverses a non-directory or symlink: {output_path}"
-                )));
-            }
-            (false, None) => return Ok(()),
-            _ => {}
+        .await
+        .map_err(|error| {
+            fabro_tool::ToolError::message(format!(
+                "output_path persistence is unsupported in this sandbox: {error}"
+            ))
+        })?;
+    if outcome.result.is_success() {
+        return Ok(());
+    }
+    let detail = sandbox_command_error(&outcome);
+    Err(fabro_tool::ToolError::message(format!(
+        "output_path persistence is unsupported in this sandbox: {detail}"
+    )))
+}
+
+async fn stage_result(
+    environment: &dyn Environment,
+    contents: &str,
+) -> fabro_tool::ToolResult<StagedResult> {
+    let id = Ulid::new();
+    let mut paths = Vec::new();
+    let mut start = 0;
+    while start < contents.len() {
+        let mut end = start
+            .saturating_add(RESULT_STAGE_CHUNK_BYTES)
+            .min(contents.len());
+        while !contents.is_char_boundary(end) {
+            end -= 1;
         }
-        if !is_file {
-            directory.push('/');
-            directory.push_str(component);
+        let path = format!(".fabro-result-{id}-{index}.stage", index = paths.len());
+        paths.push(path.clone());
+        if let Err(error) = environment.write_file(&path, &contents[start..end]).await {
+            cleanup_staged_result(environment, &paths).await;
+            return Err(fabro_tool::ToolError::message(format!(
+                "failed to stage tool result for {path}: {error}"
+            )));
         }
+        start = end;
+    }
+    // JSON serialization never produces an empty string, but keeping the
+    // primitive complete makes its create-new behavior independent of callers.
+    if paths.is_empty() {
+        let path = format!(".fabro-result-{id}-0.stage");
+        if let Err(error) = environment.write_file(&path, "").await {
+            let _ = environment.delete_file(&path).await;
+            return Err(fabro_tool::ToolError::message(format!(
+                "failed to stage empty tool result for {path}: {error}"
+            )));
+        }
+        paths.push(path);
+    }
+    Ok(StagedResult {
+        paths,
+        sha256: hex::encode(Sha256::digest(contents.as_bytes())),
+    })
+}
+
+async fn commit_staged_result(
+    environment: &dyn Environment,
+    output_path: &str,
+    staged: StagedResult,
+) -> fabro_tool::ToolResult<()> {
+    let command = create_new_file_command(output_path, &staged);
+    let outcome = match environment
+        .exec(ExecRequest {
+            output_bytes_cap: Some(16 * 1024),
+            ..ExecRequest::new(&command)
+        })
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            cleanup_staged_result(environment, &staged.paths).await;
+            return Err(fabro_tool::ToolError::message(format!(
+                "failed to save tool result to {output_path}: {error}"
+            )));
+        }
+    };
+    if !outcome.result.is_success() {
+        cleanup_staged_result(environment, &staged.paths).await;
+        let detail = sandbox_command_error(&outcome);
+        return Err(fabro_tool::ToolError::message(format!(
+            "failed to save tool result to {output_path}: {detail}"
+        )));
     }
     Ok(())
+}
+
+fn sandbox_command_error(outcome: &ExecOutcome) -> String {
+    let detail = if outcome.result.stderr.trim().is_empty() {
+        outcome.result.stdout.trim()
+    } else {
+        outcome.result.stderr.trim()
+    };
+    if detail.is_empty() {
+        format!(
+            "sandbox command exited {}",
+            outcome.result.display_exit_code()
+        )
+    } else {
+        detail.to_string()
+    }
+}
+
+async fn cleanup_staged_result(environment: &dyn Environment, paths: &[String]) {
+    for path in paths {
+        let _ = environment.delete_file(path).await;
+    }
+}
+
+fn create_new_file_command(output_path: &str, staged: &StagedResult) -> String {
+    let temporary_name = format!(".fabro-result-{}.tmp", Ulid::new());
+    shell::shell_join(
+        ["python3", "-c", SECURE_CREATE_SCRIPT, "--", output_path]
+            .into_iter()
+            .chain([temporary_name.as_str()])
+            .chain([staged.sha256.as_str()])
+            .chain(staged.paths.iter().map(String::as_str)),
+    )
 }
 
 #[cfg(test)]
@@ -481,7 +829,10 @@ mod tests {
     };
     use fabro_workflow_version::{CollectedWorkflowClosure, ValidatedWorkflowVersion};
     use lithos_llm::types::ToolCall;
-    use pebble_coding_agent::environment::{Environment as _, LocalEnvironment};
+    use pebble_coding_agent::environment::{
+        DirEntry, EnvResult, Environment as _, EnvironmentError, EnvironmentErrorKind, GrepOptions,
+        LocalEnvironment,
+    };
     use pebble_coding_agent::sandbox_driver::SandboxEnvironment;
     use pebble_coding_agent::tools::{CodingToolSet, ToolRunner};
     use sandbox_driver::{SandboxProvider as _, SandboxSource, SandboxSpec};
@@ -492,6 +843,73 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    struct UnsupportedPersistenceEnvironment {
+        platform: &'static str,
+    }
+
+    #[async_trait]
+    impl Environment for UnsupportedPersistenceEnvironment {
+        fn working_directory(&self) -> &str {
+            "."
+        }
+
+        fn platform(&self) -> &str {
+            self.platform
+        }
+
+        fn os_version(&self) -> String {
+            "darwin test".to_string()
+        }
+
+        async fn read_file_bytes(&self, _path: &str) -> EnvResult<Vec<u8>> {
+            panic!("unsupported platforms must fail before reading files")
+        }
+
+        async fn write_file(&self, _path: &str, _content: &str) -> EnvResult<()> {
+            panic!("unsupported platforms must fail before staging files")
+        }
+
+        async fn rename_file(&self, _source: &str, _destination: &str) -> EnvResult<()> {
+            panic!("unsupported platforms must fail before renaming files")
+        }
+
+        async fn delete_file(&self, _path: &str) -> EnvResult<()> {
+            panic!("unsupported platforms must fail before deleting files")
+        }
+
+        async fn file_exists(&self, _path: &str) -> EnvResult<bool> {
+            panic!("unsupported platforms must fail before inspecting files")
+        }
+
+        async fn list_directory(
+            &self,
+            _path: &str,
+            _depth: Option<usize>,
+        ) -> EnvResult<Vec<DirEntry>> {
+            panic!("unsupported platforms must fail before listing files")
+        }
+
+        async fn grep(
+            &self,
+            _pattern: &str,
+            _path: &str,
+            _options: &GrepOptions,
+        ) -> EnvResult<Vec<String>> {
+            panic!("unsupported platforms must fail before searching files")
+        }
+
+        async fn glob(&self, _pattern: &str, _path: Option<&str>) -> EnvResult<Vec<String>> {
+            panic!("unsupported platforms must fail before matching files")
+        }
+
+        async fn exec(&self, _request: ExecRequest<'_>) -> EnvResult<ExecOutcome> {
+            Err(EnvironmentError::new(
+                EnvironmentErrorKind::Unsupported,
+                "Python 3 POSIX dir_fd support is unavailable",
+            ))
+        }
+    }
 
     struct CountingAdmission {
         waits:   AtomicUsize,
@@ -715,7 +1133,12 @@ mod tests {
 
     fn query_services(run_count: usize, event_count: usize) -> FabroRunToolServices {
         let runs = (0..run_count.max(1))
-            .map(|index| query_run(RunId::new(), index as i64))
+            .map(|index| {
+                query_run(
+                    RunId::new(),
+                    i64::try_from(index).expect("test run count fits in i64"),
+                )
+            })
             .collect::<Vec<_>>();
         let run_id = runs[0].id;
         let events = (1..=event_count)
@@ -745,6 +1168,19 @@ mod tests {
     fn receipt(output: &str) -> Value {
         serde_json::from_str(output.split_once('\n').expect("summary and receipt").1)
             .expect("receipt is JSON")
+    }
+
+    async fn host_sandbox_environment(workspace: &tempfile::TempDir) -> SandboxEnvironment {
+        let sandbox = HostProvider::new()
+            .create(
+                &SandboxSpec::new(SandboxSource::HostDirectory)
+                    .working_directory(workspace.path().display().to_string()),
+                None,
+            )
+            .await
+            .expect("a host sandbox");
+        let working_directory = sandbox.working_directory().to_string();
+        SandboxEnvironment::with_platform(sandbox, working_directory, "linux", "linux test")
     }
 
     #[tokio::test]
@@ -962,6 +1398,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_null_output_path_preserves_ordinary_search_results() {
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let environment = LocalEnvironment::new(temp_dir.path());
+        let services = query_services(2, 0);
+
+        let search = execute_fabro_run_tool_with_environment(
+            fabro_tool::FABRO_RUN_SEARCH_TOOL_NAME,
+            json!({"first": 1, "output_path": null}),
+            &services,
+            Some(&environment),
+        )
+        .await
+        .expect("null keeps the ordinary search behavior");
+        assert!(search.starts_with("found 1 Fabro run(s)\n"));
+        assert_eq!(
+            serde_json::from_str::<Value>(search.split_once('\n').unwrap().1).unwrap()["runs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            temp_dir
+                .path()
+                .read_dir()
+                .expect("the workspace is readable")
+                .next()
+                .is_none(),
+            "null does not stage or save a search result"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_null_output_path_preserves_ordinary_events_results() {
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let environment = LocalEnvironment::new(temp_dir.path());
+        let services = query_services(1, 2);
+
+        let events = execute_fabro_run_tool_with_environment(
+            fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME,
+            json!({
+                "action": "list",
+                "run_id": services.current_run_id,
+                "direction": "asc",
+                "first": 1,
+                "max_content_length": 262_144,
+                "output_path": null
+            }),
+            &services,
+            Some(&environment),
+        )
+        .await
+        .expect("null keeps the ordinary events behavior");
+        let events: Value =
+            serde_json::from_str(events.split_once('\n').unwrap().1).expect("events are JSON");
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        assert!(
+            temp_dir
+                .path()
+                .read_dir()
+                .expect("the workspace is readable")
+                .next()
+                .is_none(),
+            "null does not stage or save an events result"
+        );
+    }
+
+    #[tokio::test]
     async fn native_events_save_bounded_full_wrappers_and_truncation_metadata() {
         let temp_dir = tempfile::tempdir().expect("a workspace");
         let environment = LocalEnvironment::new(temp_dir.path());
@@ -974,7 +1478,7 @@ mod tests {
                 "run_id": run_id,
                 "direction": "asc",
                 "first": 200,
-                "max_content_length": 262144,
+                "max_content_length": 262_144,
                 "output_path": "results/events.json"
             }),
             &services,
@@ -997,7 +1501,7 @@ mod tests {
                 "run_id": run_id,
                 "direction": "asc",
                 "first": 200,
-                "max_content_length": 262144
+                "max_content_length": 262_144
             })
         );
         assert_eq!(value["response"]["next_cursor"], 200);
@@ -1017,18 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn native_persistence_refuses_escapes_symlinks_existing_files_and_write_failures() {
         let temp_dir = tempfile::tempdir().expect("a workspace");
-        let provider = HostProvider::new();
-        let sandbox = provider
-            .create(
-                &SandboxSpec::new(SandboxSource::HostDirectory)
-                    .working_directory(temp_dir.path().display().to_string()),
-                None,
-            )
-            .await
-            .expect("a host sandbox");
-        let working_directory = sandbox.working_directory().to_string();
-        let environment =
-            SandboxEnvironment::with_platform(sandbox, working_directory, "linux", "linux test");
+        let environment = host_sandbox_environment(&temp_dir).await;
         let services = query_services(1, 0);
         let name = fabro_tool::FABRO_RUN_SEARCH_TOOL_NAME;
 
@@ -1063,6 +1556,29 @@ mod tests {
             "original"
         );
 
+        tokio::fs::create_dir(temp_dir.path().join("existing-directory"))
+            .await
+            .unwrap();
+        let error = execute_fabro_run_tool_with_environment(
+            name,
+            json!({"output_path": "existing-directory"}),
+            &services,
+            Some(&environment),
+        )
+        .await
+        .expect_err("an existing destination directory is refused");
+        assert!(error.to_string().contains("directory"), "{error}");
+        assert!(
+            temp_dir
+                .path()
+                .join("existing-directory")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none(),
+            "no result is written beneath the destination directory"
+        );
+
         tokio::fs::write(temp_dir.path().join("not-a-directory"), "original")
             .await
             .unwrap();
@@ -1081,6 +1597,48 @@ mod tests {
             use std::os::unix::fs::symlink;
 
             let outside = tempfile::tempdir().expect("an outside directory");
+            symlink(outside.path(), temp_dir.path().join("linked-destination")).unwrap();
+            let error = execute_fabro_run_tool_with_environment(
+                name,
+                json!({"output_path": "linked-destination"}),
+                &services,
+                Some(&environment),
+            )
+            .await
+            .expect_err("a destination symlink to a directory is refused");
+            assert!(error.to_string().contains("new workspace file"), "{error}");
+            assert!(
+                outside
+                    .path()
+                    .read_dir()
+                    .expect("the outside directory is readable")
+                    .next()
+                    .is_none(),
+                "no result is written beneath the symlink destination"
+            );
+
+            tokio::fs::create_dir(temp_dir.path().join("inside-target"))
+                .await
+                .unwrap();
+            symlink(
+                temp_dir.path().join("inside-target"),
+                temp_dir.path().join("inside-link"),
+            )
+            .unwrap();
+            let error = execute_fabro_run_tool_with_environment(
+                name,
+                json!({"output_path": "inside-link/result.json"}),
+                &services,
+                Some(&environment),
+            )
+            .await
+            .expect_err("a symlinked component to another workspace directory is refused");
+            assert!(error.to_string().contains("symlink"), "{error}");
+            assert!(
+                !temp_dir.path().join("inside-target/result.json").exists(),
+                "no result is written through an internal workspace symlink"
+            );
+
             symlink(outside.path(), temp_dir.path().join("linked")).unwrap();
             let error = execute_fabro_run_tool_with_environment(
                 name,
@@ -1095,6 +1653,195 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_native_saves_create_the_destination_exactly_once() {
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let environment = Arc::new(host_sandbox_environment(&temp_dir).await);
+        let first_services = Arc::new(query_services(1, 0));
+        let second_services = Arc::new(query_services(2, 0));
+        let name = fabro_tool::FABRO_RUN_SEARCH_TOOL_NAME;
+
+        let first = task::spawn({
+            let environment = Arc::clone(&environment);
+            let services = Arc::clone(&first_services);
+            async move {
+                execute_fabro_run_tool_with_environment(
+                    name,
+                    json!({"first": 100, "output_path": "results/shared.json"}),
+                    &services,
+                    Some(environment.as_ref()),
+                )
+                .await
+            }
+        });
+        let second = task::spawn({
+            let environment = Arc::clone(&environment);
+            let services = Arc::clone(&second_services);
+            async move {
+                execute_fabro_run_tool_with_environment(
+                    name,
+                    json!({"first": 100, "output_path": "results/shared.json"}),
+                    &services,
+                    Some(environment.as_ref()),
+                )
+                .await
+            }
+        });
+        let outputs = [
+            first.await.expect("the first save task joins"),
+            second.await.expect("the second save task joins"),
+        ];
+        assert_eq!(
+            outputs.iter().filter(|output| output.is_ok()).count(),
+            1,
+            "{outputs:?}"
+        );
+        assert_eq!(
+            outputs.iter().filter(|output| output.is_err()).count(),
+            1,
+            "{outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .find_map(|output| output.as_ref().err())
+                .unwrap()
+                .to_string()
+                .contains("new workspace file")
+        );
+
+        let saved = environment
+            .read_file_text("results/shared.json")
+            .await
+            .expect("the winning result is readable");
+        let saved_value: Value = serde_json::from_str(&saved).expect("the winner saved JSON");
+        let winner = receipt(
+            outputs
+                .iter()
+                .find_map(|output| output.as_ref().ok())
+                .expect("one call wins"),
+        );
+        assert_eq!(
+            winner["result_count"],
+            saved_value["response"]["runs"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            winner["sha256"],
+            hex::encode(Sha256::digest(saved.as_bytes())),
+            "the successful receipt describes the final artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn result_file_persistence_checks_capabilities_before_staging() {
+        let error = write_new_workspace_file(
+            &UnsupportedPersistenceEnvironment {
+                platform: "windows",
+            },
+            "result.json",
+            r#"{"exact":true}"#,
+        )
+        .await
+        .expect_err("a sandbox without the required primitive is refused");
+        assert!(
+            error.to_string().contains("unsupported in this sandbox"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_commit_detects_intermediate_stage_tampering() {
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let environment = host_sandbox_environment(&temp_dir).await;
+        let staged = stage_result(&environment, r#"{"response":"exact"}"#)
+            .await
+            .expect("the exact result is staged");
+        tokio::fs::write(
+            temp_dir.path().join(&staged.paths[0]),
+            r#"{"response":"tampered"}"#,
+        )
+        .await
+        .expect("a concurrent sandbox actor tampers with the stage");
+
+        let error = commit_staged_result(&environment, "results/tampered.json", staged)
+            .await
+            .expect_err("the copied bytes must match the original result hash");
+        assert!(
+            error.to_string().contains("SHA-256 verification failed"),
+            "{error}"
+        );
+        assert!(
+            !temp_dir.path().join("results/tampered.json").exists(),
+            "a failed verification leaves no saved result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_commit_refuses_a_parent_replaced_by_a_symlink_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let outside = tempfile::tempdir().expect("an outside directory");
+        let environment = host_sandbox_environment(&temp_dir).await;
+        validate_output_path("checked/result.json").expect("the original path is valid");
+        tokio::fs::create_dir(temp_dir.path().join("checked"))
+            .await
+            .expect("the checked parent exists");
+        let staged = stage_result(&environment, r#"{"exact":true}"#)
+            .await
+            .expect("the provider stages the result");
+
+        tokio::fs::rename(
+            temp_dir.path().join("checked"),
+            temp_dir.path().join("checked-before-swap"),
+        )
+        .await
+        .expect("the checked directory can be replaced");
+        symlink(outside.path(), temp_dir.path().join("checked"))
+            .expect("the replacement symlink is created");
+
+        let error = commit_staged_result(&environment, "checked/result.json", staged)
+            .await
+            .expect_err("the provider-side create refuses the swapped parent");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !outside.path().join("result.json").exists(),
+            "the sandbox write cannot escape through the swapped parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_write_streams_the_largest_documented_event_page_past_provider_buffers() {
+        const LARGE_EVENT_PAGE_BYTES: usize = 50 * 1024 * 1024 + 1;
+
+        let temp_dir = tempfile::tempdir().expect("a workspace");
+        let environment = host_sandbox_environment(&temp_dir).await;
+        let contents = "x".repeat(LARGE_EVENT_PAGE_BYTES);
+        let staged = stage_result(&environment, &contents)
+            .await
+            .expect("the large result is staged in bounded provider writes");
+        assert!(staged.paths.len() > 1);
+        for path in &staged.paths {
+            let length = tokio::fs::metadata(temp_dir.path().join(path))
+                .await
+                .expect("the provider wrote the stage")
+                .len();
+            assert!(
+                length <= RESULT_STAGE_CHUNK_BYTES as u64,
+                "a provider write was {length} bytes"
+            );
+        }
+
+        commit_staged_result(&environment, "results/large-events.json", staged)
+            .await
+            .expect("the sandbox streams the chunks into one new file");
+        let saved = tokio::fs::read(temp_dir.path().join("results/large-events.json"))
+            .await
+            .expect("the streamed result is readable");
+        assert_eq!(saved, contents.as_bytes());
+    }
+
     #[test]
     fn output_path_is_advertised_only_by_native_tool_definitions() {
         for definition in fabro_tool::tool_definitions().iter().filter(|definition| {
@@ -1107,7 +1854,7 @@ mod tests {
             let native = native_tool_definition(definition);
             assert_eq!(
                 native.parameters["properties"]["output_path"]["type"],
-                "string"
+                json!(["string", "null"])
             );
         }
     }
