@@ -643,6 +643,214 @@ pub(super) fn count_of(names: &[String], expected: &str) -> usize {
     names.iter().filter(|name| *name == expected).count()
 }
 
+/// A maximum-active timeout goes through the real worker cancellation path:
+/// the quiet command is stopped, the scheduler admits the queued run, and
+/// evidence committed before the timeout stays readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn maximum_active_timeout_releases_one_scheduler_slot_and_retains_evidence() {
+    let context = test_context!();
+    let server =
+        RunningServer::start_with("\n[server.scheduler]\nmax_concurrent_runs = 1\n", &[]).await;
+    let settings = run_json(&server, "settings").await;
+    assert_eq!(
+        settings["server"]["scheduler"]["max_concurrent_runs"], 1,
+        "the foreground server must actually run with one slot"
+    );
+    let first_started = context.temp_dir.join("timeout-first-started");
+    let command_pid_file = context.temp_dir.join("timeout-command.pid");
+    let sleeper_pid_file = context.temp_dir.join("timeout-sleeper.pid");
+    let leaked_completion = context.temp_dir.join("timeout-command-completed");
+    let second_finished = context.temp_dir.join("timeout-second-finished");
+    let first = format!(
+        r#"digraph Timeout {{
+    graph [goal="Keep timeout evidence", stall_timeout="30s", max_active_duration="4s", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    save [shape=parallelogram, script="mkdir -p assets; printf saved > assets/report.txt; echo checkpoint-output"]
+    quiet [shape=parallelogram, script="printf %s $$ > {command_pid_file}; sleep 30 & child=$!; printf %s $child > {sleeper_pid_file}; touch {first_started}; echo quiet-started; wait $child; touch {leaked_completion}", timeout="40s"]
+    start -> save -> quiet -> exit
+}}"#,
+        first_started = first_started.display(),
+        command_pid_file = command_pid_file.display(),
+        sleeper_pid_file = sleeper_pid_file.display(),
+        leaked_completion = leaked_completion.display(),
+    );
+    let workspace = write_petri_workflow(&context, &first);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(workspace.join("workflow.toml"))
+        .expect("the workflow settings open")
+        .write_all(b"\n[run.artifacts]\ninclude = [\"assets/**\"]\n")
+        .expect("the artifact settings append");
+    let first_run = run_detached(&context, &server, &workspace);
+    wait_for_path(
+        &first_started,
+        "the first run should occupy the scheduler slot",
+    )
+    .await;
+    let command_pid = std::fs::read_to_string(&command_pid_file)
+        .expect("the quiet command records its pid")
+        .trim()
+        .parse::<u32>()
+        .expect("the quiet command pid is numeric");
+    let sleeper_pid = std::fs::read_to_string(&sleeper_pid_file)
+        .expect("the quiet command records its sleeper pid")
+        .trim()
+        .parse::<u32>()
+        .expect("the quiet sleeper pid is numeric");
+    let first_worker_pid = wait_for_worker(&first_run);
+    assert!(
+        fabro_proc::process_running_strict(command_pid)
+            && fabro_proc::process_running_strict(sleeper_pid)
+            && fabro_proc::process_running_strict(first_worker_pid),
+        "the worker and command tree must be live before the timeout"
+    );
+    let timeout_started = Instant::now();
+
+    let second = format!(
+        r#"digraph AfterTimeout {{
+    graph [goal="Use the released slot", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    work [shape=parallelogram, script="touch {second_finished}"]
+    start -> work -> exit
+}}"#,
+        second_finished = second_finished.display(),
+    );
+    std::fs::write(workspace.join("workflow.fabro"), second)
+        .expect("the queued workflow replaces the source fixture");
+    std::fs::write(
+        workspace.join("workflow.toml"),
+        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\ngoal = \"Use the \
+         released slot\"\n",
+    )
+    .expect("the queued workflow settings replace the fixture");
+    let second_run = run_detached(&context, &server, &workspace);
+
+    let queued_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let status = run_status(&server, &second_run).await;
+        if status == "runnable" {
+            break;
+        }
+        assert!(
+            matches!(status.as_str(), "submitted" | "pending"),
+            "the one-slot scheduler launched the second run instead of queueing it: {status}"
+        );
+        assert!(
+            Instant::now() < queued_deadline,
+            "the second run never became runnable behind the occupied slot"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(
+        run_json(&server, "system/info").await["runs"]["scheduler_slots_used"],
+        1,
+        "only the first run should hold the configured scheduler slot"
+    );
+    assert_eq!(
+        worker_pid(&second_run),
+        None,
+        "a queued run must not have a worker"
+    );
+    assert!(
+        !second_finished.exists()
+            && fabro_proc::process_running_strict(command_pid)
+            && fabro_proc::process_running_strict(sleeper_pid),
+        "the second command must stay queued while the first command is alive"
+    );
+
+    assert_eq!(
+        wait_for_status(&server, &first_run, &["failed", "succeeded"]).await,
+        "failed",
+        "the timed-out run must not succeed"
+    );
+    assert!(
+        timeout_started.elapsed() < Duration::from_secs(15),
+        "native cancellation and cleanup exceeded their bound: {:?}",
+        timeout_started.elapsed()
+    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    while fabro_proc::process_running_strict(command_pid)
+        || fabro_proc::process_running_strict(sleeper_pid)
+        || fabro_proc::process_running_strict(first_worker_pid)
+    {
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "terminal timeout left the worker or command tree alive: worker={}, command={}, \
+             sleeper={}",
+            fabro_proc::process_running_strict(first_worker_pid),
+            fabro_proc::process_running_strict(command_pid),
+            fabro_proc::process_running_strict(sleeper_pid),
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(
+        wait_for_status(&server, &second_run, &["failed", "succeeded"]).await,
+        "succeeded",
+        "the queued run did not acquire the released scheduler slot; server stderr:\n{}",
+        server.stderr_text()
+    );
+    assert!(
+        second_finished.exists(),
+        "the queued command should execute"
+    );
+    assert!(
+        !leaked_completion.exists(),
+        "the cancelled command must not survive terminal cleanup"
+    );
+
+    let stream = settled_stream(&server, &first_run).await;
+    let timeout = stream
+        .iter()
+        .find(|item| item["item"]["derived"]["event"] == "run.maximum_active_duration_exceeded")
+        .expect("the stream reports the distinct active-runtime timeout");
+    assert_eq!(
+        timeout["item"]["derived"]["maximum_active_duration_ms"], 4000,
+        "{timeout:#}"
+    );
+    assert!(
+        timeout["item"]["derived"]["active_duration_ms"]
+            .as_u64()
+            .is_some_and(|elapsed| elapsed >= 4000),
+        "{timeout:#}"
+    );
+    assert!(
+        serde_json::to_string(&stream)
+            .expect("the stream serializes")
+            .contains("quiet-started"),
+        "command log output before cancellation remains readable"
+    );
+    assert!(
+        server.checkpoints(&first_run).await.len() >= 2,
+        "start and the completed save stage should remain checkpointed"
+    );
+
+    let target = server.target();
+    let output = context
+        .command()
+        .args([
+            "artifact", "list", &first_run, "--json", "--server", &target,
+        ])
+        .output()
+        .expect("artifact list executes");
+    assert!(
+        output.status.success(),
+        "saved artifacts should remain readable\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifacts: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).expect("artifact list is JSON");
+    assert!(
+        artifacts
+            .iter()
+            .any(|artifact| artifact["relative_path"] == "assets/report.txt"),
+        "{artifacts:#?}"
+    );
+    server.shutdown();
+}
+
 /// The run's whole stream once it is settled: Fabro's terminal lifecycle
 /// record lands a moment after the engine's finish (the worker exits, the
 /// server records the status, the projector folds it), so a reader that

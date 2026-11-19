@@ -60,7 +60,7 @@ toasts. `RunProjection` (`GET /runs/{id}/state`) serves `attach`, `inspect`,
 | status: paused | `lifecycle.status.kind = paused`, `pending_control` | `run.paused`, `run.unpaused`; a pending request is derived from Fabro's own control call until the record lands. The worker mirrors the same state as platform records `run.lifecycle {paused}` and `{unpaused}`, the way the legacy worker reported it, so the server's live status follows too; they fold to the same status | run |
 | status: succeeded, failed | `lifecycle.status.kind`, `status.reason`, `lifecycle.error`, `Conclusion.status`, `Conclusion.failure` | `run.finished {status}` (`success`, `failed`, `cancelled`) and the root `invocation.finished {result}` (`status` gives `partial_success`; `failure` gives the message and class) | run |
 | status: dead, removing | `lifecycle.status.kind` | platform record `run.lifecycle` (lease lost, delete requested); Petri has no such state | run |
-| cancel reason | `FailureReason::cancelled`, `terminated` | `invocation.cancel.requested {reason}` (`interrupt`, `control`, `stall_timeout`); `run.stalled` beside a watchdog cancel | invocation |
+| cancel reason | `FailureReason::cancelled`, `terminated` | `invocation.cancel.requested {reason}` (`interrupt`, `control`, `stall_timeout`, `maximum_active_duration`); `run.stalled` or `run.maximum_active_duration_exceeded` beside a watchdog cancel | invocation |
 | approval | `lifecycle.approval`, `RunProjection.approval` | platform record `run.lifecycle` (approved, denied with reason) | run |
 | archived, superseded, retried | `lifecycle.archived`, `archived_at`, `superseded_by`, `retried_from` | platform records `run.archived`, `run.unarchived`, `run.superseded {new_run_id, target}`, `run.created {retried_from}` | run |
 | created at | `timestamps.created_at` | platform record `run.created` `recorded_at` | run |
@@ -356,7 +356,7 @@ and served on the events stream, and no view row reads them.
 | `invocation.declared` | Run summary (root result), Stages: nested workflow; Parallel: branch started; Sandbox: binding |
 | `execution.declared`, `execution.finished` | Stages: visit and restart; edge selected and loop restart; nested workflow |
 | `invocation.finished` | Run summary: status, final output; Parallel: branch completed; Stages: nested workflow |
-| `invocation.cancel.requested`, `run.stalled` | Run summary: cancel reason |
+| `invocation.cancel.requested`, `run.stalled`, `run.maximum_active_duration_exceeded` | Run summary: cancel reason |
 | `run.paused`, `run.unpaused` | Run summary: status paused |
 | `run.note.recorded` | Stages: hook decisions; Sandbox: retention (when a hook ran) |
 | `run.finished` | Run summary: status, completed at, wall time |

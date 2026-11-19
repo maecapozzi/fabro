@@ -77,7 +77,7 @@ use petri_runtime::driver::lifecycle::ExecutionHooks;
 use petri_runtime::engine::{EngineState, Event, EventRecord};
 pub use petri_runtime::executor::Retention;
 use petri_runtime::executor::SecretProvider;
-use petri_runtime::ir::FiringId;
+use petri_runtime::ir::{FiringId, StepEvent};
 use petri_runtime::{DaytonaResources, LostSandbox, RunOptions, Runtime, SandboxBackend};
 use sandbox_driver::NetworkPolicy;
 use tokio::fs;
@@ -112,15 +112,15 @@ pub enum Execution {
 /// activity, while model streaming and useful tool output are.
 #[derive(Clone)]
 struct FabroWatchdog {
-    native:        RunWatchdog,
-    polling_calls: Arc<Mutex<BTreeMap<String, bool>>>,
+    native:   RunWatchdog,
+    activity: Arc<Mutex<ActivityClassifier>>,
 }
 
 impl FabroWatchdog {
     fn new(native: RunWatchdog) -> Self {
         Self {
             native,
-            polling_calls: Arc::new(Mutex::new(BTreeMap::new())),
+            activity: Arc::new(Mutex::new(ActivityClassifier::default())),
         }
     }
 
@@ -129,57 +129,105 @@ impl FabroWatchdog {
         else {
             return;
         };
-        match envelope.event {
-            CodingEvent::ToolCallStarted {
-                tool_name,
-                tool_call_id,
-                ..
-            } => {
-                sync::lock(&self.polling_calls).insert(tool_call_id, is_run_poll(&tool_name));
-            }
-            CodingEvent::ToolCallOutputDelta { delta }
-                if !delta.is_empty()
-                    && envelope.tool_call_id.is_some_and(|call_id| {
-                        !sync::lock(&self.polling_calls)
-                            .get(&call_id)
-                            .copied()
-                            .unwrap_or(true)
-                    }) =>
-            {
-                self.native.record_activity();
-            }
-            CodingEvent::ToolCallCompleted {
-                tool_name,
-                tool_call_id,
-                is_error: false,
-                ..
-            } if !sync::lock(&self.polling_calls)
-                .remove(&tool_call_id)
-                .unwrap_or_else(|| is_run_poll(&tool_name)) =>
-            {
-                self.native.record_activity();
-            }
-            CodingEvent::ToolCallCompleted { tool_call_id, .. } => {
-                sync::lock(&self.polling_calls).remove(&tool_call_id);
-            }
-            CodingEvent::LlmFirstOutput { .. } => {
-                self.native.record_activity();
-            }
-            CodingEvent::TextDelta { delta } if !delta.is_empty() => {
-                self.native.record_activity();
-            }
-            CodingEvent::ReasoningDelta { delta } if !delta.is_empty() => {
-                self.native.record_activity();
-            }
-            CodingEvent::AssistantMessage { text, .. } if !text.is_empty() => {
-                self.native.record_activity();
-            }
-            _ => {}
+        if sync::lock(&self.activity).records_activity(envelope) {
+            self.native.record_activity();
         }
     }
 
     fn start(&self, handle: petri_execution::CoordinatorHandle) -> WatchdogTask {
         self.native.start(handle)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AgentSession {
+    stream:  String,
+    session: String,
+}
+
+impl AgentSession {
+    fn of(envelope: &CodingAgentEvent) -> Self {
+        Self {
+            stream:  envelope.stream_id().to_owned(),
+            session: envelope.session_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ToolCall {
+    session: AgentSession,
+    call:    String,
+}
+
+#[derive(Default)]
+struct ActivityClassifier {
+    polling_calls: BTreeMap<ToolCall, bool>,
+}
+
+impl ActivityClassifier {
+    fn records_activity(&mut self, envelope: CodingAgentEvent) -> bool {
+        let session = AgentSession::of(&envelope);
+        match envelope.event {
+            CodingEvent::TextDelta { delta } | CodingEvent::ReasoningDelta { delta } => {
+                !delta.is_empty()
+            }
+            CodingEvent::AssistantMessage {
+                text, reasoning, ..
+            } => {
+                !text.is_empty()
+                    || reasoning.as_ref().is_some_and(|reasoning| {
+                        reasoning
+                            .summary()
+                            .is_some_and(|summary| !summary.is_empty())
+                            || reasoning.trace().is_some_and(|trace| !trace.is_empty())
+                    })
+            }
+            CodingEvent::ToolCallStarted {
+                tool_name,
+                tool_call_id,
+                ..
+            } => {
+                self.polling_calls.insert(
+                    ToolCall {
+                        session,
+                        call: tool_call_id,
+                    },
+                    is_run_poll(&tool_name),
+                );
+                false
+            }
+            CodingEvent::ToolCallOutputDelta { delta } => {
+                !delta.is_empty()
+                    && envelope.tool_call_id.is_some_and(|call| {
+                        !self
+                            .polling_calls
+                            .get(&ToolCall { session, call })
+                            .copied()
+                            .unwrap_or(true)
+                    })
+            }
+            CodingEvent::ToolCallCompleted {
+                tool_name,
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                let polling = self
+                    .polling_calls
+                    .remove(&ToolCall {
+                        session,
+                        call: tool_call_id,
+                    })
+                    .unwrap_or_else(|| is_run_poll(&tool_name));
+                !is_error && !polling
+            }
+            CodingEvent::ProcessingEnd | CodingEvent::SessionEnded => {
+                self.polling_calls.retain(|call, _| call.session != session);
+                false
+            }
+            _ => false,
+        }
     }
 }
 
@@ -193,7 +241,7 @@ impl ExecutionObserver for FabroWatchdog {
     ) {
         match &record.event {
             Event::StepProgressRecorded {
-                ev: petri_runtime::ir::StepEvent::Custom(payload),
+                ev: StepEvent::Custom(payload),
                 ..
             } if payload.get("kind").and_then(serde_json::Value::as_str) == Some("pebble") => {
                 self.on_pebble_event(payload);
@@ -814,7 +862,257 @@ async fn write_receipt(run_dir: &std::path::Path, receipt: &petri_execution::Int
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+
+    fn pebble_event(
+        classifier: &mut ActivityClassifier,
+        stream: &str,
+        session: &str,
+        tool_call_id: Option<&str>,
+        event: Value,
+    ) -> bool {
+        let mut envelope = json!({
+            "seq": 1,
+            "stream_id": stream,
+            "session_id": session,
+            "timestamp": "2026-11-18T00:00:00.000Z",
+        });
+        envelope["event"] = event;
+        if let Some(tool_call_id) = tool_call_id {
+            envelope["tool_call_id"] = json!(tool_call_id);
+        }
+        let payload = json!({
+            "kind": "pebble",
+            "event": envelope,
+        });
+        let envelope = serde_json::from_value::<CodingAgentEvent>(payload["event"].clone())
+            .expect("the nested Pebble envelope is valid");
+        classifier.records_activity(envelope)
+    }
+
+    fn assistant(text: &str, tool_call_count: usize) -> Value {
+        json!({
+            "AssistantMessage": {
+                "text": text,
+                "model": "test/model",
+                "usage": {},
+                "tool_call_count": tool_call_count,
+            }
+        })
+    }
+
+    fn assistant_with_reasoning(text: &str, reasoning: &str, tool_call_count: usize) -> Value {
+        json!({
+            "AssistantMessage": {
+                "text": text,
+                "reasoning": {"summary": reasoning},
+                "model": "test/model",
+                "usage": {},
+                "tool_call_count": tool_call_count,
+            }
+        })
+    }
+
+    fn tool_started(name: &str, call: &str) -> Value {
+        json!({
+            "ToolCallStarted": {
+                "tool_name": name,
+                "tool_call_id": call,
+                "arguments": {},
+            }
+        })
+    }
+
+    fn tool_completed(name: &str, call: &str, is_error: bool) -> Value {
+        json!({
+            "ToolCallCompleted": {
+                "tool_name": name,
+                "tool_call_id": call,
+                "output": {},
+                "is_error": is_error,
+            }
+        })
+    }
+
+    #[test]
+    fn tool_only_polling_rounds_and_empty_retries_are_not_activity() {
+        let mut classifier = ActivityClassifier::default();
+        let cases = [
+            json!({"LlmRequestStarted": {"requested_model": "test/model"}}),
+            json!({"LlmFirstOutput": {"kind": "text"}}),
+            assistant("", 1),
+            tool_started("fabro_run_gather", "call-1"),
+        ];
+        for event in cases {
+            assert!(!pebble_event(
+                &mut classifier,
+                "stream",
+                "session",
+                None,
+                event
+            ));
+        }
+        assert!(!pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            Some("call-1"),
+            json!({"ToolCallOutputDelta": {"delta": "still running"}}),
+        ));
+        assert!(!pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            tool_completed("fabro_run_gather", "call-1", false),
+        ));
+        for event in [
+            json!({"LlmRequestStarted": {"requested_model": "test/model"}}),
+            json!({"LlmFirstOutput": {"kind": "text"}}),
+            assistant("", 0),
+            assistant_with_reasoning("", "", 0),
+        ] {
+            assert!(!pebble_event(
+                &mut classifier,
+                "stream",
+                "session",
+                None,
+                event
+            ));
+        }
+    }
+
+    #[test]
+    fn live_model_output_and_successful_non_poll_tools_are_activity() {
+        let mut classifier = ActivityClassifier::default();
+        for event in [
+            json!({"LlmRequestStarted": {"requested_model": "test/model"}}),
+            json!({"LlmFirstOutput": {"kind": "text"}}),
+        ] {
+            assert!(!pebble_event(
+                &mut classifier,
+                "stream",
+                "session",
+                None,
+                event
+            ));
+        }
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            json!({"TextDelta": {"delta": "useful result"}}),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            assistant("useful result", 0),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            json!({"ReasoningDelta": {"delta": "working"}}),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            assistant_with_reasoning("", "committed reasoning", 0),
+        ));
+        assert!(
+            pebble_event(
+                &mut classifier,
+                "stream",
+                "session",
+                None,
+                assistant("I will check the child", 1),
+            ),
+            "real model text remains observable even when a later tool polls"
+        );
+        assert!(!pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            tool_started("shell", "call-1"),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            Some("call-1"),
+            json!({"ToolCallOutputDelta": {"delta": "compiled"}}),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            tool_completed("shell", "call-1", false),
+        ));
+        assert!(!pebble_event(
+            &mut classifier,
+            "stream",
+            "session",
+            None,
+            tool_completed("shell", "call-2", true),
+        ));
+    }
+
+    #[test]
+    fn parallel_sessions_with_colliding_provider_call_ids_stay_independent() {
+        let mut classifier = ActivityClassifier::default();
+        assert!(!pebble_event(
+            &mut classifier,
+            "root-stream",
+            "polling-child",
+            None,
+            tool_started("fabro_run_get", "call-1"),
+        ));
+        assert!(!pebble_event(
+            &mut classifier,
+            "root-stream",
+            "working-child",
+            None,
+            tool_started("shell", "call-1"),
+        ));
+        assert!(!pebble_event(
+            &mut classifier,
+            "root-stream",
+            "polling-child",
+            Some("call-1"),
+            json!({"ToolCallOutputDelta": {"delta": "running"}}),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "root-stream",
+            "working-child",
+            Some("call-1"),
+            json!({"ToolCallOutputDelta": {"delta": "real output"}}),
+        ));
+        assert!(!pebble_event(
+            &mut classifier,
+            "root-stream",
+            "polling-child",
+            None,
+            tool_completed("fabro_run_get", "call-1", false),
+        ));
+        assert!(pebble_event(
+            &mut classifier,
+            "root-stream",
+            "working-child",
+            None,
+            tool_completed("shell", "call-1", false),
+        ));
+    }
 
     fn outcome_with(status: RunStatus, failure: Option<&str>, complete: bool) -> RunOutcome {
         RunOutcome {
