@@ -862,7 +862,12 @@ async fn write_receipt(run_dir: &std::path::Path, receipt: &petri_execution::Int
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use petri_runtime::engine::EventOrigin;
+    use petri_runtime::ir::{Attempt, Graph};
     use serde_json::{Value, json};
+    use tokio::time;
 
     use super::*;
 
@@ -890,6 +895,40 @@ mod tests {
         let envelope = serde_json::from_value::<CodingAgentEvent>(payload["event"].clone())
             .expect("the nested Pebble envelope is valid");
         classifier.records_activity(envelope)
+    }
+
+    fn pebble_record(
+        seq: u64,
+        stream: &str,
+        session: &str,
+        tool_call_id: Option<&str>,
+        event: &Value,
+    ) -> EventRecord {
+        let mut envelope = json!({
+            "seq": seq,
+            "stream_id": stream,
+            "session_id": session,
+            "timestamp": "2026-11-18T00:00:00.000Z",
+            "event": event,
+        });
+        if let Some(tool_call_id) = tool_call_id {
+            envelope["tool_call_id"] = json!(tool_call_id);
+        }
+        EventRecord {
+            seq,
+            origin: EventOrigin::External,
+            event: Event::StepProgressRecorded {
+                firing: FiringId::new(1),
+                ev:     StepEvent::Custom(json!({
+                    "kind": "pebble",
+                    "event": envelope,
+                })),
+            },
+        }
+    }
+
+    fn observe(watchdog: &FabroWatchdog, state: &EngineState, record: &EventRecord) {
+        watchdog.on_engine_record(petri_execution::ExecutionId::new(0), record, 0, state);
     }
 
     fn assistant(text: &str, tool_call_count: usize) -> Value {
@@ -1065,6 +1104,143 @@ mod tests {
             None,
             tool_completed("shell", "call-2", true),
         ));
+    }
+
+    #[tokio::test]
+    async fn nested_pebble_envelopes_drive_native_watchdog_accounting() {
+        let native = RunWatchdog::with_limits(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(300)),
+        );
+        let watchdog = FabroWatchdog::new(native.clone());
+        let state = EngineState::new(Graph::new());
+        observe(&watchdog, &state, &EventRecord {
+            seq:    0,
+            origin: EventOrigin::External,
+            event:  Event::StepStarted {
+                firing:  FiringId::new(1),
+                attempt: Attempt::FIRST,
+            },
+        });
+
+        time::sleep(Duration::from_millis(90)).await;
+        for (seq, tool_call_id, event) in [
+            (
+                1,
+                None,
+                json!({"LlmRequestStarted": {"requested_model": "test/model"}}),
+            ),
+            (2, None, json!({"LlmFirstOutput": {"kind": "text"}})),
+            (3, None, assistant("", 0)),
+            (4, None, tool_started("fabro_run_gather", "poll-1")),
+            (
+                5,
+                Some("poll-1"),
+                json!({"ToolCallOutputDelta": {"delta": "still running"}}),
+            ),
+            (6, None, tool_completed("fabro_run_gather", "poll-1", false)),
+        ] {
+            observe(
+                &watchdog,
+                &state,
+                &pebble_record(seq, "root-stream", "child-session", tool_call_id, &event),
+            );
+        }
+        time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            native.state().idle_duration_ms >= 100,
+            "empty model retries and polling-only tool events must reach the inactivity limit"
+        );
+
+        observe(
+            &watchdog,
+            &state,
+            &pebble_record(
+                7,
+                "root-stream",
+                "child-session",
+                None,
+                &json!({"TextDelta": {"delta": "checking the child"}}),
+            ),
+        );
+        assert!(
+            native.state().idle_duration_ms < 10,
+            "real streaming text is immediate activity before a future tool choice is known"
+        );
+        for (seq, event) in [
+            (8, assistant("checking the child", 1)),
+            (9, tool_started("fabro_run_get", "poll-2")),
+            (10, tool_completed("fabro_run_get", "poll-2", false)),
+        ] {
+            observe(
+                &watchdog,
+                &state,
+                &pebble_record(seq, "root-stream", "child-session", None, &event),
+            );
+        }
+        assert!(
+            native.state().idle_duration_ms < 10,
+            "a later polling call does not retroactively erase real streamed output"
+        );
+
+        time::sleep(Duration::from_millis(90)).await;
+        observe(
+            &watchdog,
+            &state,
+            &pebble_record(
+                11,
+                "root-stream",
+                "child-session",
+                None,
+                &tool_started("shell", "work-1"),
+            ),
+        );
+        assert!(native.state().idle_duration_ms >= 90);
+        observe(
+            &watchdog,
+            &state,
+            &pebble_record(
+                12,
+                "root-stream",
+                "child-session",
+                None,
+                &tool_completed("shell", "work-1", false),
+            ),
+        );
+        assert!(
+            native.state().idle_duration_ms < 10,
+            "successful non-poll work refreshes inactivity"
+        );
+
+        time::sleep(Duration::from_millis(90)).await;
+        observe(
+            &watchdog,
+            &state,
+            &pebble_record(
+                13,
+                "root-stream",
+                "child-session",
+                None,
+                &json!({"ReasoningDelta": {"delta": "still working"}}),
+            ),
+        );
+        time::sleep(Duration::from_millis(90)).await;
+        observe(
+            &watchdog,
+            &state,
+            &pebble_record(
+                14,
+                "root-stream",
+                "child-session",
+                None,
+                &json!({"TextDelta": {"delta": "more output"}}),
+            ),
+        );
+        assert!(native.state().idle_duration_ms < 10);
+        assert!(
+            native.state().active_duration_ms >= 300,
+            "continuous real output refreshes inactivity but cannot reset active runtime"
+        );
     }
 
     #[test]
