@@ -21,7 +21,7 @@
 )]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fabro_petri::engine::{self, RunStatus};
@@ -31,7 +31,7 @@ use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, test_context, twin_o
 use fabro_types::{WorkflowPath, WorkflowVersion};
 use serde_json::{Value, json};
 
-use super::petri::{RunningServer, run_detached_with, run_json, wait_for_status};
+use super::petri::{RunningServer, run_detached_with, run_json, run_stream, wait_for_status};
 use crate::support::TEST_DEV_TOKEN;
 
 const MODEL: &str = "gpt-5.4";
@@ -40,6 +40,7 @@ const MODEL: &str = "gpt-5.4";
 const RUN_ARGS: &[&str] = &["--auto-approve", "--provider", "openai", "--model", MODEL];
 const POLL: Duration = Duration::from_millis(50);
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
+const TIMER_DURATION_MS: u64 = 4_000;
 
 /// What the stage asks of its agent; every request of the stage's own
 /// session carries it, and no request of a sub-agent does.
@@ -95,6 +96,37 @@ fn write_agent_workspace(context: &fabro_test::TestContext, extra_settings: &str
         format!(
             "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\n\
              goal = \"Use the run tools\"\n\n[run.agent]\nfabro_tools = true\n{extra_settings}"
+        ),
+    )
+    .expect("the settings write");
+    workspace
+}
+
+fn write_timer_parent_workspace(context: &fabro_test::TestContext) -> PathBuf {
+    let workspace = context.temp_dir.join("timer-parent-workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace creates");
+    std::fs::write(
+        workspace.join("workflow.fabro"),
+        format!(
+            r#"digraph TimerParent {{
+    graph [goal="Start an approved child while a native timer is pending", default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    work [shape=box, prompt="{PROMPT}", max_retries=0]
+    timer [shape=insulator, duration="{TIMER_DURATION_MS}ms"]
+    done [shape=parallelogram, script="echo parent resumed", max_retries=0]
+    start -> work -> timer -> done -> exit
+}}
+"#
+        ),
+    )
+    .expect("the workflow writes");
+    std::fs::write(
+        workspace.join("workflow.toml"),
+        format!(
+            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\n\
+             goal = \"Start an approved child while a native timer is pending\"\n\n\
+             [run.agent]\nfabro_tools = true\n"
         ),
     )
     .expect("the settings write");
@@ -195,6 +227,184 @@ async fn approve_run(server: &RunningServer, run_id: &str) {
         format!("POST /api/v1/runs/{run_id}/approve"),
     )
     .await;
+}
+
+async fn scheduler_slots_used(server: &RunningServer) -> u64 {
+    run_json(server, "system/info").await["runs"]["scheduler_slots_used"]
+        .as_u64()
+        .expect("system info includes scheduler occupancy")
+}
+
+async fn wait_for_step_started(server: &RunningServer, run_id: &str, node: &str) -> u64 {
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    loop {
+        let stream = run_stream(server, run_id).await;
+        if let Some(recorded_at) = stream.iter().find_map(|line| {
+            (line["item"]["record"]["body"]["event"] == "step.started"
+                && line["item"]["subject"]["node"]["name"] == node)
+                .then(|| line["recorded_at"].as_u64())
+                .flatten()
+        }) {
+            return recorded_at;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run {run_id} never started node {node}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+fn lifecycle_recorded_at(stream: &[Value], transition: &str) -> u64 {
+    stream
+        .iter()
+        .find_map(|line| {
+            (line["item"]["record"]["kind"] == "run.lifecycle"
+                && line["item"]["record"]["transition"] == transition)
+                .then(|| line["recorded_at"].as_u64())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("run stream has no {transition} lifecycle record"))
+}
+
+fn step_recorded_at(stream: &[Value], node: &str, event: &str) -> u64 {
+    stream
+        .iter()
+        .find_map(|line| {
+            (line["item"]["record"]["body"]["event"] == event
+                && line["item"]["subject"]["node"]["name"] == node)
+                .then(|| line["recorded_at"].as_u64())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("run stream has no {event} record for {node}"))
+}
+
+fn sandbox_startup_ms(stream: &[Value]) -> u64 {
+    stream
+        .iter()
+        .find_map(|line| {
+            (line["item"]["record"]["body"]["event"] == "scope.acquired")
+                .then(|| line["item"]["record"]["body"]["duration_ms"].as_u64())
+                .flatten()
+        })
+        .expect("child stream includes sandbox startup duration")
+}
+
+#[derive(Debug)]
+struct TimerChildMeasurement {
+    approval_wait_ms:                    u64,
+    approval_request_ms:                 u64,
+    runnable_admission_queue_ms:         u64,
+    worker_startup_ms:                   u64,
+    sandbox_startup_ms:                  u64,
+    approved_to_running_ms:              u64,
+    occupancy_while_parent_timer_waits:  u64,
+    child_running_before_timer_finished: bool,
+}
+
+async fn measure_approved_child_during_native_timer(
+    context: &fabro_test::TestContext,
+    twin: &fabro_test::TwinOpenAi,
+    namespace: &str,
+    fabro_bin: Option<&Path>,
+) -> TimerChildMeasurement {
+    let settings = format!(
+        "\n[llm.providers.openai]\nbase_url = \"{}\"\n\n\
+         [server.scheduler]\nmax_concurrent_runs = 1\n",
+        twin.base_url
+    );
+    let server = match fabro_bin {
+        Some(fabro_bin) => {
+            RunningServer::start_with_binary_and_env(
+                fabro_bin,
+                &settings,
+                &[(EnvVars::OPENAI_API_KEY, namespace)],
+                &[("FABRO_SERVER_MAX_CONCURRENT_RUNS", "1")],
+            )
+            .await
+        }
+        None => {
+            RunningServer::start_with_env(&settings, &[(EnvVars::OPENAI_API_KEY, namespace)], &[(
+                "FABRO_SERVER_MAX_CONCURRENT_RUNS",
+                "1",
+            )])
+            .await
+        }
+    };
+    let child_version = register_child_version(&server).await;
+    let child_workspace = context.temp_dir.join("timer-child-workspace");
+    std::fs::create_dir_all(&child_workspace).expect("the child workspace creates");
+    TwinScenarios::new(namespace.to_string())
+        .scenario(run_stage_scenario().tool_call(TwinToolCall::new(
+            "fabro_run_create",
+            json!({
+                "runs": [{
+                    "workflow_version_id": child_version,
+                    "target": {"kind": "folder", "path": child_workspace},
+                    "environment_id": "local",
+                    "args": {"auto_approve": true},
+                }],
+            }),
+        )))
+        .scenario(run_stage_scenario().text("The child is waiting for approval."))
+        .load(twin)
+        .await;
+    let workspace = write_timer_parent_workspace(context);
+    let parent_id = run_detached_with(context, &server, &workspace, RUN_ARGS);
+
+    let children = wait_for_children(&server, &parent_id).await;
+    assert_eq!(children.len(), 1, "one child run: {children:?}");
+    let child_id = children[0]["id"]
+        .as_str()
+        .expect("the child run has an id")
+        .to_string();
+    assert_eq!(
+        children[0]["lifecycle"]["status"]["reason"], "approval_required",
+        "the child must not run before explicit approval"
+    );
+    let _timer_started_at = wait_for_step_started(&server, &parent_id, "timer").await;
+    let occupancy_while_parent_timer_waits = scheduler_slots_used(&server).await;
+
+    let approval_started = Instant::now();
+    approve_run(&server, &child_id).await;
+    let approval_request_ms = u64::try_from(approval_started.elapsed().as_millis())
+        .expect("approval request duration fits u64");
+
+    assert_eq!(
+        wait_for_status(&server, &child_id, &["succeeded", "failed"]).await,
+        "succeeded",
+        "child: {}\nserver stderr:\n{}",
+        run_json(&server, &format!("runs/{child_id}")).await,
+        server.stderr_text()
+    );
+    assert_eq!(
+        wait_for_status(&server, &parent_id, &["succeeded", "failed"]).await,
+        "succeeded",
+        "parent: {}\nserver stderr:\n{}",
+        run_json(&server, &format!("runs/{parent_id}")).await,
+        server.stderr_text()
+    );
+
+    let child_stream = run_stream(&server, &child_id).await;
+    let parent_stream = run_stream(&server, &parent_id).await;
+    let pending_at = lifecycle_recorded_at(&child_stream, "pending");
+    let approved_at = lifecycle_recorded_at(&child_stream, "approved");
+    let runnable_at = lifecycle_recorded_at(&child_stream, "runnable");
+    let starting_at = lifecycle_recorded_at(&child_stream, "starting");
+    let running_at = lifecycle_recorded_at(&child_stream, "running");
+    let timer_finished_at = step_recorded_at(&parent_stream, "timer", "step.finished");
+    let measurement = TimerChildMeasurement {
+        approval_wait_ms: approved_at.saturating_sub(pending_at),
+        approval_request_ms,
+        runnable_admission_queue_ms: starting_at.saturating_sub(runnable_at),
+        worker_startup_ms: running_at.saturating_sub(starting_at),
+        sandbox_startup_ms: sandbox_startup_ms(&child_stream),
+        approved_to_running_ms: running_at.saturating_sub(approved_at),
+        occupancy_while_parent_timer_waits,
+        child_running_before_timer_finished: running_at < timer_finished_at,
+    };
+    server.shutdown();
+    measurement
 }
 
 /// The runs whose parent is `parent_id`.
@@ -402,6 +612,74 @@ async fn an_agent_gathering_its_child_makes_progress_with_one_scheduler_slot() {
         inputs[2]
     );
     server.shutdown();
+}
+
+fn measurement_json(label: &str, measurement: &TimerChildMeasurement) -> Value {
+    json!({
+        "label": label,
+        "timer_duration_ms": TIMER_DURATION_MS,
+        "approval_wait_ms": measurement.approval_wait_ms,
+        "approval_request_ms": measurement.approval_request_ms,
+        "runnable_admission_queue_ms": measurement.runnable_admission_queue_ms,
+        "worker_startup_ms": measurement.worker_startup_ms,
+        "sandbox_startup_ms": measurement.sandbox_startup_ms,
+        "approved_to_running_ms": measurement.approved_to_running_ms,
+        "occupancy_while_parent_timer_waits":
+            measurement.occupancy_while_parent_timer_waits,
+        "child_running_before_timer_finished":
+            measurement.child_running_before_timer_finished,
+    })
+}
+
+/// An ordinary native timer is inactive scheduler work: with the sole slot
+/// released, an explicitly approved child reaches `running`, and the parent
+/// later reacquires capacity for its downstream command.
+#[tokio::test(flavor = "multi_thread")]
+async fn approved_child_runs_during_parent_native_timer_with_one_scheduler_slot() {
+    let context = test_context!();
+    let twin = twin_openai().await;
+    let namespace = format!("{}::{}", module_path!(), line!());
+
+    let measurement =
+        measure_approved_child_during_native_timer(&context, twin, &namespace, None).await;
+
+    assert_eq!(
+        measurement.occupancy_while_parent_timer_waits, 0,
+        "a native timer must release the only scheduler slot"
+    );
+    assert!(
+        measurement.child_running_before_timer_finished,
+        "the approved child must reach running before the parent timer finishes"
+    );
+    eprintln!(
+        "DAAP-4008 candidate measurement: {}",
+        measurement_json("candidate", &measurement)
+    );
+}
+
+/// Runs the same bounded native workload with an explicit Fabro binary.
+///
+/// Invoke this once with the exact-tree baseline and once with the candidate;
+/// the emitted JSON keeps approval, scheduler queue, worker startup, sandbox
+/// startup, and actual permit occupancy separate.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual identical-workload baseline/candidate measurement"]
+async fn measure_approved_child_during_parent_native_timer() {
+    let fabro_bin = std::env::var_os("FABRO_DAAP_4008_MEASURE_BIN")
+        .map(PathBuf::from)
+        .expect("FABRO_DAAP_4008_MEASURE_BIN names the isolated server binary");
+    let context = test_context!();
+    let twin = twin_openai().await;
+    let namespace = format!("{}::{}", module_path!(), line!());
+
+    let measurement =
+        measure_approved_child_during_native_timer(&context, twin, &namespace, Some(&fabro_bin))
+            .await;
+
+    eprintln!(
+        "DAAP-4008 isolated measurement: {}",
+        measurement_json(&fabro_bin.display().to_string(), &measurement)
+    );
 }
 
 /// A `pre_tool_use` hook from `[[run.hooks]]` blocks a run tool as it

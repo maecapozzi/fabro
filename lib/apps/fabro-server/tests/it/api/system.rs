@@ -120,6 +120,16 @@ async fn scheduler_slots_used(app: &axum::Router) -> i64 {
         .expect("scheduler slot count should be present")
 }
 
+async fn wait_for_scheduler_slots(app: &axum::Router, expected: i64) {
+    for _ in 0..POLL_ATTEMPTS {
+        if scheduler_slots_used(app).await == expected {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!("scheduler slot count should have reached {expected}");
+}
+
 async fn answer_yes(app: &axum::Router, run_id: &str, question_id: &str) {
     let question_id = question_id.replace('#', "%23");
     let request = Request::builder()
@@ -461,6 +471,77 @@ async fn blocked_runs_release_shared_scheduler_capacity() {
     let body = response_json(response, StatusCode::OK, "GET /api/v1/system/info").await;
     assert_eq!(body["runs"]["active"], 2);
     assert_eq!(body["runs"]["scheduler_slots_used"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_timers_release_capacity_and_active_followups_are_readmitted_one_at_a_time() {
+    let workspace = tempfile::tempdir().unwrap();
+    let app = test_app_with_scheduler(test_app_state_with_options(test_settings(), 1));
+    let first_started = workspace.path().join("first-started");
+    let release_first = workspace.path().join("release-first");
+    let second_started = workspace.path().join("second-started");
+    let timer_run = |name: &str, started: &std::path::Path, release: &std::path::Path| {
+        format!(
+            r#"digraph {name} {{
+    graph [goal="Release scheduler capacity during a native timer"]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    timer [shape=insulator, duration="1s"]
+    active [shape=parallelogram, script="touch {started}; while [ ! -f {release} ]; do sleep 0.05; done"]
+    start -> timer -> active -> exit
+}}"#,
+            started = started.display(),
+            release = release.display(),
+        )
+    };
+    let first_dot = timer_run("FirstTimer", &first_started, &release_first);
+    let second_dot = timer_run("SecondTimer", &second_started, &second_started);
+
+    let first_run = create_run(
+        &app,
+        minimal_intent_json(&app, &first_dot, workspace.path()).await,
+    )
+    .await;
+    let second_run = create_run(
+        &app,
+        minimal_intent_json(&app, &second_dot, workspace.path()).await,
+    )
+    .await;
+
+    start_run(&app, &first_run).await;
+    assert_eq!(
+        wait_for_run_status(&app, &first_run, &["running", "succeeded", "failed"]).await,
+        "running"
+    );
+    wait_for_scheduler_slots(&app, 0).await;
+    start_run(&app, &second_run).await;
+    assert_eq!(
+        wait_for_run_status(&app, &second_run, &["running", "succeeded", "failed"]).await,
+        "running"
+    );
+    wait_for_scheduler_slots(&app, 0).await;
+
+    wait_for_file(&first_started).await;
+    assert_eq!(
+        scheduler_slots_used(&app).await,
+        1,
+        "the active follow-up reacquires the only scheduler slot"
+    );
+    assert!(
+        !second_started.exists(),
+        "the second active follow-up cannot oversubscribe the scheduler"
+    );
+
+    std::fs::write(&release_first, "").unwrap();
+    wait_for_file(&second_started).await;
+    assert_eq!(
+        wait_for_run_status(&app, &first_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
+    assert_eq!(
+        wait_for_run_status(&app, &second_run, &["succeeded", "failed"]).await,
+        "succeeded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
