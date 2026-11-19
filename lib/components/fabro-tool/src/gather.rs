@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fabro_types::{BlockedReason, PendingReason, Run, RunStatus};
 use futures::future::try_join_all;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::time;
+use tokio::time::{self, Instant};
 
 use super::common;
 use super::common::{FabroToolBackend, RunSummaryResult, ToolError, ToolResult};
@@ -155,16 +155,198 @@ pub fn gather_runs_text(result: &GatherRunsResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use fabro_api::types::Usage;
     use fabro_types::{
-        AskFabro, FailureReason, RunId, RunLifecycle, RunLinks, RunOrigin, RunSize, RunStatus,
-        RunTimestamps, WorkflowRef, test_support,
+        AskFabro, FailureReason, PairId, PairMessageRecord, PairMessageRequest, PairRecord,
+        PairTranscriptResponse, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin,
+        RunPairStatusResponse, RunSize, RunStatus, RunTimestamps, StageId, SuccessReason,
+        WorkflowRef, test_support,
     };
 
-    use super::{GatherAttentionKind, attention_required};
+    use super::{GatherAttentionKind, ValidatedGatherRuns, attention_required, gather_runs};
+    use crate::FabroToolBackend;
+
+    struct ScriptedBackend {
+        resolved: fabro_types::Run,
+        states:   Mutex<VecDeque<fabro_types::Run>>,
+        reads:    AtomicUsize,
+    }
+
+    impl ScriptedBackend {
+        fn new(states: impl IntoIterator<Item = fabro_types::Run>) -> Self {
+            let states = states.into_iter().collect::<VecDeque<_>>();
+            let resolved = states
+                .front()
+                .cloned()
+                .expect("gather test supplies at least one run state");
+            Self {
+                resolved,
+                states: Mutex::new(states),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    fn unexpected() -> anyhow::Error {
+        anyhow::anyhow!("unexpected gather test backend call")
+    }
+
+    #[async_trait]
+    impl FabroToolBackend for ScriptedBackend {
+        async fn create_run_from_intent(&self, _: RunIntent) -> anyhow::Result<RunId> {
+            Err(unexpected())
+        }
+
+        async fn resolve_run(&self, _: &str) -> anyhow::Result<fabro_types::Run> {
+            Ok(self.resolved.clone())
+        }
+
+        async fn retrieve_run(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let mut states = self.states.lock().expect("test state lock is not poisoned");
+            if states.len() > 1 {
+                Ok(states.pop_front().expect("the queue has a front"))
+            } else {
+                Ok(states
+                    .front()
+                    .cloned()
+                    .expect("the queue retains its final state"))
+            }
+        }
+
+        async fn start_run(&self, _: &RunId, _: bool) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn approve_run(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn deny_run(&self, _: &RunId, _: Option<String>) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn cancel_run(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn interrupt_run(&self, _: &RunId) -> anyhow::Result<()> {
+            Err(unexpected())
+        }
+
+        async fn steer_run(&self, _: &RunId, _: String, _: bool) -> anyhow::Result<()> {
+            Err(unexpected())
+        }
+
+        async fn archive_run(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn unarchive_run(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn list_store_runs(&self) -> anyhow::Result<Vec<fabro_types::Run>> {
+            Err(unexpected())
+        }
+
+        async fn list_store_runs_by_parent(
+            &self,
+            _: RunId,
+        ) -> anyhow::Result<Vec<fabro_types::Run>> {
+            Err(unexpected())
+        }
+
+        async fn link_run_parent(&self, _: &RunId, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn unlink_run_parent(&self, _: &RunId) -> anyhow::Result<fabro_types::Run> {
+            Err(unexpected())
+        }
+
+        async fn get_run_state(&self, _: &RunId) -> anyhow::Result<fabro_types::RunProjection> {
+            Err(unexpected())
+        }
+
+        async fn list_run_stream(
+            &self,
+            _: &RunId,
+            _: u64,
+            _: Option<usize>,
+        ) -> anyhow::Result<Vec<fabro_types::RunStreamItem>> {
+            Err(unexpected())
+        }
+
+        async fn list_run_questions(
+            &self,
+            _: &RunId,
+        ) -> anyhow::Result<Vec<fabro_api::types::ApiQuestion>> {
+            Err(unexpected())
+        }
+
+        async fn submit_run_answer(
+            &self,
+            _: &RunId,
+            _: &str,
+            _: fabro_api::types::SubmitAnswerRequest,
+        ) -> anyhow::Result<()> {
+            Err(unexpected())
+        }
+
+        async fn get_run_pair_status(&self, _: &RunId) -> anyhow::Result<RunPairStatusResponse> {
+            Err(unexpected())
+        }
+
+        async fn start_run_pair(&self, _: &RunId, _: StageId) -> anyhow::Result<PairRecord> {
+            Err(unexpected())
+        }
+
+        async fn get_run_pair(&self, _: &RunId, _: &PairId) -> anyhow::Result<PairRecord> {
+            Err(unexpected())
+        }
+
+        async fn end_run_pair(&self, _: &RunId, _: &PairId) -> anyhow::Result<PairRecord> {
+            Err(unexpected())
+        }
+
+        async fn send_run_pair_message(
+            &self,
+            _: &RunId,
+            _: &PairId,
+            _: PairMessageRequest,
+        ) -> anyhow::Result<PairMessageRecord> {
+            Err(unexpected())
+        }
+
+        async fn get_run_pair_transcript(
+            &self,
+            _: &RunId,
+            _: &PairId,
+            _: Option<u32>,
+            _: Option<u32>,
+        ) -> anyhow::Result<PairTranscriptResponse> {
+            Err(unexpected())
+        }
+    }
+
+    fn gather_params(timeout_seconds: u64, poll_interval_seconds: u64) -> ValidatedGatherRuns {
+        ValidatedGatherRuns {
+            run_ids: vec!["child".to_string()],
+            timeout_seconds,
+            poll_interval_seconds,
+        }
+    }
 
     fn run(status: RunStatus) -> fabro_types::Run {
         fabro_types::Run {
@@ -240,5 +422,94 @@ mod tests {
             attention[1].kind,
             GatherAttentionKind::QuestionRequired
         ));
+    }
+
+    #[tokio::test]
+    async fn gather_returns_already_terminal_success_and_failure_without_waiting() {
+        for status in [
+            RunStatus::Succeeded {
+                reason: SuccessReason::Completed,
+            },
+            RunStatus::Failed {
+                reason: FailureReason::WorkflowError,
+            },
+        ] {
+            let backend = Arc::new(ScriptedBackend::new([run(status)]));
+
+            let result = gather_runs(backend.clone(), gather_params(60, 5))
+                .await
+                .expect("terminal child gather succeeds");
+
+            assert!(!result.timed_out);
+            assert!(result.attention_required.is_empty());
+            assert_eq!(backend.reads(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_returns_operator_attention_without_approving_or_answering() {
+        for status in [
+            RunStatus::Pending {
+                reason: fabro_types::PendingReason::ApprovalRequired,
+            },
+            RunStatus::Blocked {
+                blocked_reason: fabro_types::BlockedReason::HumanInputRequired,
+            },
+        ] {
+            let backend = Arc::new(ScriptedBackend::new([run(status)]));
+
+            let result = gather_runs(backend.clone(), gather_params(60, 5))
+                .await
+                .expect("attention state gather succeeds");
+
+            assert!(!result.timed_out);
+            assert_eq!(result.attention_required.len(), 1);
+            assert_eq!(backend.reads(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_returns_current_state_at_a_bounded_timeout() {
+        let backend = Arc::new(ScriptedBackend::new([run(RunStatus::Running)]));
+
+        let result = gather_runs(backend.clone(), gather_params(0, 5))
+            .await
+            .expect("bounded gather succeeds");
+
+        assert!(result.timed_out);
+        assert!(result.attention_required.is_empty());
+        assert_eq!(backend.reads(), 1);
+    }
+
+    #[tokio::test]
+    async fn gather_observes_completion_that_arrives_while_parent_is_waiting() {
+        let backend = Arc::new(ScriptedBackend::new([
+            run(RunStatus::Running),
+            run(RunStatus::Succeeded {
+                reason: SuccessReason::Completed,
+            }),
+        ]));
+        let result = gather_runs(backend.clone(), gather_params(10, 0))
+            .await
+            .expect("completion is returned");
+
+        assert!(!result.timed_out);
+        assert_eq!(result.runs[0].status, "succeeded");
+        assert_eq!(backend.reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn interrupted_gather_stops_waiting_without_another_observation() {
+        let backend = Arc::new(ScriptedBackend::new([run(RunStatus::Running)]));
+        let gather = tokio::spawn(gather_runs(backend.clone(), gather_params(60, 5)));
+
+        tokio::task::yield_now().await;
+        gather.abort();
+
+        assert!(
+            gather.await.is_err(),
+            "interrupted gather task is cancelled"
+        );
+        assert_eq!(backend.reads(), 1);
     }
 }

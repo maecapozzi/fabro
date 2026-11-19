@@ -2,15 +2,19 @@ use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::JsonRejection;
-use fabro_api::types::{CreateWorkflowVersionResponse, WorkflowVersion};
+use fabro_api::types::{
+    CreateWorkflowVersionResponse, WorkflowVersion, WorkflowVersionId,
+    WorkflowVersionLookupResponse,
+};
 use fabro_types::MAX_WORKFLOW_VERSION_BYTES;
 use fabro_util::error;
 use fabro_workflow_version::{
     ValidatedWorkflowVersion, WorkflowVersionStore, WorkflowVersionStoreError,
 };
+use serde::Deserialize;
 
 use super::super::{
-    ApiError, AppState, IntoResponse, Json, Response, Router, State, StatusCode, post,
+    ApiError, AppState, IntoResponse, Json, Query, Response, Router, State, StatusCode, get, post,
 };
 use crate::principal_middleware::RequiredRunManagementActor;
 
@@ -22,8 +26,40 @@ const VERSION_TOO_LARGE_CODE: &str = "workflow_version_too_large";
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route(
         "/workflow-versions",
-        post(create_workflow_version).layer(DefaultBodyLimit::max(MAX_WORKFLOW_VERSION_BYTES)),
+        get(lookup_workflow_version).post(
+            post(create_workflow_version).layer(DefaultBodyLimit::max(MAX_WORKFLOW_VERSION_BYTES)),
+        ),
     )
+}
+
+#[derive(Deserialize)]
+struct WorkflowVersionLookupQuery {
+    workflow_version_id: WorkflowVersionId,
+}
+
+async fn lookup_workflow_version(
+    _auth: RequiredRunManagementActor,
+    State(state): State<Arc<AppState>>,
+    Query(WorkflowVersionLookupQuery {
+        workflow_version_id,
+    }): Query<WorkflowVersionLookupQuery>,
+) -> Result<Response, ApiError> {
+    let store = WorkflowVersionStore::new(state.store_ref().blobs());
+    let Some(_) = store
+        .get_closure(&workflow_version_id)
+        .await
+        .map_err(store_error)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "workflow version was not found",
+        ));
+    };
+
+    Ok(Json(WorkflowVersionLookupResponse {
+        workflow_version_id,
+    })
+    .into_response())
 }
 
 async fn create_workflow_version(
@@ -132,6 +168,16 @@ mod tests {
             .unwrap()
     }
 
+    fn lookup_request(workflow_version_id: &WorkflowVersionId) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/api/v1/workflow-versions?workflow_version_id={workflow_version_id}"
+            ))
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn version(graph: &str) -> Value {
         json!({
             "entrypoint": "workflow.fabro",
@@ -196,6 +242,37 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn lookup_verifies_complete_registered_closure_and_reports_a_cache_miss() {
+        let app = test_support::build_test_router(TestAppStateBuilder::new().build());
+        let created = app
+            .clone()
+            .oneshot(request(serde_json::to_vec(&version(GRAPH)).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let workflow_version_id = response_json(created).await["workflow_version_id"]
+            .as_str()
+            .unwrap()
+            .parse::<WorkflowVersionId>()
+            .unwrap();
+
+        let hit = app
+            .clone()
+            .oneshot(lookup_request(&workflow_version_id))
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(hit).await,
+            json!({"workflow_version_id": workflow_version_id})
+        );
+
+        let missing = WorkflowVersionId::from(BlobHash::new(b"missing workflow closure"));
+        let miss = app.oneshot(lookup_request(&missing)).await.unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

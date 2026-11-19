@@ -78,6 +78,13 @@ A version can be reused for several children, each with its own goal, target, an
 the agent's read tool and pass literal `goal` text. Workflow names, paths, inline
 source objects, and `goal_file` are no longer run-create inputs.
 
+For a prepared-version cache, verify the cached ID with
+`fabro_workflow_version_lookup` before using it. A hit validates the immutable
+root and its complete dependency closure on the current server; a miss returns
+`available: false` and must fall back to normal package registration. Keep cache
+keys bound to the exact package closure and all variant selectors, including the
+selected workflow revision, route, environment, and repository where relevant.
+
 This flow works in Local, Docker, and Daytona environments. The agent can clone a
 remote workflow in its sandbox and submit the resulting contents. Fabro's native
 tool handler executes outside the sandbox, so registration treats file-map keys

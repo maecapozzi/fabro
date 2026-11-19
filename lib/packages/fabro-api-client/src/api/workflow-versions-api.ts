@@ -27,6 +27,8 @@ import type { CreateWorkflowVersionResponse } from '../models';
 import type { ErrorResponse } from '../models';
 // @ts-ignore
 import type { WorkflowVersion } from '../models';
+// @ts-ignore
+import type { WorkflowVersionLookupResponse } from '../models';
 /**
  * WorkflowVersionsApi - axios parameter creator
  */
@@ -73,6 +75,49 @@ export const WorkflowVersionsApiAxiosParamCreator = function (configuration?: Co
                 options: localVarRequestOptions,
             };
         },
+        /**
+         * Verifies that an immutable workflow version and its complete dependency closure are present and canonical. This does not create, modify, or execute a workflow.
+         * @summary Verify Workflow Version
+         * @param {string} workflowVersionId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        lookupWorkflowVersion: async (workflowVersionId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'workflowVersionId' is not null or undefined
+            assertParamExists('lookupWorkflowVersion', 'workflowVersionId', workflowVersionId)
+            const localVarPath = `/api/v1/workflow-versions`;
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            if (workflowVersionId !== undefined) {
+                localVarQueryParameter['workflow_version_id'] = workflowVersionId;
+            }
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
     }
 };
 
@@ -95,6 +140,19 @@ export const WorkflowVersionsApiFp = function(configuration?: Configuration) {
             const localVarOperationServerBasePath = operationServerMap['WorkflowVersionsApi.createWorkflowVersion']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
+        /**
+         * Verifies that an immutable workflow version and its complete dependency closure are present and canonical. This does not create, modify, or execute a workflow.
+         * @summary Verify Workflow Version
+         * @param {string} workflowVersionId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async lookupWorkflowVersion(workflowVersionId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<WorkflowVersionLookupResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.lookupWorkflowVersion(workflowVersionId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['WorkflowVersionsApi.lookupWorkflowVersion']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
     }
 };
 
@@ -114,6 +172,16 @@ export const WorkflowVersionsApiFactory = function (configuration?: Configuratio
         createWorkflowVersion(workflowVersion: WorkflowVersion, options?: RawAxiosRequestConfig): AxiosPromise<CreateWorkflowVersionResponse> {
             return localVarFp.createWorkflowVersion(workflowVersion, options).then((request) => request(axios, basePath));
         },
+        /**
+         * Verifies that an immutable workflow version and its complete dependency closure are present and canonical. This does not create, modify, or execute a workflow.
+         * @summary Verify Workflow Version
+         * @param {string} workflowVersionId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        lookupWorkflowVersion(workflowVersionId: string, options?: RawAxiosRequestConfig): AxiosPromise<WorkflowVersionLookupResponse> {
+            return localVarFp.lookupWorkflowVersion(workflowVersionId, options).then((request) => request(axios, basePath));
+        },
     };
 };
 
@@ -130,5 +198,16 @@ export class WorkflowVersionsApi extends BaseAPI {
      */
     public createWorkflowVersion(workflowVersion: WorkflowVersion, options?: RawAxiosRequestConfig) {
         return WorkflowVersionsApiFp(this.configuration).createWorkflowVersion(workflowVersion, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Verifies that an immutable workflow version and its complete dependency closure are present and canonical. This does not create, modify, or execute a workflow.
+     * @summary Verify Workflow Version
+     * @param {string} workflowVersionId
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public lookupWorkflowVersion(workflowVersionId: string, options?: RawAxiosRequestConfig) {
+        return WorkflowVersionsApiFp(this.configuration).lookupWorkflowVersion(workflowVersionId, options).then((request) => request(this.axios, this.basePath));
     }
 }
