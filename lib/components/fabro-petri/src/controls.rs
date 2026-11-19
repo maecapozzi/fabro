@@ -875,6 +875,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_gather_requests_readmission_and_resumes_after_a_grant() {
+        let controls = RunControls::new();
+        let admission = controls.scheduler_admission();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        let execution = ExecutionId::new(0);
+        let firing = FiringId::new(1);
+        admission.started(execution, firing);
+
+        let wait: Box<dyn GatherWait> = Box::new(admission.wait(execution, firing));
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+
+        let readmit = task::spawn(async move { wait.readmit().await });
+        assert_eq!(
+            events.recv().await,
+            Some(SchedulerAdmissionEvent::ReadmissionRequested)
+        );
+        assert!(
+            !readmit.is_finished(),
+            "a completed observation waits for scheduler capacity, not another model turn"
+        );
+
+        admission.grant();
+        readmit
+            .await
+            .expect("the granted gather readmission finishes");
+    }
+
+    #[tokio::test]
     async fn scheduler_admission_tracks_initial_and_reused_subagent_turns_by_generation() {
         let controls = RunControls::new();
         let admission = controls.scheduler_admission();

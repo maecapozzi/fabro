@@ -104,7 +104,7 @@ struct Harness {
     /// What a successful run's work does when it ends.
     publisher:      Option<Arc<dyn RunPublisher>>,
     fail_run_diff:  bool,
-    _root:          tempfile::TempDir,
+    root:           tempfile::TempDir,
 }
 
 impl Harness {
@@ -132,7 +132,7 @@ impl Harness {
             sandboxed: false,
             publisher: None,
             fail_run_diff: false,
-            _root: root,
+            root,
         }
     }
 
@@ -941,6 +941,51 @@ async fn a_run_hook_blocks_a_tool_effect_through_the_forwarded_service() {
         "the blocked removal never happened"
     );
     assert_eq!(harness.checkpoints().len(), 5);
+}
+
+/// The platform run key, not the engine storage directory's basename, is the
+/// identity exposed to a sandbox command hook.
+#[tokio::test]
+async fn sandbox_stage_hook_receives_the_bound_fabro_run_id() {
+    let mut harness = Harness::new().await;
+    harness.run_dir = harness.root.path().join("run-record").join("petri");
+    assert_eq!(
+        harness.run_dir.file_name().and_then(|name| name.to_str()),
+        Some("petri")
+    );
+    let run_id = harness.run_id.to_string();
+    assert_eq!(run_id.len(), 26, "Fabro run IDs are ULIDs");
+
+    let workflow = workflow(
+        "  write [shape=parallelogram, script=\"test -f hook-context.json\"]",
+        "  start -> write -> exit",
+    );
+    let settings = format!(
+        r#"{SETTINGS}
+[[run.hooks]]
+event = "stage_start"
+matcher = "^write$"
+script = '''printf %s "$FABRO_RUN_ID" > hook-run-id
+cp "$FABRO_HOOK_CONTEXT" hook-context.json'''
+"#
+    );
+    let outcome = harness.run(&workflow, &settings).await;
+    assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+    assert!(outcome.complete, "{:?}", outcome.incomplete);
+
+    let workspace = harness.workspace().await;
+    let path = harness.workspace_path(&workspace);
+    let hook_run_id = fs::read_to_string(path.join("hook-run-id"))
+        .await
+        .expect("the sandbox hook recorded FABRO_RUN_ID");
+    let context: serde_json::Value = serde_json::from_slice(
+        &fs::read(path.join("hook-context.json"))
+            .await
+            .expect("the sandbox hook recorded FABRO_HOOK_CONTEXT"),
+    )
+    .expect("the hook context is JSON");
+    assert_eq!(hook_run_id, run_id);
+    assert_eq!(context["run_id"], run_id);
 }
 
 /// The run's records name the workspace its root invocation ran in: what

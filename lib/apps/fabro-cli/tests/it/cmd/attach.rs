@@ -2038,7 +2038,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                 },
                 "context_updates": {
                   "failure_class": "",
-                  "internal.run_id": "petri"
+                  "internal.run_id": "[ULID]"
                 }
               }
             }
@@ -2113,7 +2113,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
               },
               "context_updates": {
                 "failure_class": "",
-                "internal.run_id": "petri"
+                "internal.run_id": "[ULID]"
               }
             },
             "executed": true,

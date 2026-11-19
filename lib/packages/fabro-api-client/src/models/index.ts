@@ -564,4 +564,5 @@ export * from './workflow-reference';
 export * from './workflow-schedule-summary';
 export * from './workflow-settings';
 export * from './workflow-version';
+export * from './workflow-version-lookup-response';
 export * from './write-blob-response';

@@ -172,6 +172,14 @@ async fn execute_fabro_run_tool_with_environment(
             let summary = fabro_tool::workflow_version_create_text(&result);
             render_fabro_tool_result(&summary, &result)
         }
+        fabro_tool::FABRO_WORKFLOW_VERSION_LOOKUP_TOOL_NAME => {
+            let params =
+                parse_fabro_tool_args::<fabro_tool::FabroWorkflowVersionLookupParams>(name, args)?;
+            let result =
+                fabro_tool::lookup_workflow_version(Arc::clone(&services.backend), params).await?;
+            let summary = fabro_tool::workflow_version_lookup_text(&result);
+            render_fabro_tool_result(&summary, &result)
+        }
         fabro_tool::FABRO_RUN_CREATE_TOOL_NAME => {
             let params = parse_fabro_tool_args::<fabro_tool::FabroRunCreateParams>(name, args)?;
             let result = fabro_tool::create_runs_with_options(
@@ -1131,6 +1139,14 @@ mod tests {
         }
     }
 
+    fn terminal_run(id: RunId) -> Run {
+        let mut run = query_run(id, 0);
+        run.lifecycle.status = RunStatus::Succeeded {
+            reason: fabro_types::SuccessReason::Completed,
+        };
+        run
+    }
+
     fn query_services(run_count: usize, event_count: usize) -> FabroRunToolServices {
         let runs = (0..run_count.max(1))
             .map(|index| {
@@ -1885,6 +1901,63 @@ mod tests {
                 .all(|definition| !definition.description.contains(&current_run_id.to_string())),
             "external MCP definitions stay free of native run context"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_gather_result_is_held_until_scheduler_readmission() {
+        let server = httpmock::MockServer::start_async().await;
+        let child_id = RunId::new();
+        let child = terminal_run(child_id);
+        let retrieved = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(format!("/api/v1/runs/{child_id}"));
+                then.status(200).json_body_obj(&child);
+            })
+            .await;
+        let client = fabro_client::Client::new_no_proxy(&server.url("")).unwrap();
+        let services = FabroRunToolServices {
+            backend:        Arc::new(ClientBackend::new(Arc::new(client)).with_run_scope(child_id)),
+            current_run_id: RunId::new(),
+        };
+        let admission = Arc::new(CountingAdmission::new());
+        let admission_for_tool: Arc<dyn GatherAdmission> = admission.clone();
+        let gather = task::spawn(async move {
+            invoke_fabro_run_tool(
+                fabro_tool::FABRO_RUN_GATHER_TOOL_NAME,
+                json!({
+                    "run_ids": [child_id],
+                    "timeout_seconds": 0,
+                    "poll_interval_seconds": 5,
+                }),
+                &services,
+                Some(admission_for_tool),
+                None,
+            )
+            .await
+        });
+
+        admission.entered.notified().await;
+        retrieved.assert_calls_async(2).await;
+        assert!(
+            !gather.is_finished(),
+            "the terminal observation is ready but parent model work remains admission-bound"
+        );
+
+        admission.grant.notify_one();
+        let output = gather
+            .await
+            .expect("gather task joins")
+            .expect("gather returns after readmission");
+        let (_, body) = output
+            .split_once('\n')
+            .expect("tool output includes a structured result");
+        let result: serde_json::Value =
+            serde_json::from_str(body).expect("gather result is valid JSON");
+        assert_eq!(result["runs"][0]["run_id"], child_id.to_string());
+        assert_eq!(result["runs"][0]["status"], "succeeded");
+        assert_eq!(result["timed_out"], false);
+        assert_eq!(result["attention_required"], json!([]));
     }
 
     #[tokio::test]

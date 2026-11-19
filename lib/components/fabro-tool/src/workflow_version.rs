@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fabro_api::types::CreateWorkflowVersionResponse;
-use fabro_types::{MAX_WORKFLOW_VERSION_BYTES, WorkflowPath};
+use fabro_types::{MAX_WORKFLOW_VERSION_BYTES, WorkflowPath, WorkflowVersionId};
 use fabro_workflow_version::CollectedWorkflowClosure;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,19 @@ pub struct FabroWorkflowVersionCreateParams {
 pub struct ValidatedWorkflowVersionCreate {
     pub entrypoint: WorkflowPath,
     pub files:      BTreeMap<WorkflowPath, String>,
+}
+
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FabroWorkflowVersionLookupParams {
+    #[schemars(with = "String")]
+    pub workflow_version_id: WorkflowVersionId,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WorkflowVersionLookupResult {
+    pub workflow_version_id: String,
+    pub available:           bool,
 }
 
 impl TryFrom<FabroWorkflowVersionCreateParams> for ValidatedWorkflowVersionCreate {
@@ -79,9 +92,39 @@ pub async fn create_workflow_version(
     })
 }
 
+pub async fn lookup_workflow_version(
+    backend: Arc<dyn FabroToolBackend>,
+    params: FabroWorkflowVersionLookupParams,
+) -> ToolResult<WorkflowVersionLookupResult> {
+    let workflow_version_id = params.workflow_version_id;
+    let available = backend
+        .lookup_workflow_version(&workflow_version_id)
+        .await
+        .map_err(|err| ToolError::from_anyhow(&err))?;
+    Ok(WorkflowVersionLookupResult {
+        workflow_version_id: workflow_version_id.to_string(),
+        available,
+    })
+}
+
 #[must_use]
 pub fn workflow_version_create_text(result: &CreateWorkflowVersionResponse) -> String {
     format!("Registered workflow version {}", result.workflow_version_id)
+}
+
+#[must_use]
+pub fn workflow_version_lookup_text(result: &WorkflowVersionLookupResult) -> String {
+    if result.available {
+        format!(
+            "Workflow version {} is available",
+            result.workflow_version_id
+        )
+    } else {
+        format!(
+            "Workflow version {} is not available",
+            result.workflow_version_id
+        )
+    }
 }
 
 #[cfg(test)]

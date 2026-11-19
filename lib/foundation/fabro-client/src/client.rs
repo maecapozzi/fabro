@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use fabro_api::types;
 use fabro_api::types::RunControlAcknowledgement;
@@ -735,6 +735,35 @@ impl Client {
             );
         }
         Ok(returned_id)
+    }
+
+    /// Verifies that a stored immutable workflow version has a complete,
+    /// canonical dependency closure. A missing root is a cache miss.
+    pub async fn lookup_workflow_version(&self, id: &WorkflowVersionId) -> Result<bool> {
+        match self
+            .send_api(|client| {
+                let id = *id;
+                async move {
+                    client
+                        .lookup_workflow_version()
+                        .workflow_version_id(id)
+                        .send()
+                        .await
+                }
+            })
+            .await
+        {
+            Ok(response) => {
+                let returned_id = response.into_inner().workflow_version_id;
+                ensure!(
+                    returned_id == *id,
+                    "workflow version lookup returned {returned_id} for requested {id}"
+                );
+                Ok(true)
+            }
+            Err(error) if is_not_found_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Registers versions in iteration order, stopping at the first failure.
