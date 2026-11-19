@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fabro_petri::controls;
+use fabro_petri::controls::SCHEDULER_ADMISSION_RELEASED_NOTICE;
 use fabro_petri::engine::{self, RunStatus};
 use fabro_static::EnvVars;
 use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, test_context, twin_openai};
@@ -229,13 +229,16 @@ fn interrupt_refused_by_cli(
     );
 }
 
-/// The stream's `run.notice` records, as `(code, message)`, in order.
+/// The stream's control-related `run.notice` records, as `(code, message)`,
+/// in order. Scheduler admission reports its own lifecycle notices
+/// asynchronously; they are not outcomes of a control request.
 fn notices(items: &[Value]) -> Vec<(String, String)> {
     items
         .iter()
         .filter(|item| item["kind"] == "platform")
         .map(|item| &item["item"]["record"])
         .filter(|record| record["kind"] == "run.notice")
+        .filter(|record| record["code"].as_str() != Some(SCHEDULER_ADMISSION_RELEASED_NOTICE))
         .map(|record| {
             (
                 record["code"].as_str().unwrap_or_default().to_string(),
@@ -886,7 +889,6 @@ const GATE_INTERRUPT_REFUSAL: &str =
     "Interrupt of stage `gate` refused: the stage has no model turn to interrupt";
 const UNNAMED_INTERRUPT_REFUSAL: &str =
     "Interrupt refused: Run has no active steerable agent session.";
-const SCHEDULER_ADMISSION_CHANGED: &str = "shared scheduler admission changed";
 
 /// An interrupt of a stage with no model turn to stop: the gate the run is
 /// blocked on, named by its node, is refused by Petri with `no_live_turn`;
@@ -925,16 +927,12 @@ async fn an_interrupt_of_a_gate_stage_is_refused_with_no_live_turn() {
         UNNAMED_INTERRUPT_REFUSAL,
     );
     interrupt_refused_by_cli(&context, &server, &run_id, "gate", GATE_INTERRUPT_REFUSAL);
-    let names = wait_for_stream_count(&server, &run_id, "run.notice", 4).await;
+    let names = wait_for_stream_count(&server, &run_id, "run.notice", 3).await;
     assert_eq!(count_of(&names, "control.requested"), 0, "{names:?}");
-    let run_notices = notices(&run_stream(&server, &run_id).await);
-    // Waiting at the gate releases shared scheduler admission before the
-    // three refusal notices, which retain their exact codes and order.
-    assert_eq!(run_notices, [
-        (
-            controls::SCHEDULER_ADMISSION_RELEASED_NOTICE.to_string(),
-            SCHEDULER_ADMISSION_CHANGED.to_string()
-        ),
+    let refused = notices(&run_stream(&server, &run_id).await);
+    // The notice names the stage and carries Petri's reason as it spells
+    // it, so the web and the CLI can show both.
+    assert_eq!(refused, [
         (
             "no_live_turn".to_string(),
             GATE_INTERRUPT_REFUSAL.to_string()
@@ -1007,17 +1005,11 @@ async fn a_control_the_worker_never_answers_is_pending() {
         "the endpoint waited its bound for the answer: {:?}",
         asked.elapsed()
     );
-    let run_notices = notices(&run_stream(&server, &run_id).await);
-    assert_eq!(run_notices, [
-        (
-            controls::SCHEDULER_ADMISSION_RELEASED_NOTICE.to_string(),
-            SCHEDULER_ADMISSION_CHANGED.to_string()
-        ),
-        (
-            "no_live_turn".to_string(),
-            GATE_INTERRUPT_REFUSAL.to_string()
-        )
-    ]);
+    let refused = notices(&run_stream(&server, &run_id).await);
+    assert_eq!(refused, [(
+        "no_live_turn".to_string(),
+        GATE_INTERRUPT_REFUSAL.to_string()
+    )]);
 
     answer(&server, &run_id, &question_id, json!({ "kind": "yes" })).await;
     let status = wait_for_status(&server, &run_id, &["succeeded", "failed"]).await;

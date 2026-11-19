@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, ensure};
+use fabro_petri::controls::SCHEDULER_ADMISSION_RELEASED_NOTICE;
 use fabro_test::{
     apply_filters, assert_reqwest_status, expect_reqwest_json, fabro_json_snapshot, fabro_snapshot,
     test_context,
@@ -86,6 +87,14 @@ fn normalize_attach_json_progress_event(mut event: Value) -> Value {
     }
     redact_volatile_fields(&mut event);
     event
+}
+
+fn is_scheduler_admission_release_notice(event: &Value) -> bool {
+    event.pointer("/item/record/kind") == Some(&Value::String("run.notice".to_string()))
+        && event.pointer("/item/record/code")
+            == Some(&Value::String(
+                SCHEDULER_ADMISSION_RELEASED_NOTICE.to_string(),
+            ))
 }
 
 /// Replace, at every depth, the wall-clock epoch milliseconds a stream
@@ -1018,11 +1027,14 @@ fn attach_json_errors_without_prompting_for_human_input() {
     }
 
     // Platform and Petri records can share a millisecond timestamp, so their
-    // interleaving varies with projection pass boundaries. Snapshot each
-    // source's order and full payload; the raw comparison above checks their
-    // actual interleaving, cursors, and absence of skipped or duplicate items.
+    // interleaving varies with projection pass boundaries. The scheduler's
+    // asynchronous slot-release notice can likewise arrive before or after
+    // attach exits at the pending question. Snapshot each source's stable
+    // order and full payload; the raw comparison above checks the actual
+    // interleaving, cursors, and absence of skipped or duplicate items.
     let mut progress: Vec<Value> = progress
         .into_iter()
+        .filter(|item| !is_scheduler_admission_release_notice(item))
         .map(normalize_attach_json_progress_event)
         .collect();
     progress.sort_by_key(|item| item["kind"] != "platform");
@@ -1206,23 +1218,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
           "position": {
             "execution": 0,
             "firing": 1
-          }
-        }
-      },
-      {
-        "run_id": "[ULID]",
-        "stream_seq": "[STREAM_SEQ]",
-        "kind": "platform",
-        "id": "[EVENT_ID]",
-        "recorded_at": "[EPOCH_MS]",
-        "item": {
-          "seq": 10,
-          "recorded_at": "[EPOCH_MS]",
-          "record": {
-            "kind": "run.notice",
-            "level": "info",
-            "code": "scheduler.admission_released",
-            "message": "shared scheduler admission changed"
           }
         }
       },

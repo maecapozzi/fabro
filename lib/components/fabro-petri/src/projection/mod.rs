@@ -549,6 +549,59 @@ mod tests {
     }
 
     #[test]
+    fn a_late_parallel_branch_association_backfills_existing_stages() {
+        let mut view = RunView::new();
+        let created = StoredPlatformRecord {
+            seq:         1,
+            recorded_at: 1_000,
+            record:      PlatformRecord::RunCreated(RunCreatedRecord {
+                spec:         types_support::test_run_spec(),
+                title:        Some("A run".to_string()),
+                parent_id:    None,
+                retried_from: None,
+                web_url:      None,
+            }),
+            position:    None,
+        };
+        view.fold(&Item::Platform(&created), 1);
+        view.state.executions.insert(2, 9);
+        let subject = Subject {
+            node:       NodeRef {
+                id:   NodeId::new(1),
+                name: "a".into(),
+                kind: "attractor/command".into(),
+                meta: serde_json::json!({ "kind": "command" }),
+            },
+            firing:     Some(FiringId::new(4)),
+            visit:      Some(1),
+            attempt:    None,
+            generation: None,
+            branch:     BranchRole::None,
+        };
+        view.start_visit(ExecutionId::new(2), &subject, millis(2_000));
+        let stage = view
+            .projection()
+            .and_then(|projection| projection.stage(&StageId::new("a", 1)))
+            .expect("the branch stage is shown");
+        assert!(stage.parallel_branch_id.is_none());
+
+        view.set_invocation_branch(9, &StageId::new("fork", 1), 0);
+
+        let stage = view
+            .projection()
+            .and_then(|projection| projection.stage(&StageId::new("a", 1)))
+            .expect("the branch stage remains shown");
+        assert_eq!(
+            stage
+                .parallel_branch_id
+                .as_ref()
+                .expect("the late branch association backfills the stage")
+                .to_string(),
+            "fork@1:0"
+        );
+    }
+
+    #[test]
     fn a_firing_key_is_stored_as_execution_colon_firing() {
         let mut stages: BTreeMap<FiringKey, u32> = BTreeMap::new();
         stages.insert(FiringKey::new(3, 7), 1);

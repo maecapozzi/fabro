@@ -831,12 +831,12 @@ mod tests {
     use fabro_tool::fabro_client::ClientBackend;
     use fabro_tool::{FabroToolBackend, ValidatedWorkflowVersionCreate, WorkflowVersionPackager};
     use fabro_types::{
-        AskFabro, Run, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunSize,
-        RunStatus, RunStreamItem, RunStreamItemKind, RunTimestamps, SuccessReason, WorkflowRef,
-        WorkflowVersion, test_support,
+        Run, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunStatus,
+        RunStreamItem, RunStreamItemKind, RunTimestamps, WorkflowRef, WorkflowVersion,
+        test_support,
     };
     use fabro_workflow_version::{CollectedWorkflowClosure, ValidatedWorkflowVersion};
-    use lithos_llm::types::{ToolCall, Usage};
+    use lithos_llm::types::ToolCall;
     use pebble_coding_agent::environment::{
         DirEntry, EnvResult, Environment as _, EnvironmentError, EnvironmentErrorKind, GrepOptions,
         LocalEnvironment,
@@ -964,58 +964,6 @@ mod tests {
         FabroRunToolServices {
             backend:        Arc::new(ClientBackend::new(Arc::new(client))),
             current_run_id: fabro_types::RunId::new(),
-        }
-    }
-
-    fn terminal_run(id: RunId) -> Run {
-        Run {
-            id,
-            parent_id: None,
-            children_count: 0,
-            title: "Child".to_string(),
-            goal: "Child".to_string(),
-            workflow: WorkflowRef {
-                slug:       None,
-                name:       None,
-                graph_name: None,
-                node_count: 0,
-                edge_count: 0,
-            },
-            automation: None,
-            repository: None,
-            created_by: test_support::test_principal(),
-            origin: RunOrigin::default(),
-            labels: HashMap::new(),
-            lifecycle: RunLifecycle {
-                status:          RunStatus::Succeeded {
-                    reason: SuccessReason::Completed,
-                },
-                approval:        None,
-                pending_control: None,
-                queue_position:  None,
-                error:           None,
-                archived:        false,
-                archived_at:     None,
-            },
-            sandbox: None,
-            models: Vec::new(),
-            source_directory: None,
-            timestamps: RunTimestamps {
-                created_at:    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-                started_at:    None,
-                last_event_at: None,
-                completed_at:  None,
-            },
-            timing: None,
-            usage: Usage::default(),
-            size: RunSize::default(),
-            ask_fabro: AskFabro::default(),
-            diff: None,
-            pull_request: None,
-            current_question: None,
-            superseded_by: None,
-            retried_from: None,
-            links: RunLinks { web: None },
         }
     }
 
@@ -1189,6 +1137,14 @@ mod tests {
             retried_from: None,
             links: RunLinks { web: None },
         }
+    }
+
+    fn terminal_run(id: RunId) -> Run {
+        let mut run = query_run(id, 0);
+        run.lifecycle.status = RunStatus::Succeeded {
+            reason: fabro_types::SuccessReason::Completed,
+        };
+        run
     }
 
     fn query_services(run_count: usize, event_count: usize) -> FabroRunToolServices {
