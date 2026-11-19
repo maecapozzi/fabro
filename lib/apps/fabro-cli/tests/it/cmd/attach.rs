@@ -1212,6 +1212,23 @@ fn attach_json_errors_without_prompting_for_human_input() {
       {
         "run_id": "[ULID]",
         "stream_seq": "[STREAM_SEQ]",
+        "kind": "platform",
+        "id": "[EVENT_ID]",
+        "recorded_at": "[EPOCH_MS]",
+        "item": {
+          "seq": 10,
+          "recorded_at": "[EPOCH_MS]",
+          "record": {
+            "kind": "run.notice",
+            "level": "info",
+            "code": "scheduler.admission_released",
+            "message": "shared scheduler admission changed"
+          }
+        }
+      },
+      {
+        "run_id": "[ULID]",
+        "stream_seq": "[STREAM_SEQ]",
         "kind": "petri",
         "id": "coordinator/0/0",
         "recorded_at": "[EPOCH_MS]",
@@ -2026,7 +2043,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                 },
                 "context_updates": {
                   "failure_class": "",
-                  "internal.run_id": "petri"
+                  "internal.run_id": "[ULID]"
                 }
               }
             }
@@ -2101,7 +2118,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
               },
               "context_updates": {
                 "failure_class": "",
-                "internal.run_id": "petri"
+                "internal.run_id": "[ULID]"
               }
             },
             "executed": true,

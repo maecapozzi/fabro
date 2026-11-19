@@ -272,7 +272,7 @@ mod tests {
         SuccessReason, WorkflowRef, WorkflowVersion, test_support,
     };
     use fabro_workflow_version::{CollectedWorkflowClosure, ValidatedWorkflowVersion};
-    use lithos_llm::types::ToolCall;
+    use lithos_llm::types::{ToolCall, Usage};
     use pebble_coding_agent::environment::LocalEnvironment;
     use pebble_coding_agent::tools::{CodingToolSet, ToolRunner};
     use serde_json::json;
@@ -370,7 +370,7 @@ mod tests {
                 completed_at:  None,
             },
             timing: None,
-            usage: Default::default(),
+            usage: Usage::default(),
             size: RunSize::default(),
             ask_fabro: AskFabro::default(),
             diff: None,

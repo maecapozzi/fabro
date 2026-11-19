@@ -92,6 +92,25 @@ as virtual relative paths and never reads sandbox paths from the worker host.
 Include the workflow's referenced configuration, prompts, and child workflows in
 the supplied tree. See [MCP](/agents/mcp) for package limits.
 
+To observe a long-running child without returning to the model at ordinary
+timer intervals, call `fabro_run_gather` with:
+
+```json
+{
+  "run_ids": ["<child-run-id>"],
+  "wait_until_terminal_or_attention": true
+}
+```
+
+This mode keeps the native gather active through running and other ordinary
+nonterminal states. It returns when every selected run is terminal or any run
+needs operator approval or an answer to a human question. It does not approve
+or answer the child. Do not also set `timeout_seconds`; omitting the opt-in
+preserves the bounded gather contract (300-second default, 600-second maximum).
+The parent releases scheduler admission while gathering and requests
+readmission before the result reaches its agent. Tool cancellation and the
+parent stage's execution budget still stop the wait.
+
 Workflow content and workspace target are independent. If `target` is omitted,
 a native child inherits the parent's canonical target: `none` or folder as-is,
 and a Git target's repository and current execution branch (normally

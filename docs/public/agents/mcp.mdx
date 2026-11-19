@@ -45,7 +45,7 @@ fabro mcp init claude --name fabro-testing --server https://fabro-testing.exampl
 | `fabro_run_search` | Search runs by ID, parent, workflow, labels, status, archive state, and creation time. |
 | `fabro_run_get` | Read-only inspection of a run: returns its summary, projection, and pending questions without mutating state. |
 | `fabro_run_interact` | Control a run: start, approve, deny, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. |
-| `fabro_run_gather` | Wait for runs to reach terminal states, returning current state on timeout. |
+| `fabro_run_gather` | Wait for terminal state or operator attention. Bounded waits return current state on timeout; `wait_until_terminal_or_attention: true` observes through ordinary active periods until meaningful state or caller cancellation. |
 | `fabro_run_pair` | Inspect, start, message, end, or read transcript for a live run pairing session. |
 | `fabro_run_events` | List, inspect, or search stored events for a run. |
 

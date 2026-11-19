@@ -12,15 +12,21 @@ use super::common::{FabroToolBackend, RunSummaryResult, ToolError, ToolResult};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FabroRunGatherParams {
-    pub run_ids:               Vec<String>,
-    pub timeout_seconds:       Option<u64>,
+    pub run_ids: Vec<String>,
+    /// Keep observing through ordinary active states until every run is
+    /// terminal or one needs operator attention. The enclosing tool/run
+    /// cancellation and execution budget still apply.
+    pub wait_until_terminal_or_attention: Option<bool>,
+    pub timeout_seconds: Option<u64>,
     pub poll_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
 pub struct ValidatedGatherRuns {
     pub run_ids:               Vec<String>,
-    pub timeout_seconds:       u64,
+    /// `None` selects terminal-or-attention observation. `Some` preserves
+    /// bounded gather behavior.
+    pub timeout_seconds:       Option<u64>,
     pub poll_interval_seconds: u64,
 }
 
@@ -32,6 +38,13 @@ impl TryFrom<FabroRunGatherParams> for ValidatedGatherRuns {
         if params.timeout_seconds.is_some_and(|timeout| timeout > 600) {
             return Err(ToolError::message("timeout_seconds must be <= 600"));
         }
+        let wait_until_terminal_or_attention =
+            params.wait_until_terminal_or_attention.unwrap_or(false);
+        if wait_until_terminal_or_attention && params.timeout_seconds.is_some() {
+            return Err(ToolError::message(
+                "timeout_seconds cannot be set when wait_until_terminal_or_attention is true",
+            ));
+        }
         if params
             .poll_interval_seconds
             .is_some_and(|interval| interval < 5)
@@ -40,7 +53,8 @@ impl TryFrom<FabroRunGatherParams> for ValidatedGatherRuns {
         }
         Ok(Self {
             run_ids:               params.run_ids,
-            timeout_seconds:       params.timeout_seconds.unwrap_or(300),
+            timeout_seconds:       (!wait_until_terminal_or_attention)
+                .then(|| params.timeout_seconds.unwrap_or(300)),
             poll_interval_seconds: params.poll_interval_seconds.unwrap_or(15),
         })
     }
@@ -75,7 +89,9 @@ pub async fn gather_runs(
     params: ValidatedGatherRuns,
 ) -> ToolResult<GatherRunsResult> {
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(params.timeout_seconds);
+    let deadline = params
+        .timeout_seconds
+        .map(|timeout| start + Duration::from_secs(timeout));
     let run_ids = try_join_all(params.run_ids.into_iter().map(|selector| {
         let backend = Arc::clone(&backend);
         async move {
@@ -107,16 +123,20 @@ pub async fn gather_runs(
                 elapsed_seconds: start.elapsed().as_secs(),
             });
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(GatherRunsResult {
-                runs:               summaries.iter().map(common::run_summary_result).collect(),
-                attention_required: Vec::new(),
-                timed_out:          true,
-                elapsed_seconds:    start.elapsed().as_secs(),
-            });
-        }
-        let sleep_for = Duration::from_secs(params.poll_interval_seconds).min(deadline - now);
+        let sleep_for = if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(GatherRunsResult {
+                    runs:               summaries.iter().map(common::run_summary_result).collect(),
+                    attention_required: Vec::new(),
+                    timed_out:          true,
+                    elapsed_seconds:    start.elapsed().as_secs(),
+                });
+            }
+            Duration::from_secs(params.poll_interval_seconds).min(deadline - now)
+        } else {
+            Duration::from_secs(params.poll_interval_seconds)
+        };
         time::sleep(sleep_for).await;
     }
 }
@@ -158,18 +178,23 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
-    use fabro_api::types::Usage;
+    use fabro_api::types::{ApiQuestion, SubmitAnswerRequest, Usage};
     use fabro_types::{
         AskFabro, FailureReason, PairId, PairMessageRecord, PairMessageRequest, PairRecord,
         PairTranscriptResponse, RunId, RunIntent, RunLifecycle, RunLinks, RunOrigin,
         RunPairStatusResponse, RunSize, RunStatus, RunTimestamps, StageId, SuccessReason,
         WorkflowRef, test_support,
     };
+    use tokio::{task, time};
 
-    use super::{GatherAttentionKind, ValidatedGatherRuns, attention_required, gather_runs};
+    use super::{
+        FabroRunGatherParams, GatherAttentionKind, ValidatedGatherRuns, attention_required,
+        gather_runs,
+    };
     use crate::FabroToolBackend;
 
     struct ScriptedBackend {
@@ -288,10 +313,7 @@ mod tests {
             Err(unexpected())
         }
 
-        async fn list_run_questions(
-            &self,
-            _: &RunId,
-        ) -> anyhow::Result<Vec<fabro_api::types::ApiQuestion>> {
+        async fn list_run_questions(&self, _: &RunId) -> anyhow::Result<Vec<ApiQuestion>> {
             Err(unexpected())
         }
 
@@ -299,7 +321,7 @@ mod tests {
             &self,
             _: &RunId,
             _: &str,
-            _: fabro_api::types::SubmitAnswerRequest,
+            _: SubmitAnswerRequest,
         ) -> anyhow::Result<()> {
             Err(unexpected())
         }
@@ -343,7 +365,15 @@ mod tests {
     fn gather_params(timeout_seconds: u64, poll_interval_seconds: u64) -> ValidatedGatherRuns {
         ValidatedGatherRuns {
             run_ids: vec!["child".to_string()],
-            timeout_seconds,
+            timeout_seconds: Some(timeout_seconds),
+            poll_interval_seconds,
+        }
+    }
+
+    fn terminal_or_attention_params(poll_interval_seconds: u64) -> ValidatedGatherRuns {
+        ValidatedGatherRuns {
+            run_ids: vec!["child".to_string()],
+            timeout_seconds: None,
             poll_interval_seconds,
         }
     }
@@ -424,6 +454,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_or_attention_wait_is_explicit_and_mutually_exclusive_with_timeout() {
+        let long_wait = ValidatedGatherRuns::try_from(FabroRunGatherParams {
+            run_ids: vec!["child".to_string()],
+            wait_until_terminal_or_attention: Some(true),
+            timeout_seconds: None,
+            poll_interval_seconds: None,
+        })
+        .expect("the opt-in wait validates");
+        assert_eq!(long_wait.timeout_seconds, None);
+
+        let bounded = ValidatedGatherRuns::try_from(FabroRunGatherParams {
+            run_ids: vec!["child".to_string()],
+            wait_until_terminal_or_attention: None,
+            timeout_seconds: None,
+            poll_interval_seconds: None,
+        })
+        .expect("the default bounded wait validates");
+        assert_eq!(bounded.timeout_seconds, Some(300));
+
+        let error = ValidatedGatherRuns::try_from(FabroRunGatherParams {
+            run_ids: vec!["child".to_string()],
+            wait_until_terminal_or_attention: Some(true),
+            timeout_seconds: Some(600),
+            poll_interval_seconds: None,
+        })
+        .expect_err("a long wait cannot also declare a bounded timeout");
+        assert!(error.as_str().contains("cannot be set"));
+    }
+
     #[tokio::test]
     async fn gather_returns_already_terminal_success_and_failure_without_waiting() {
         for status in [
@@ -498,12 +558,79 @@ mod tests {
         assert_eq!(backend.reads(), 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn terminal_or_attention_wait_spans_more_than_ten_minutes_without_model_polling() {
+        for final_status in [
+            RunStatus::Succeeded {
+                reason: SuccessReason::Completed,
+            },
+            RunStatus::Failed {
+                reason: FailureReason::WorkflowError,
+            },
+            RunStatus::Pending {
+                reason: fabro_types::PendingReason::ApprovalRequired,
+            },
+            RunStatus::Blocked {
+                blocked_reason: fabro_types::BlockedReason::HumanInputRequired,
+            },
+        ] {
+            let states = std::iter::repeat_with(|| run(RunStatus::Running))
+                .take(42)
+                .chain(std::iter::once(run(final_status)));
+            let backend = Arc::new(ScriptedBackend::new(states));
+
+            let result = gather_runs(backend.clone(), terminal_or_attention_params(15))
+                .await
+                .expect("the long-lived gather reaches a meaningful state");
+
+            assert!(
+                result.elapsed_seconds > 600,
+                "ordinary active observations must not end the wait at the legacy cap"
+            );
+            assert!(!result.timed_out);
+            assert_eq!(backend.reads(), 43);
+            assert!(
+                result.runs[0].status != "running",
+                "the result is terminal or needs operator attention"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_or_attention_wait_remains_cancellable_after_ten_minutes() {
+        let backend = Arc::new(ScriptedBackend::new([run(RunStatus::Running)]));
+        let started = time::Instant::now();
+        let gather = task::spawn(gather_runs(
+            backend.clone(),
+            terminal_or_attention_params(15),
+        ));
+        task::yield_now().await;
+        for _ in 0..41 {
+            time::advance(Duration::from_secs(15)).await;
+            task::yield_now().await;
+        }
+        assert!(started.elapsed() > Duration::from_mins(10));
+        assert_eq!(backend.reads(), 42);
+        assert!(
+            !gather.is_finished(),
+            "ordinary active state does not complete the long wait"
+        );
+        gather.abort();
+        assert!(
+            gather.await.is_err(),
+            "cancelling the tool interrupts its long-lived observation"
+        );
+        let reads_after_cancellation = backend.reads();
+        time::advance(Duration::from_secs(30)).await;
+        assert_eq!(backend.reads(), reads_after_cancellation);
+    }
+
     #[tokio::test]
     async fn interrupted_gather_stops_waiting_without_another_observation() {
         let backend = Arc::new(ScriptedBackend::new([run(RunStatus::Running)]));
-        let gather = tokio::spawn(gather_runs(backend.clone(), gather_params(60, 5)));
+        let gather = task::spawn(gather_runs(backend.clone(), gather_params(60, 5)));
 
-        tokio::task::yield_now().await;
+        task::yield_now().await;
         gather.abort();
 
         assert!(

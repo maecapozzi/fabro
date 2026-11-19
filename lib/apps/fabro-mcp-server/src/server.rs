@@ -198,7 +198,7 @@ impl FabroMcpServer {
 
     #[tool(
         name = "fabro_run_gather",
-        description = "Wait for Fabro runs to reach terminal states, returning current state on timeout."
+        description = "Wait for Fabro runs to reach terminal states or operator attention. Bounded waits return current state on timeout; wait_until_terminal_or_attention=true observes until meaningful state or caller cancellation."
     )]
     async fn fabro_run_gather(
         &self,
