@@ -209,12 +209,14 @@ async fn wait_for_children(server: &RunningServer, parent_id: &str) -> Vec<Value
     let deadline = Instant::now() + RUN_TIMEOUT;
     loop {
         let children = children_of(server, parent_id).await;
-        if !children.is_empty() {
+        if children.iter().any(|child| {
+            child["lifecycle"]["status"]["reason"].as_str() == Some("approval_required")
+        }) {
             return children;
         }
         assert!(
             Instant::now() < deadline,
-            "no child run of {parent_id} appeared"
+            "no approval-required child run of {parent_id} appeared"
         );
         tokio::time::sleep(POLL).await;
     }

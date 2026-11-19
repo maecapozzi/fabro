@@ -30,6 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fabro_petri::controls::SCHEDULER_ADMISSION_RELEASED_NOTICE;
 use fabro_petri::engine::{self, RunStatus};
 use fabro_static::EnvVars;
 use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, test_context, twin_openai};
@@ -228,13 +229,16 @@ fn interrupt_refused_by_cli(
     );
 }
 
-/// The stream's `run.notice` records, as `(code, message)`, in order.
+/// The stream's control-related `run.notice` records, as `(code, message)`,
+/// in order. Scheduler admission reports its own lifecycle notices
+/// asynchronously; they are not outcomes of a control request.
 fn notices(items: &[Value]) -> Vec<(String, String)> {
     items
         .iter()
         .filter(|item| item["kind"] == "platform")
         .map(|item| &item["item"]["record"])
         .filter(|record| record["kind"] == "run.notice")
+        .filter(|record| record["code"].as_str() != Some(SCHEDULER_ADMISSION_RELEASED_NOTICE))
         .map(|record| {
             (
                 record["code"].as_str().unwrap_or_default().to_string(),

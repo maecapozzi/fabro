@@ -118,8 +118,7 @@ impl RunView {
                             .get(&FiringKey::new(execution.raw(), occurrence.firing))
                             .map(|stage| stage.stage_id.clone());
                         if let Some(group) = group {
-                            self.state.invocations.entry(invocation).or_default().branch =
-                                Some((group, index));
+                            self.set_invocation_branch(invocation, &group, index);
                         }
                     }
                     Progress::Other => {}
