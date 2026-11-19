@@ -334,13 +334,28 @@ Fabro uses Petri's run watchdog for two independent limits: an inactivity
 budget and an active-runtime backstop. The clocks start when actual work
 starts, so scheduler queue time does not count.
 
-The inactivity clock resets only for typed execution activity: non-empty command
-or tool output, artifacts, Pebble model request/streaming activity, and typed
-tool lifecycle events. Activity in child and parallel work counts for the
-containing run. Status requests, `fabro_run_get`/gather/wait polling,
-supervision bookkeeping, heartbeats, and retries without useful execution
-activity do not reset it. Fabro deliberately does not infer progress from
-arbitrary model prose.
+The inactivity clock resets only for typed execution activity: command log
+output, artifacts, non-empty model text or reasoning deltas (and non-empty
+committed model text or reasoning), and non-empty output or successful
+completion from a non-poll tool. Bare model-request/first-output markers and
+empty assistant messages do not count. Output and completion from
+`fabro_run_get`, `fabro_run_gather`, `fabro_run_events`, and
+`fabro_run_search` do not count either, so a tool-only polling loop cannot stay
+alive. Failed tools, supervision bookkeeping, heartbeats, and retries without
+useful execution output also do not reset the clock.
+
+These are structural event rules; Fabro does not infer semantic progress from
+arbitrary prose. In particular, genuinely non-empty model text or reasoning is
+observable activity immediately, even if that model turn later chooses a
+polling tool—the watchdog cannot know a future tool choice while text is
+streaming. Repeated tool-only polling remains bounded, and the independent
+active-runtime limit bounds a model that keeps producing real content.
+
+Nested workflow and parallel branch activity inside the same Petri run counts
+for that run. A separately scheduled Fabro child run has its own watchdog and
+does not refresh its parent's clock. The parent must therefore gather useful
+child work within its budget; repeated status or gather polling remains
+bounded.
 
 Both clocks park for an explicit pause and when every currently running firing
 is waiting for real human launch approval or input. A parallel branch that is
