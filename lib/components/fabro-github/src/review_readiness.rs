@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context as _, bail};
 use chrono::Utc;
 use fabro_types::{ReviewReadiness, ReviewReadinessStatus};
@@ -21,8 +23,16 @@ query ReviewReadiness(
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       headRefOid
+      author { id }
       reviewThreads(first: 100, after: $threadCursor) {
-        nodes { isResolved }
+        nodes {
+          id
+          isResolved
+          comments(last: 100) {
+            nodes { id body author { id __typename } }
+            pageInfo { hasPreviousPage startCursor }
+          }
+        }
         pageInfo { hasNextPage endCursor }
       }
       commits(last: 1) {
@@ -35,6 +45,55 @@ query ReviewReadiness(
             }
           }
         }
+      }
+    }
+  }
+}
+";
+
+const THREAD_COMMENTS_QUERY: &str = r"
+query ReviewThreadComments($threadId: ID!, $before: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(last: 100, before: $before) {
+        nodes { id body author { id __typename } }
+        pageInfo { hasPreviousPage startCursor }
+      }
+    }
+  }
+}
+";
+
+const TOP_LEVEL_COMMENTS_QUERY: &str = r"
+query PullRequestComments(
+  $owner: String!,
+  $repo: String!,
+  $number: Int!,
+  $before: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      comments(last: 100, before: $before) {
+        nodes { id body author { id __typename } }
+        pageInfo { hasPreviousPage startCursor }
+      }
+    }
+  }
+}
+";
+
+const TOP_LEVEL_REVIEWS_QUERY: &str = r"
+query PullRequestReviews(
+  $owner: String!,
+  $repo: String!,
+  $number: Int!,
+  $before: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviews(last: 100, before: $before) {
+        nodes { id body state author { id __typename } }
+        pageInfo { hasPreviousPage startCursor }
       }
     }
   }
@@ -115,14 +174,246 @@ async fn collect_readiness(
             .context("GitHub did not return the pull request")?;
         let page = ReadinessPage::try_from(pull_request_data)?;
         accumulator.add_page(&page)?;
+        for thread in &page.threads.nodes {
+            if thread_awaits_response(client, token, base_url, thread, &page.author_id).await? {
+                accumulator.feedback_awaiting_response += 1;
+            }
+        }
 
         if !page.threads.page_info.has_next_page {
+            accumulator.feedback_awaiting_response += top_level_feedback_awaiting_response_count(
+                client,
+                token,
+                base_url,
+                pull_request,
+                &page.author_id,
+            )
+            .await?;
             return accumulator.finish();
         }
         thread_cursor = next_cursor(&page.threads)?;
     }
 
     bail!("GitHub review-readiness pagination exceeded {MAX_PAGES} pages")
+}
+
+async fn thread_awaits_response(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    thread: &ReviewThread,
+    pull_request_author_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(!outstanding_feedback_items(
+        client,
+        token,
+        base_url,
+        &thread.comments,
+        pull_request_author_id,
+        |before| serde_json::json!({ "threadId": thread.id, "before": before }),
+        THREAD_COMMENTS_QUERY,
+    )
+    .await?
+    .await?
+    .is_empty())
+}
+
+async fn top_level_feedback_awaiting_response_count(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    pull_request: &AuthoredPullRequest,
+    pull_request_author_id: &str,
+) -> anyhow::Result<u64> {
+    let first_page =
+        pull_request_comments_page(client, token, base_url, pull_request, None).await?;
+    let (mut feedback_items, mut handled_items) = feedback_items_and_handled(
+        client,
+        token,
+        base_url,
+        &first_page,
+        pull_request_author_id,
+        |before| {
+            serde_json::json!({
+                "owner": pull_request.owner,
+                "repo": pull_request.repo,
+                "number": pull_request.number.get(),
+                "before": before,
+            })
+        },
+        TOP_LEVEL_COMMENTS_QUERY,
+    )
+    .await?;
+    let first_review_page =
+        pull_request_reviews_page(client, token, base_url, pull_request, None).await?;
+    let (review_items, review_handled) = feedback_items_and_handled(
+        client,
+        token,
+        base_url,
+        &first_review_page,
+        pull_request_author_id,
+        |before| {
+            serde_json::json!({
+                "owner": pull_request.owner,
+                "repo": pull_request.repo,
+                "number": pull_request.number.get(),
+                "before": before,
+            })
+        },
+        TOP_LEVEL_REVIEWS_QUERY,
+    )
+    .await?;
+    feedback_items.extend(review_items);
+    handled_items.extend(review_handled);
+    feedback_items.retain(|id| !handled_items.contains(id));
+    Ok(feedback_items.len() as u64)
+}
+
+async fn outstanding_feedback_items(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    first_page: &ReverseConnection<ReviewComment>,
+    pull_request_author_id: &str,
+    variables: impl Fn(Option<String>) -> serde_json::Value,
+    query: &str,
+) -> anyhow::Result<Vec<String>> {
+    let (mut feedback_items, handled_items) = feedback_items_and_handled(
+        client,
+        token,
+        base_url,
+        first_page,
+        pull_request_author_id,
+        variables,
+        query,
+    )
+    .await?;
+    feedback_items.retain(|id| !handled_items.contains(id));
+    Ok(feedback_items)
+}
+
+async fn feedback_items_and_handled(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    first_page: &ReverseConnection<ReviewComment>,
+    pull_request_author_id: &str,
+    variables: impl Fn(Option<String>) -> serde_json::Value,
+    query: &str,
+) -> anyhow::Result<(Vec<String>, HashSet<String>)> {
+    let mut page = first_page.clone();
+    let mut feedback_items = Vec::new();
+    let mut handled_items = HashSet::new();
+    for _ in 0..MAX_PAGES {
+        record_feedback_items(
+            &page.nodes,
+            pull_request_author_id,
+            &mut feedback_items,
+            &mut handled_items,
+        );
+        if !page.page_info.has_previous_page {
+            return Ok((feedback_items, handled_items));
+        }
+        let before = previous_cursor(&page)?;
+        let variables = variables(Some(before));
+        page = if query == TOP_LEVEL_REVIEWS_QUERY {
+            reviews_page(client, token, base_url, variables).await?
+        } else {
+            comments_page(client, token, base_url, query, variables).await?
+        };
+    }
+    bail!("GitHub review-feedback pagination exceeded {MAX_PAGES} pages")
+}
+
+fn record_feedback_items(
+    comments: &[ReviewComment],
+    pull_request_author_id: &str,
+    feedback_items: &mut Vec<String>,
+    handled_items: &mut HashSet<String>,
+) {
+    for comment in comments {
+        if comment.is_reviewer_feedback(pull_request_author_id) {
+            feedback_items.push(comment.id.clone());
+        }
+        if comment.is_factory_response(pull_request_author_id) {
+            handled_items.extend(factory_feedback_targets(&comment.body).map(str::to_string));
+        }
+    }
+}
+
+async fn pull_request_comments_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    pull_request: &AuthoredPullRequest,
+    before: Option<String>,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let variables = serde_json::json!({
+        "owner": pull_request.owner,
+        "repo": pull_request.repo,
+        "number": pull_request.number.get(),
+        "before": before,
+    });
+    comments_page(client, token, base_url, TOP_LEVEL_COMMENTS_QUERY, variables).await
+}
+
+async fn pull_request_reviews_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    pull_request: &AuthoredPullRequest,
+    before: Option<String>,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let variables = serde_json::json!({
+        "owner": pull_request.owner,
+        "repo": pull_request.repo,
+        "number": pull_request.number.get(),
+        "before": before,
+    });
+    reviews_page(client, token, base_url, variables).await
+}
+
+async fn reviews_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    variables: serde_json::Value,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let response: GraphqlResponse<ReviewData> =
+        graphql(client, token, base_url, TOP_LEVEL_REVIEWS_QUERY, variables).await?;
+    complete_data(response)?
+        .repository
+        .and_then(|repository| repository.pull_request)
+        .map(|pull_request| pull_request.reviews)
+        .context("GitHub did not return pull request reviews")
+}
+
+async fn comments_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let response: GraphqlResponse<CommentsData> =
+        graphql(client, token, base_url, query, variables).await?;
+    let data = complete_data(response)?;
+    data.node
+        .and_then(|node| node.comments)
+        .or_else(|| {
+            data.repository
+                .and_then(|repository| repository.pull_request)
+                .map(|pull_request| pull_request.comments)
+        })
+        .context("GitHub did not return review comments")
+}
+
+fn previous_cursor<T>(connection: &ReverseConnection<T>) -> anyhow::Result<String> {
+    connection
+        .page_info
+        .start_cursor
+        .clone()
+        .context("GitHub pagination omitted a start cursor")
 }
 
 fn next_cursor<T>(connection: &Connection<T>) -> anyhow::Result<Option<String>> {
@@ -170,18 +461,21 @@ fn complete_data<T>(response: GraphqlResponse<T>) -> anyhow::Result<T> {
 
 fn unavailable() -> ReviewReadiness {
     ReviewReadiness {
-        status:                  ReviewReadinessStatus::Unavailable,
-        head_sha:                None,
+        status: ReviewReadinessStatus::Unavailable,
+        head_sha: None,
         unresolved_thread_count: None,
-        checked_at:              Utc::now(),
+        feedback_awaiting_response_count: None,
+        checked_at: Utc::now(),
     }
 }
 
 #[derive(Default)]
 struct ReadinessAccumulator {
-    head_sha:           Option<String>,
+    head_sha: Option<String>,
+    author_id: Option<String>,
     unresolved_threads: u64,
-    ci:                 Option<CiEvidence>,
+    feedback_awaiting_response: u64,
+    ci: Option<CiEvidence>,
 }
 
 impl ReadinessAccumulator {
@@ -196,7 +490,15 @@ impl ReadinessAccumulator {
         {
             bail!("Pull request head changed while readiness was loading")
         }
+        if self
+            .author_id
+            .as_ref()
+            .is_some_and(|author_id| author_id != &page.author_id)
+        {
+            bail!("Pull request author changed while readiness was loading")
+        }
         self.head_sha.get_or_insert_with(|| page.head_sha.clone());
+        self.author_id.get_or_insert_with(|| page.author_id.clone());
         self.ci = Some(page.ci.clone());
         self.unresolved_threads += page
             .threads
@@ -228,6 +530,7 @@ impl ReadinessAccumulator {
             status,
             head_sha: Some(head_sha),
             unresolved_thread_count: Some(self.unresolved_threads),
+            feedback_awaiting_response_count: Some(self.feedback_awaiting_response),
             checked_at: Utc::now(),
         })
     }
@@ -276,6 +579,7 @@ fn valid_sha(value: &str) -> bool {
 
 struct ReadinessPage {
     head_sha:   String,
+    author_id:  String,
     commit_sha: String,
     threads:    Connection<ReviewThread>,
     ci:         CiEvidence,
@@ -300,6 +604,7 @@ impl TryFrom<PullRequestData> for ReadinessPage {
             });
         Ok(Self {
             head_sha: pull_request.head_ref_oid,
+            author_id: pull_request.author.id,
             commit_sha: commit.oid,
             threads: pull_request.review_threads,
             ci,
@@ -328,6 +633,7 @@ struct RepositoryData {
 struct PullRequestData {
     #[serde(rename = "headRefOid")]
     head_ref_oid:   String,
+    author:         Actor,
     #[serde(rename = "reviewThreads")]
     review_threads: Connection<ReviewThread>,
     commits:        CommitConnection,
@@ -379,8 +685,112 @@ struct PageInfo {
 
 #[derive(Deserialize)]
 struct ReviewThread {
+    id:          String,
     #[serde(rename = "isResolved")]
     is_resolved: bool,
+    comments:    ReverseConnection<ReviewComment>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReviewComment {
+    id:     String,
+    body:   String,
+    #[serde(default)]
+    state:  Option<String>,
+    author: Option<Actor>,
+}
+
+impl ReviewComment {
+    fn is_reviewer_feedback(&self, pull_request_author_id: &str) -> bool {
+        self.author.as_ref().is_some_and(|author| {
+            !author.is_bot()
+                && author.id != pull_request_author_id
+                && !(self.state.as_deref() == Some("APPROVED") && self.body.trim().is_empty())
+        })
+    }
+
+    fn is_factory_response(&self, pull_request_author_id: &str) -> bool {
+        self.author
+            .as_ref()
+            .is_some_and(|author| author.id == pull_request_author_id)
+    }
+}
+
+/// Extract the IDs in Factory's deliberately narrow GitHub comment marker.
+/// Ordinary prose, including an author comment that mentions a feedback ID,
+/// is not a response signal.
+fn factory_feedback_targets(body: &str) -> impl Iterator<Item = &str> {
+    body.split("<!-- factory-feedback:")
+        .skip(1)
+        .filter_map(|tail| tail.split_once(" -->"))
+        .filter_map(|(marker, _)| marker.rsplit_once(':').map(|(_, id)| id))
+        .filter(|id| !id.is_empty())
+}
+
+#[derive(Clone, Deserialize)]
+struct Actor {
+    id:        String,
+    #[serde(rename = "__typename")]
+    type_name: String,
+}
+
+impl Actor {
+    fn is_bot(&self) -> bool {
+        self.type_name == "Bot"
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct ReverseConnection<T> {
+    nodes:     Vec<T>,
+    #[serde(rename = "pageInfo")]
+    page_info: ReversePageInfo,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReversePageInfo {
+    #[serde(rename = "hasPreviousPage")]
+    has_previous_page: bool,
+    #[serde(rename = "startCursor")]
+    start_cursor:      Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CommentsData {
+    node:       Option<CommentsNode>,
+    repository: Option<CommentsRepository>,
+}
+
+#[derive(Deserialize)]
+struct CommentsNode {
+    comments: Option<ReverseConnection<ReviewComment>>,
+}
+
+#[derive(Deserialize)]
+struct CommentsRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<CommentsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct CommentsPullRequest {
+    comments: ReverseConnection<ReviewComment>,
+}
+
+#[derive(Deserialize)]
+struct ReviewData {
+    repository: Option<ReviewRepository>,
+}
+
+#[derive(Deserialize)]
+struct ReviewRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<ReviewPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct ReviewPullRequest {
+    reviews: ReverseConnection<ReviewComment>,
 }
 
 #[cfg(test)]
@@ -427,11 +837,44 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": head,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": threads.iter()
-                                .map(|resolved| serde_json::json!({ "isResolved": resolved }))
+                                .enumerate()
+                                .map(|(index, resolved)| serde_json::json!({
+                                    "id": format!("thread-{index}"),
+                                    "isResolved": resolved,
+                                    "comments": {
+                                        "nodes": [{
+                                            "id": format!("comment-{index}"),
+                                            "body": "",
+                                            "author": {
+                                                "id": "author-id",
+                                                "__typename": "User"
+                                            }
+                                        }],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                }))
                                 .collect::<Vec<_>>(),
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
+                        },
+                        "comments": {
+                            "nodes": [],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
+                        },
+                        "reviews": {
+                            "nodes": [],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
                         },
                         "commits": {
                             "nodes": [{
@@ -520,6 +963,7 @@ mod tests {
     fn changed_head_invalidates_collected_green_evidence() {
         let page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": HEAD,
+            "author": { "id": "author-id" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -543,6 +987,7 @@ mod tests {
 
         let changed_page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": NEXT_HEAD,
+            "author": { "id": "author-id" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -577,6 +1022,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": null }
@@ -635,6 +1081,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -682,6 +1129,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": "threads-1" }
@@ -707,6 +1155,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -735,5 +1184,52 @@ mod tests {
 
         assert_eq!(readiness.status, ReviewReadinessStatus::Unavailable);
         assert_eq!(mock.request_count(), 2);
+    }
+
+    fn comment(id: &str, author_id: &str, body: &str) -> ReviewComment {
+        ReviewComment {
+            id:     id.to_string(),
+            body:   body.to_string(),
+            state:  None,
+            author: Some(Actor {
+                id:        author_id.to_string(),
+                type_name: "User".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn unrelated_author_comment_does_not_handle_top_level_feedback() {
+        let comments = [
+            comment("reviewer-comment", "reviewer", "Please fix this."),
+            comment("author-note", "author-id", "I updated the README."),
+        ];
+        let mut feedback = Vec::new();
+        let mut handled = HashSet::new();
+
+        record_feedback_items(&comments, "author-id", &mut feedback, &mut handled);
+
+        feedback.retain(|id| !handled.contains(id));
+        assert_eq!(feedback, ["reviewer-comment"]);
+    }
+
+    #[test]
+    fn factory_marker_handles_only_its_exact_feedback_item() {
+        let comments = [
+            comment("first", "reviewer", "First concern."),
+            comment("second", "reviewer", "Second concern."),
+            comment(
+                "factory-reply",
+                "author-id",
+                "<!-- factory-feedback:top-level:first -->",
+            ),
+        ];
+        let mut feedback = Vec::new();
+        let mut handled = HashSet::new();
+
+        record_feedback_items(&comments, "author-id", &mut feedback, &mut handled);
+
+        feedback.retain(|id| !handled.contains(id));
+        assert_eq!(feedback, ["second"]);
     }
 }

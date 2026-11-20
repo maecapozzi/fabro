@@ -38,10 +38,13 @@ pub enum ReviewReadinessStatus {
 /// Review-readiness evidence collected from the pull request's current head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewReadiness {
-    pub status:                  ReviewReadinessStatus,
-    pub head_sha:                Option<String>,
+    pub status: ReviewReadinessStatus,
+    pub head_sha: Option<String>,
     pub unresolved_thread_count: Option<u64>,
-    pub checked_at:              DateTime<Utc>,
+    /// Reviewer feedback whose latest meaningful comment has not yet received
+    /// a reply from the pull request author.
+    pub feedback_awaiting_response_count: Option<u64>,
+    pub checked_at: DateTime<Utc>,
 }
 
 /// Latest explicit pull request creation requested for a run.

@@ -93,6 +93,7 @@ const completeInReviewQuery = {
           status: "ready" as const,
           head_sha: "1111111111111111111111111111111111111111",
           unresolved_thread_count: 0,
+          feedback_awaiting_response_count: 0,
           checked_at: "2026-04-19T12:01:00Z",
         },
       },
@@ -326,6 +327,7 @@ describe("Runs workspace preference restoration", () => {
               ...base.review_readiness,
               status: "unresolved_comments",
               unresolved_thread_count: 2,
+              feedback_awaiting_response_count: 1,
             },
           },
           {
@@ -343,6 +345,7 @@ describe("Runs workspace preference restoration", () => {
               status: "unavailable",
               head_sha: null,
               unresolved_thread_count: null,
+              feedback_awaiting_response_count: null,
               checked_at: "2026-04-19T12:01:00Z",
             },
           },
@@ -360,6 +363,8 @@ describe("Runs workspace preference restoration", () => {
     expect(rendered).toContain("CI running");
     expect(rendered).toContain("CI failed");
     expect(rendered).toContain("2 unresolved comments");
+    expect(rendered).toContain("2 unresolved threads");
+    expect(rendered).toContain("1 awaiting response");
     expect(rendered).toContain("No checks reported");
     expect(rendered).toContain("Status unavailable");
   });
