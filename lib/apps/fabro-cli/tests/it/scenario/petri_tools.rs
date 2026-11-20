@@ -123,11 +123,9 @@ fn write_timer_parent_workspace(context: &fabro_test::TestContext) -> PathBuf {
     .expect("the workflow writes");
     std::fs::write(
         workspace.join("workflow.toml"),
-        format!(
-            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\n\
+        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run]\n\
              goal = \"Start an approved child while a native timer is pending\"\n\n\
-             [run.agent]\nfabro_tools = true\n"
-        ),
+             [run.agent]\nfabro_tools = true\n",
     )
     .expect("the settings write");
     workspace
@@ -270,26 +268,25 @@ async fn scheduler_slots_while_timer_is_pending(
             line["item"]["record"]["body"]["event"] == "step.finished"
                 && line["item"]["subject"]["node"]["name"] == "timer"
         });
-        if !timer_finished {
-            sample = Some(match sample {
-                Some(mut sample) => {
-                    sample.min_slots = sample.min_slots.min(slots);
-                    sample.max_slots = sample.max_slots.max(slots);
-                    sample.samples += 1;
-                    sample.last_observed_at_ms = observed_at_ms;
-                    sample
-                }
-                None => TimerOccupancySample {
-                    min_slots:            slots,
-                    max_slots:            slots,
-                    samples:              1,
-                    first_observed_at_ms: observed_at_ms,
-                    last_observed_at_ms:  observed_at_ms,
-                },
-            });
-        } else {
+        if timer_finished {
             return sample.expect("the timer was observed pending before it finished");
         }
+        sample = Some(match sample {
+            Some(mut sample) => {
+                sample.min_slots = sample.min_slots.min(slots);
+                sample.max_slots = sample.max_slots.max(slots);
+                sample.samples += 1;
+                sample.last_observed_at_ms = observed_at_ms;
+                sample
+            }
+            None => TimerOccupancySample {
+                min_slots:            slots,
+                max_slots:            slots,
+                samples:              1,
+                first_observed_at_ms: observed_at_ms,
+                last_observed_at_ms:  observed_at_ms,
+            },
+        });
         assert!(
             Instant::now() < deadline,
             "native timer in {parent_id} did not finish within the occupancy sampling bound"
