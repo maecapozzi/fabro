@@ -2339,7 +2339,7 @@ async fn stored_run_with_pending_interview(
 }
 
 #[tokio::test]
-async fn slack_post_question_routes_and_updates_run_channel_or_server_default() {
+async fn slack_post_question_removes_resolved_cards_and_updates_when_deletion_fails() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let selected_run = stored_run_with_pending_interview(
@@ -2388,14 +2388,25 @@ channel = "C-selected-request"
             }));
         })
         .await;
-    let selected_update = slack_api
+    let selected_delete = slack_api
         .mock_async(|when, then| {
             when.method(POST)
-                .path("/chat.update")
+                .path("/chat.delete")
                 .body_includes(r#""channel":"C-selected-returned""#)
-                .body_includes(r#""ts":"1111.0000""#)
-                .body_includes("Yes");
+                .body_includes(r#""ts":"1111.0000""#);
             then.status(200).json_body(json!({ "ok": true }));
+        })
+        .await;
+    let default_delete = slack_api
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat.delete")
+                .body_includes(r#""channel":"D-default-returned""#)
+                .body_includes(r#""ts":"2222.0000""#);
+            then.status(200).json_body(json!({
+                "ok": false,
+                "error": "cant_delete_message",
+            }));
         })
         .await;
     let default_update = slack_api
@@ -2404,23 +2415,25 @@ channel = "C-selected-request"
                 .path("/chat.update")
                 .body_includes(r#""channel":"D-default-returned""#)
                 .body_includes(r#""ts":"2222.0000""#)
-                .body_includes("No");
+                .body_includes("Answered")
+                .body_excludes("action_id");
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
     let service = SlackService {
-        client:           SlackClient::with_api_base_and_http(
+        client:              SlackClient::with_api_base_and_http(
             "xoxb-test".to_string(),
             slack_api.base_url(),
             fabro_http::test_http_client().expect("test Slack client should build"),
         ),
-        app_token:        "xapp-test".to_string(),
-        default_channel:  Some("D-default".to_string()),
-        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
-        posted_approvals: Arc::new(Mutex::new(HashMap::new())),
-        auth_identity:    Arc::new(Mutex::new(None)),
-        thread_registry:  Arc::new(ThreadRegistry::new()),
-        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+        app_token:           "xapp-test".to_string(),
+        default_channel:     Some("D-default".to_string()),
+        posted_messages:     Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals:    Arc::new(Mutex::new(HashMap::new())),
+        dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
+        auth_identity:       Arc::new(Mutex::new(None)),
+        thread_registry:     Arc::new(ThreadRegistry::new()),
+        connection:          Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
     };
 
     service
@@ -2432,6 +2445,16 @@ channel = "C-selected-request"
     selected_post.assert_async().await;
     default_post.assert_async().await;
 
+    let stale_question_post = slack_api
+        .mock_async(|when, then| {
+            when.method(POST).path("/chat.postMessage");
+            then.status(500);
+        })
+        .await;
+    service
+        .post_question(state.as_ref(), selected_run, "q-already-resolved", None)
+        .await;
+
     service
         .finish_interview(selected_run, "q-selected", "Join standup?", "Yes")
         .await;
@@ -2439,7 +2462,11 @@ channel = "C-selected-request"
         .finish_interview(default_run, "q-default", "Join standup?", "No")
         .await;
 
-    selected_update.assert_async().await;
+    selected_post.assert_calls_async(1).await;
+    default_post.assert_calls_async(1).await;
+    stale_question_post.assert_calls_async(0).await;
+    selected_delete.assert_async().await;
+    default_delete.assert_async().await;
     default_update.assert_async().await;
 }
 
@@ -8441,14 +8468,15 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
         fabro_http::test_http_client().expect("test Slack client should build"),
     );
     let posting_service = SlackService {
-        client:           client.clone(),
-        app_token:        "xapp-test".to_string(),
-        default_channel:  Some("C-approval".to_string()),
-        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
-        posted_approvals: Arc::new(Mutex::new(HashMap::new())),
-        auth_identity:    Arc::new(Mutex::new(None)),
-        thread_registry:  Arc::new(ThreadRegistry::new()),
-        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+        client:              client.clone(),
+        app_token:           "xapp-test".to_string(),
+        default_channel:     Some("C-approval".to_string()),
+        posted_messages:     Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals:    Arc::new(Mutex::new(HashMap::new())),
+        dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
+        auth_identity:       Arc::new(Mutex::new(None)),
+        thread_registry:     Arc::new(ThreadRegistry::new()),
+        connection:          Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
     };
     posting_service
         .post_launch_approval(state.as_ref(), child_run_id, Some(&child_url))
@@ -8477,13 +8505,12 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
             }));
         })
         .await;
-    let update = slack_api
+    let delete = slack_api
         .mock_async(|when, then| {
             when.method(POST)
-                .path("/chat.update")
-                .body_includes(r#""text":"Approved: Test""#)
-                .body_includes("Open task in Fabro")
-                .body_includes(&child_url);
+                .path("/chat.delete")
+                .body_includes(r#""channel":"C-approval""#)
+                .body_includes(r#""ts":"1234.5678""#);
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
@@ -8493,6 +8520,7 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
         default_channel: Some("C-approval".to_string()),
         posted_messages: Arc::new(Mutex::new(HashMap::new())),
         posted_approvals: Arc::new(Mutex::new(HashMap::new())),
+        dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
         auth_identity: Arc::new(Mutex::new(None)),
         thread_registry: Arc::new(ThreadRegistry::new()),
         connection: Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
@@ -8528,7 +8556,8 @@ async fn slack_launch_approval_posts_trusted_link_and_survives_service_restart()
         .submit_approval(Arc::clone(&state), submission.clone())
         .await;
     auth.assert_async().await;
-    update.assert_async().await;
+    delete.assert_async().await;
+    post.assert_calls_async(1).await;
 
     restarted_service
         .submit_approval(Arc::clone(&state), submission)
@@ -8633,18 +8662,19 @@ async fn child_decision_does_not_rewrite_unbound_parent_launch_questions() {
         })
         .await;
     let service = SlackService {
-        client:           SlackClient::with_api_base_and_http(
+        client:              SlackClient::with_api_base_and_http(
             "xoxb-test".to_string(),
             slack_api.base_url(),
             fabro_http::test_http_client().expect("test Slack client should build"),
         ),
-        app_token:        "xapp-test".to_string(),
-        default_channel:  Some("C-approval".to_string()),
-        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
-        posted_approvals: Arc::new(Mutex::new(HashMap::new())),
-        auth_identity:    Arc::new(Mutex::new(None)),
-        thread_registry:  Arc::new(ThreadRegistry::new()),
-        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+        app_token:           "xapp-test".to_string(),
+        default_channel:     Some("C-approval".to_string()),
+        posted_messages:     Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals:    Arc::new(Mutex::new(HashMap::new())),
+        dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
+        auth_identity:       Arc::new(Mutex::new(None)),
+        thread_registry:     Arc::new(ThreadRegistry::new()),
+        connection:          Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
     };
     let mut question = Question::new(
         "CHILD LAUNCH APPROVAL — Open the linked child and approve it.",
@@ -8708,33 +8738,36 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
         create_pending_worker_child(&app, &user_jwt, parent_run_id, &worker_token).await;
 
     let slack_api = MockServer::start_async().await;
-    let approved_update = slack_api
+    let no_new_post = slack_api
+        .mock_async(|when, then| {
+            when.method(POST).path("/chat.postMessage");
+            then.status(500);
+        })
+        .await;
+    let approved_delete = slack_api
         .mock_async(|when, then| {
             when.method(POST)
-                .path("/chat.update")
-                .body_includes(r#""text":"Approved: Child A""#)
-                .body_includes("Approved")
-                .body_includes("Open task in Fabro");
+                .path("/chat.delete")
+                .body_includes(r#""channel":"C-approved""#)
+                .body_includes(r#""ts":"1111.0000""#);
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
-    let denied_update = slack_api
+    let denied_delete = slack_api
         .mock_async(|when, then| {
             when.method(POST)
-                .path("/chat.update")
-                .body_includes(r#""text":"Denied: Child B""#)
-                .body_includes("Denied")
-                .body_includes("Open task in Fabro");
+                .path("/chat.delete")
+                .body_includes(r#""channel":"C-denied""#)
+                .body_includes(r#""ts":"2222.0000""#);
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
-    let stale_click_update = slack_api
+    let stale_click_delete = slack_api
         .mock_async(|when, then| {
             when.method(POST)
-                .path("/chat.update")
-                .body_includes(r#""text":"Approved: Child C""#)
-                .body_includes("Approved")
-                .body_excludes(r#""text":"Denied: Child C""#);
+                .path("/chat.delete")
+                .body_includes(r#""channel":"C-web-approved""#)
+                .body_includes(r#""ts":"3333.0000""#);
             then.status(200).json_body(json!({ "ok": true }));
         })
         .await;
@@ -8749,15 +8782,15 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
         })
         .await;
     let service = SlackService {
-        client:           SlackClient::with_api_base_and_http(
+        client:              SlackClient::with_api_base_and_http(
             "xoxb-test".to_string(),
             slack_api.base_url(),
             fabro_http::test_http_client().expect("test Slack client should build"),
         ),
-        app_token:        "xapp-test".to_string(),
-        default_channel:  Some("C-approval".to_string()),
-        posted_messages:  Arc::new(Mutex::new(HashMap::new())),
-        posted_approvals: Arc::new(Mutex::new(HashMap::from([
+        app_token:           "xapp-test".to_string(),
+        default_channel:     Some("C-approval".to_string()),
+        posted_messages:     Arc::new(Mutex::new(HashMap::new())),
+        posted_approvals:    Arc::new(Mutex::new(HashMap::from([
             (approved_child, SlackPostedApproval {
                 message:     SlackPostedMessage {
                     channel_id: "C-approved".to_string(),
@@ -8786,9 +8819,10 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
                 run_web_url: format!("https://fabro.example/runs/{web_approved_child}"),
             }),
         ]))),
-        auth_identity:    Arc::new(Mutex::new(None)),
-        thread_registry:  Arc::new(ThreadRegistry::new()),
-        connection:       Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
+        dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
+        auth_identity:       Arc::new(Mutex::new(None)),
+        thread_registry:     Arc::new(ThreadRegistry::new()),
+        connection:          Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
     };
     let actor = Principal::Slack {
         team_id:   "T123".to_string(),
@@ -8866,8 +8900,9 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
         .submit_approval(Arc::clone(&state), approve.clone())
         .await;
     auth.assert_calls_async(1).await;
-    approved_update.assert_async().await;
+    approved_delete.assert_async().await;
     service.submit_approval(Arc::clone(&state), approve).await;
+    approved_delete.assert_calls_async(1).await;
 
     let response = app
         .clone()
@@ -8890,8 +8925,9 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
     service
         .submit_approval(Arc::clone(&state), deny.clone())
         .await;
-    denied_update.assert_async().await;
+    denied_delete.assert_async().await;
     service.submit_approval(Arc::clone(&state), deny).await;
+    denied_delete.assert_calls_async(1).await;
 
     let response = app
         .clone()
@@ -8927,7 +8963,8 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
             ),
         )
         .await;
-    stale_click_update.assert_async().await;
+    stale_click_delete.assert_async().await;
+    stale_click_delete.assert_calls_async(1).await;
 
     let approved = run_records::require_projection(state.as_ref(), approved_child)
         .await
@@ -8953,6 +8990,7 @@ async fn slack_launch_decision_is_bound_to_registered_message_and_first_decision
             .map(|approval| approval.state),
         Some(fabro_types::RunApprovalState::Approved)
     );
+    no_new_post.assert_calls_async(0).await;
 }
 
 #[tokio::test]
