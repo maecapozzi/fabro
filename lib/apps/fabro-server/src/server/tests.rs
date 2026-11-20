@@ -11131,6 +11131,86 @@ fn blocked_parent_releases_its_slot_for_a_runnable_child() {
     assert!(runs[&child_id].scheduler_slot_held);
 }
 
+#[test]
+fn multiple_blocked_parents_release_capacity_for_all_runnable_children() {
+    let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 2);
+    let parent_ids = [fixtures::RUN_1, fixtures::RUN_2];
+    let child_ids = [fixtures::RUN_3, fixtures::RUN_4];
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        for parent_id in parent_ids {
+            let mut parent = scheduler_test_run(RunStatus::Running);
+            parent.scheduler_slot_held = true;
+            runs.insert(parent_id, parent);
+        }
+        for child_id in child_ids {
+            runs.insert(child_id, scheduler_test_run(RunStatus::Runnable));
+        }
+    }
+
+    for parent_id in parent_ids {
+        apply_scheduler_admission_notice(
+            state.as_ref(),
+            parent_id,
+            SCHEDULER_ADMISSION_RELEASED_NOTICE,
+        );
+    }
+    let work = claim_scheduled_work(state.as_ref());
+
+    assert_eq!(work.len(), 2);
+    for child_id in child_ids {
+        assert!(
+            work.iter()
+                .any(|work| matches!(work, ScheduledWork::Start(id) if *id == child_id)),
+            "each runnable child should receive one of the released slots"
+        );
+    }
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert_eq!(
+        runs.values().filter(|run| run.scheduler_slot_held).count(),
+        2,
+        "the scheduler must remain at its configured capacity"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_run_releases_its_slot_only_after_terminal_failure() {
+    let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);
+    let cancelled_id = fixtures::RUN_1;
+    let next_id = fixtures::RUN_2;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let mut cancelled = scheduler_test_run(RunStatus::Running);
+        cancelled.scheduler_slot_held = true;
+        runs.insert(cancelled_id, cancelled);
+        runs.insert(next_id, scheduler_test_run(RunStatus::Runnable));
+    }
+
+    apply_lifecycle_to_managed_run(
+        state.as_ref(),
+        cancelled_id,
+        &RunLifecycleRecord::new(RunLifecycleKind::CancelRequested),
+    );
+    assert!(
+        claim_scheduled_work(state.as_ref()).is_empty(),
+        "active work keeps its slot until cancellation settles"
+    );
+
+    apply_lifecycle_to_managed_run(
+        state.as_ref(),
+        cancelled_id,
+        &run_records::transition(RunLifecycleKind::Failed, RunStatus::Failed {
+            reason: FailureReason::Cancelled,
+        }),
+    );
+    let work = claim_scheduled_work(state.as_ref());
+
+    assert!(matches!(work.as_slice(), [ScheduledWork::Start(id)] if *id == next_id));
+    let runs = state.runs.lock().expect("runs lock poisoned");
+    assert!(!runs[&cancelled_id].scheduler_slot_held);
+    assert!(runs[&next_id].scheduler_slot_held);
+}
+
 #[tokio::test]
 async fn blocked_parent_answer_waits_for_readmission_and_is_claimed_once() {
     let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);

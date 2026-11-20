@@ -53,6 +53,7 @@ pub(super) const POLL: Duration = Duration::from_millis(50);
 /// from the compiled `fabro` binary. Dropping it kills the process.
 pub(super) struct RunningServer {
     child:                   Option<Child>,
+    fabro_bin:               PathBuf,
     home_root:               tempfile::TempDir,
     _storage_root:           tempfile::TempDir,
     pub(super) storage_dir:  PathBuf,
@@ -80,6 +81,24 @@ impl RunningServer {
     /// `start_with`, plus `env` on the server process: the test hooks the
     /// server forwards to its workers by name.
     pub(super) async fn start_with_env(
+        settings: &str,
+        secrets: &[(&str, &str)],
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::start_with_binary_and_env(
+            Path::new(env!("CARGO_BIN_EXE_fabro")),
+            settings,
+            secrets,
+            env,
+        )
+        .await
+    }
+
+    /// `start_with_env`, using an explicit binary for both the server and its
+    /// workers. This keeps before/after native measurements isolated from the
+    /// installed runtime.
+    pub(super) async fn start_with_binary_and_env(
+        fabro_bin: &Path,
         settings: &str,
         secrets: &[(&str, &str)],
         env: &[(&str, &str)],
@@ -114,6 +133,7 @@ impl RunningServer {
         std::fs::create_dir_all(&gates_dir).expect("the gates dir creates");
         let mut server = Self {
             child: None,
+            fabro_bin: fabro_bin.to_path_buf(),
             home_root,
             _storage_root: storage_root,
             storage_dir,
@@ -139,7 +159,7 @@ impl RunningServer {
     /// ordinary launch returns to the original environment.
     pub(super) async fn launch_with_env(&mut self, env: &[(&str, &str)]) {
         assert!(self.child.is_none(), "the server is already running");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fabro"));
+        let mut cmd = Command::new(&self.fabro_bin);
         apply_test_isolation(&mut cmd, self.home_root.path());
         // The resume scenario restarts the server: its object store must
         // outlive the process.
@@ -208,7 +228,7 @@ impl RunningServer {
     }
 
     pub(super) fn shutdown(mut self) {
-        let mut stop = Command::new(env!("CARGO_BIN_EXE_fabro"));
+        let mut stop = Command::new(&self.fabro_bin);
         apply_test_isolation(&mut stop, self.home_root.path());
         stop.args(["server", "stop"])
             .arg("--storage-dir")
