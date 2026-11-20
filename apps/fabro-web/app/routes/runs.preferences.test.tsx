@@ -295,6 +295,8 @@ describe("Runs workspace preference restoration", () => {
     expect(rendered).toContain("Show authored pull requests on Runs");
     expect(rendered).toContain("Draft");
     expect(rendered).toContain("Ready for your review");
+    expect(rendered).toContain("0 unresolved threads");
+    expect(rendered).toContain("0 awaiting response");
     expect(rendered).toContain("Open qlty/fabro pull request 42 on GitHub");
     expect(rendered).toContain("run-1".slice(-6));
   });
@@ -367,6 +369,23 @@ describe("Runs workspace preference restoration", () => {
     expect(rendered).toContain("1 awaiting response");
     expect(rendered).toContain("No checks reported");
     expect(rendered).toContain("Status unavailable");
+    expect(rendered).toContain("Review feedback counts unavailable");
+  });
+
+  test("the In review column shows loading without rendering false zero counts", async () => {
+    inReviewQuery = {
+      data:      undefined,
+      isLoading: true,
+      error:     undefined,
+    };
+
+    const { renderer } = await renderRuns("/runs?view=columns");
+    await flushEffects();
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("Loading pull requests");
+    expect(rendered).not.toContain("0 unresolved threads");
+    expect(rendered).not.toContain("0 awaiting response");
   });
 
   test("a failed refresh suppresses a previously ready marker and leaves run columns usable", async () => {
@@ -387,6 +406,8 @@ describe("Runs workspace preference restoration", () => {
     const rendered = JSON.stringify(renderer.toJSON());
     expect(rendered).toContain("Open pull requests are unavailable");
     expect(rendered).not.toContain("Ready for your review");
+    expect(rendered).not.toContain("0 unresolved threads");
+    expect(rendered).not.toContain("0 awaiting response");
     expect(rendered).toContain("Run run-1");
     expect(rendered).toContain("Succeeded");
   });

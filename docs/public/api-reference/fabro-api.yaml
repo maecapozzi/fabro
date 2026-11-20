@@ -7836,9 +7836,10 @@ components:
               minimum: 0
             - type: "null"
           description: >-
-            Count of review threads and the top-level pull request discussion
-            whose latest meaningful comment is not from the pull request
-            author, or null when feedback data was unavailable.
+            Count of unresolved review threads and top-level reviewer feedback
+            items that have neither been resolved nor received a marker-linked
+            response from the pull request author or authenticated Factory
+            identity, or null when complete feedback data was unavailable.
         checked_at:
           type: string
           format: date-time

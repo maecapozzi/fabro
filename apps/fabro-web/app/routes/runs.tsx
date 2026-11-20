@@ -744,7 +744,7 @@ function ReviewReadinessMarker({ pullRequest }: { pullRequest: InReviewPullReque
       {unresolved === null || awaitingResponse === null ? (
         <p className="text-[11px] text-fg-muted">Review feedback counts unavailable</p>
       ) : (
-        <p className="text-[11px] text-fg-muted" aria-label="Review feedback counts">
+        <p className="text-[11px] text-fg-muted">
           {unresolved} unresolved {unresolved === 1 ? "thread" : "threads"} · {awaitingResponse} awaiting{" "}
           response
         </p>

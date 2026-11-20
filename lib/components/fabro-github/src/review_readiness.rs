@@ -20,16 +20,17 @@ query ReviewReadiness(
   $number: Int!,
   $threadCursor: String
 ) {
+  viewer { login }
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       headRefOid
-      author { id }
+      author { login __typename }
       reviewThreads(first: 100, after: $threadCursor) {
         nodes {
           id
           isResolved
           comments(last: 100) {
-            nodes { id body author { id __typename } }
+            nodes { databaseId body author { login __typename } }
             pageInfo { hasPreviousPage startCursor }
           }
         }
@@ -56,7 +57,7 @@ query ReviewThreadComments($threadId: ID!, $before: String) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {
       comments(last: 100, before: $before) {
-        nodes { id body author { id __typename } }
+        nodes { databaseId body author { login __typename } }
         pageInfo { hasPreviousPage startCursor }
       }
     }
@@ -74,7 +75,7 @@ query PullRequestComments(
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       comments(last: 100, before: $before) {
-        nodes { id body author { id __typename } }
+        nodes { databaseId body author { login __typename } }
         pageInfo { hasPreviousPage startCursor }
       }
     }
@@ -92,7 +93,7 @@ query PullRequestReviews(
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       reviews(last: 100, before: $before) {
-        nodes { id body state author { id __typename } }
+        nodes { databaseId body author { login __typename } }
         pageInfo { hasPreviousPage startCursor }
       }
     }
@@ -168,14 +169,17 @@ async fn collect_readiness(
         let response: GraphqlResponse<ReadinessData> =
             graphql(client, token, base_url, READINESS_QUERY, variables).await?;
         let data = complete_data(response)?;
+        let factory_login = data.viewer.login;
         let pull_request_data = data
             .repository
             .and_then(|repository| repository.pull_request)
             .context("GitHub did not return the pull request")?;
-        let page = ReadinessPage::try_from(pull_request_data)?;
+        let page = ReadinessPage::try_from((pull_request_data, factory_login))?;
         accumulator.add_page(&page)?;
         for thread in &page.threads.nodes {
-            if thread_awaits_response(client, token, base_url, thread, &page.author_id).await? {
+            if thread_awaits_response(client, token, base_url, thread, &page.response_identities)
+                .await?
+            {
                 accumulator.feedback_awaiting_response += 1;
             }
         }
@@ -186,7 +190,7 @@ async fn collect_readiness(
                 token,
                 base_url,
                 pull_request,
-                &page.author_id,
+                &page.response_identities,
             )
             .await?;
             return accumulator.finish();
@@ -202,18 +206,22 @@ async fn thread_awaits_response(
     token: &str,
     base_url: &str,
     thread: &ReviewThread,
-    pull_request_author_id: &str,
+    response_identities: &ResponseIdentities,
 ) -> anyhow::Result<bool> {
+    if thread.is_resolved {
+        return Ok(false);
+    }
+
     Ok(!outstanding_feedback_items(
         client,
         token,
         base_url,
         &thread.comments,
-        pull_request_author_id,
+        response_identities,
+        FeedbackKind::Inline,
         |before| serde_json::json!({ "threadId": thread.id, "before": before }),
         THREAD_COMMENTS_QUERY,
     )
-    .await?
     .await?
     .is_empty())
 }
@@ -223,7 +231,7 @@ async fn top_level_feedback_awaiting_response_count(
     token: &str,
     base_url: &str,
     pull_request: &AuthoredPullRequest,
-    pull_request_author_id: &str,
+    response_identities: &ResponseIdentities,
 ) -> anyhow::Result<u64> {
     let first_page =
         pull_request_comments_page(client, token, base_url, pull_request, None).await?;
@@ -232,7 +240,8 @@ async fn top_level_feedback_awaiting_response_count(
         token,
         base_url,
         &first_page,
-        pull_request_author_id,
+        response_identities,
+        FeedbackKind::Comment,
         |before| {
             serde_json::json!({
                 "owner": pull_request.owner,
@@ -251,7 +260,8 @@ async fn top_level_feedback_awaiting_response_count(
         token,
         base_url,
         &first_review_page,
-        pull_request_author_id,
+        response_identities,
+        FeedbackKind::Review,
         |before| {
             serde_json::json!({
                 "owner": pull_request.owner,
@@ -265,7 +275,7 @@ async fn top_level_feedback_awaiting_response_count(
     .await?;
     feedback_items.extend(review_items);
     handled_items.extend(review_handled);
-    feedback_items.retain(|id| !handled_items.contains(id));
+    feedback_items.retain(|key| !handled_items.contains(key));
     Ok(feedback_items.len() as u64)
 }
 
@@ -274,21 +284,23 @@ async fn outstanding_feedback_items(
     token: &str,
     base_url: &str,
     first_page: &ReverseConnection<ReviewComment>,
-    pull_request_author_id: &str,
+    response_identities: &ResponseIdentities,
+    feedback_kind: FeedbackKind,
     variables: impl Fn(Option<String>) -> serde_json::Value,
     query: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<FeedbackKey>> {
     let (mut feedback_items, handled_items) = feedback_items_and_handled(
         client,
         token,
         base_url,
         first_page,
-        pull_request_author_id,
+        response_identities,
+        feedback_kind,
         variables,
         query,
     )
     .await?;
-    feedback_items.retain(|id| !handled_items.contains(id));
+    feedback_items.retain(|key| !handled_items.contains(key));
     Ok(feedback_items)
 }
 
@@ -297,17 +309,19 @@ async fn feedback_items_and_handled(
     token: &str,
     base_url: &str,
     first_page: &ReverseConnection<ReviewComment>,
-    pull_request_author_id: &str,
+    response_identities: &ResponseIdentities,
+    feedback_kind: FeedbackKind,
     variables: impl Fn(Option<String>) -> serde_json::Value,
     query: &str,
-) -> anyhow::Result<(Vec<String>, HashSet<String>)> {
+) -> anyhow::Result<(Vec<FeedbackKey>, HashSet<FeedbackKey>)> {
     let mut page = first_page.clone();
     let mut feedback_items = Vec::new();
     let mut handled_items = HashSet::new();
     for _ in 0..MAX_PAGES {
         record_feedback_items(
             &page.nodes,
-            pull_request_author_id,
+            response_identities,
+            feedback_kind,
             &mut feedback_items,
             &mut handled_items,
         );
@@ -327,16 +341,20 @@ async fn feedback_items_and_handled(
 
 fn record_feedback_items(
     comments: &[ReviewComment],
-    pull_request_author_id: &str,
-    feedback_items: &mut Vec<String>,
-    handled_items: &mut HashSet<String>,
+    response_identities: &ResponseIdentities,
+    feedback_kind: FeedbackKind,
+    feedback_items: &mut Vec<FeedbackKey>,
+    handled_items: &mut HashSet<FeedbackKey>,
 ) {
     for comment in comments {
-        if comment.is_reviewer_feedback(pull_request_author_id) {
-            feedback_items.push(comment.id.clone());
+        if comment.is_reviewer_feedback(response_identities, feedback_kind) {
+            feedback_items.push(FeedbackKey {
+                kind:        feedback_kind,
+                database_id: comment.database_id,
+            });
         }
-        if comment.is_factory_response(pull_request_author_id) {
-            handled_items.extend(factory_feedback_targets(&comment.body).map(str::to_string));
+        if comment.is_factory_response(response_identities) {
+            handled_items.extend(factory_feedback_targets(&comment.body));
         }
     }
 }
@@ -472,7 +490,7 @@ fn unavailable() -> ReviewReadiness {
 #[derive(Default)]
 struct ReadinessAccumulator {
     head_sha: Option<String>,
-    author_id: Option<String>,
+    response_identities: Option<ResponseIdentities>,
     unresolved_threads: u64,
     feedback_awaiting_response: u64,
     ci: Option<CiEvidence>,
@@ -491,14 +509,15 @@ impl ReadinessAccumulator {
             bail!("Pull request head changed while readiness was loading")
         }
         if self
-            .author_id
+            .response_identities
             .as_ref()
-            .is_some_and(|author_id| author_id != &page.author_id)
+            .is_some_and(|identities| identities != &page.response_identities)
         {
-            bail!("Pull request author changed while readiness was loading")
+            bail!("Pull request response identities changed while readiness was loading")
         }
         self.head_sha.get_or_insert_with(|| page.head_sha.clone());
-        self.author_id.get_or_insert_with(|| page.author_id.clone());
+        self.response_identities
+            .get_or_insert_with(|| page.response_identities.clone());
         self.ci = Some(page.ci.clone());
         self.unresolved_threads += page
             .threads
@@ -578,17 +597,19 @@ fn valid_sha(value: &str) -> bool {
 }
 
 struct ReadinessPage {
-    head_sha:   String,
-    author_id:  String,
-    commit_sha: String,
-    threads:    Connection<ReviewThread>,
-    ci:         CiEvidence,
+    head_sha:            String,
+    response_identities: ResponseIdentities,
+    commit_sha:          String,
+    threads:             Connection<ReviewThread>,
+    ci:                  CiEvidence,
 }
 
-impl TryFrom<PullRequestData> for ReadinessPage {
+impl TryFrom<(PullRequestData, String)> for ReadinessPage {
     type Error = anyhow::Error;
 
-    fn try_from(pull_request: PullRequestData) -> Result<Self, Self::Error> {
+    fn try_from(
+        (pull_request, factory_login): (PullRequestData, String),
+    ) -> Result<Self, Self::Error> {
         let commit = pull_request
             .commits
             .nodes
@@ -604,7 +625,10 @@ impl TryFrom<PullRequestData> for ReadinessPage {
             });
         Ok(Self {
             head_sha: pull_request.head_ref_oid,
-            author_id: pull_request.author.id,
+            response_identities: ResponseIdentities {
+                pull_request_author_login: pull_request.author.login,
+                factory_login,
+            },
             commit_sha: commit.oid,
             threads: pull_request.review_threads,
             ci,
@@ -620,7 +644,13 @@ struct GraphqlResponse<T> {
 
 #[derive(Deserialize)]
 struct ReadinessData {
+    viewer:     Viewer,
     repository: Option<RepositoryData>,
+}
+
+#[derive(Deserialize)]
+struct Viewer {
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -693,43 +723,79 @@ struct ReviewThread {
 
 #[derive(Clone, Deserialize)]
 struct ReviewComment {
-    id:     String,
-    body:   String,
-    #[serde(default)]
-    state:  Option<String>,
-    author: Option<Actor>,
+    #[serde(rename = "databaseId")]
+    database_id: u64,
+    body:        String,
+    author:      Option<Actor>,
 }
 
 impl ReviewComment {
-    fn is_reviewer_feedback(&self, pull_request_author_id: &str) -> bool {
+    fn is_reviewer_feedback(
+        &self,
+        response_identities: &ResponseIdentities,
+        feedback_kind: FeedbackKind,
+    ) -> bool {
         self.author.as_ref().is_some_and(|author| {
             !author.is_bot()
-                && author.id != pull_request_author_id
-                && !(self.state.as_deref() == Some("APPROVED") && self.body.trim().is_empty())
+                && !response_identities.contains(&author.login)
+                && !(feedback_kind == FeedbackKind::Review && self.body.trim().is_empty())
         })
     }
 
-    fn is_factory_response(&self, pull_request_author_id: &str) -> bool {
+    fn is_factory_response(&self, response_identities: &ResponseIdentities) -> bool {
         self.author
             .as_ref()
-            .is_some_and(|author| author.id == pull_request_author_id)
+            .is_some_and(|author| response_identities.contains(&author.login))
     }
 }
 
-/// Extract the IDs in Factory's deliberately narrow GitHub comment marker.
-/// Ordinary prose, including an author comment that mentions a feedback ID,
-/// is not a response signal.
-fn factory_feedback_targets(body: &str) -> impl Iterator<Item = &str> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResponseIdentities {
+    pull_request_author_login: String,
+    factory_login:             String,
+}
+
+impl ResponseIdentities {
+    fn contains(&self, login: &str) -> bool {
+        login == self.pull_request_author_login || login == self.factory_login
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum FeedbackKind {
+    Comment,
+    Inline,
+    Review,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct FeedbackKey {
+    kind:        FeedbackKind,
+    database_id: u64,
+}
+
+/// Extract typed REST database IDs from Factory's deliberately narrow GitHub
+/// comment marker. Ordinary prose, malformed markers, unknown kinds, and
+/// GraphQL node IDs are not response signals.
+fn factory_feedback_targets(body: &str) -> impl Iterator<Item = FeedbackKey> + '_ {
     body.split("<!-- factory-feedback:")
         .skip(1)
         .filter_map(|tail| tail.split_once(" -->"))
-        .filter_map(|(marker, _)| marker.rsplit_once(':').map(|(_, id)| id))
-        .filter(|id| !id.is_empty())
+        .filter_map(|(marker, _)| {
+            let (kind, database_id) = marker.split_once(':')?;
+            if database_id.contains(':') {
+                return None;
+            }
+            let kind = kind.parse().ok()?;
+            let database_id = database_id.parse().ok()?;
+            (database_id > 0).then_some(FeedbackKey { kind, database_id })
+        })
 }
 
 #[derive(Clone, Deserialize)]
 struct Actor {
-    id:        String,
+    login:     String,
     #[serde(rename = "__typename")]
     type_name: String,
 }
@@ -834,10 +900,14 @@ mod tests {
         });
         serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": head,
-                        "author": { "id": "author-id" },
+                        "author": {
+                            "login": "author",
+                            "__typename": "User"
+                        },
                         "reviewThreads": {
                             "nodes": threads.iter()
                                 .enumerate()
@@ -846,10 +916,10 @@ mod tests {
                                     "isResolved": resolved,
                                     "comments": {
                                         "nodes": [{
-                                            "id": format!("comment-{index}"),
+                                            "databaseId": 1_000 + index,
                                             "body": "",
                                             "author": {
-                                                "id": "author-id",
+                                                "login": "author",
                                                 "__typename": "User"
                                             }
                                         }],
@@ -963,7 +1033,7 @@ mod tests {
     fn changed_head_invalidates_collected_green_evidence() {
         let page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": HEAD,
-            "author": { "id": "author-id" },
+            "author": { "login": "author", "__typename": "User" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -981,13 +1051,14 @@ mod tests {
             }
         }))
         .expect("page fixture should deserialize");
-        let page = ReadinessPage::try_from(page_data).expect("page should be valid");
+        let page = ReadinessPage::try_from((page_data, "factory".to_string()))
+            .expect("page should be valid");
         let mut accumulator = ReadinessAccumulator::default();
         accumulator.add_page(&page).expect("page should accumulate");
 
         let changed_page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": NEXT_HEAD,
-            "author": { "id": "author-id" },
+            "author": { "login": "author", "__typename": "User" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -1002,8 +1073,8 @@ mod tests {
             }
         }))
         .expect("changed-head fixture should deserialize");
-        let changed_page =
-            ReadinessPage::try_from(changed_page_data).expect("changed page should be valid");
+        let changed_page = ReadinessPage::try_from((changed_page_data, "factory".to_string()))
+            .expect("changed page should be valid");
 
         assert!(accumulator.add_page(&changed_page).is_err());
     }
@@ -1019,10 +1090,11 @@ mod tests {
         let partial = collect(&partial).await;
         let incomplete = serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
-                        "author": { "id": "author-id" },
+                        "author": { "login": "author", "__typename": "User" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": null }
@@ -1056,9 +1128,11 @@ mod tests {
     async fn missing_requested_threads_or_rollup_contexts_are_unavailable() {
         let missing_threads = serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "login": "author", "__typename": "User" },
                         "reviewThreads": null,
                         "commits": {
                             "nodes": [{
@@ -1078,10 +1152,11 @@ mod tests {
         .to_string();
         let missing_contexts = serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
-                        "author": { "id": "author-id" },
+                        "author": { "login": "author", "__typename": "User" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -1126,10 +1201,11 @@ mod tests {
     async fn missing_contexts_on_a_later_thread_page_discard_earlier_green() {
         let first_page = serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
-                        "author": { "id": "author-id" },
+                        "author": { "login": "author", "__typename": "User" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": "threads-1" }
@@ -1152,10 +1228,11 @@ mod tests {
         .to_string();
         let malformed_second_page = serde_json::json!({
             "data": {
+                "viewer": { "login": "factory" },
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
-                        "author": { "id": "author-id" },
+                        "author": { "login": "author", "__typename": "User" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -1186,50 +1263,552 @@ mod tests {
         assert_eq!(mock.request_count(), 2);
     }
 
-    fn comment(id: &str, author_id: &str, body: &str) -> ReviewComment {
+    #[tokio::test]
+    async fn collector_counts_mixed_threads_and_typed_top_level_feedback() {
+        let body = serde_json::json!({
+            "data": {
+                "viewer": { "login": "factory" },
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": HEAD,
+                        "author": { "login": "author", "__typename": "User" },
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "handled-thread",
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "databaseId": 301,
+                                                "body": "Please change this.",
+                                                "author": {
+                                                    "login": "reviewer",
+                                                    "__typename": "User"
+                                                }
+                                            },
+                                            {
+                                                "databaseId": 401,
+                                                "body": "<!-- factory-feedback:inline:301 -->",
+                                                "author": {
+                                                    "login": "factory",
+                                                    "__typename": "Bot"
+                                                }
+                                            }
+                                        ],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                },
+                                {
+                                    "id": "awaiting-thread",
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [{
+                                            "databaseId": 302,
+                                            "body": "One more concern.",
+                                            "author": {
+                                                "login": "reviewer",
+                                                "__typename": "User"
+                                            }
+                                        }],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                },
+                                {
+                                    "id": "resolved-thread",
+                                    "isResolved": true,
+                                    "comments": {
+                                        "nodes": [{
+                                            "databaseId": 303,
+                                            "body": "Resolved without a reply.",
+                                            "author": {
+                                                "login": "reviewer",
+                                                "__typename": "User"
+                                            }
+                                        }],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                },
+                                {
+                                    "id": "noise-thread",
+                                    "isResolved": false,
+                                    "comments": {
+                                        "nodes": [{
+                                            "databaseId": 304,
+                                            "body": "Automated note.",
+                                            "author": {
+                                                "login": "dependabot",
+                                                "__typename": "Bot"
+                                            }
+                                        }],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                }
+                            ],
+                            "pageInfo": { "hasNextPage": false, "endCursor": null }
+                        },
+                        "comments": {
+                            "nodes": [
+                                {
+                                    "databaseId": 101,
+                                    "body": "Top-level concern.",
+                                    "author": {
+                                        "login": "reviewer",
+                                        "__typename": "User"
+                                    }
+                                },
+                                {
+                                    "databaseId": 102,
+                                    "body": "Handled concern.",
+                                    "author": {
+                                        "login": "reviewer",
+                                        "__typename": "User"
+                                    }
+                                },
+                                {
+                                    "databaseId": 501,
+                                    "body": "<!-- factory-feedback:comment:102 --> \
+                                             <!-- factory-feedback:review:101 -->",
+                                    "author": {
+                                        "login": "author",
+                                        "__typename": "User"
+                                    }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
+                        },
+                        "reviews": {
+                            "nodes": [
+                                {
+                                    "databaseId": 101,
+                                    "body": "Review summary with the same REST ID.",
+                                    "author": {
+                                        "login": "reviewer",
+                                        "__typename": "User"
+                                    }
+                                },
+                                {
+                                    "databaseId": 103,
+                                    "body": "",
+                                    "author": {
+                                        "login": "reviewer",
+                                        "__typename": "User"
+                                    }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
+                        },
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                    "oid": HEAD,
+                                    "statusCheckRollup": {
+                                        "state": "SUCCESS",
+                                        "contexts": { "totalCount": 1 }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let mock = MockHttpClient::new().on(HttpMethod::Post, "/graphql", 200, &body);
+
+        let readiness = collect_readiness(&mock, "secret", "", &pull_request())
+            .await
+            .expect("mixed review evidence should load");
+
+        assert_eq!(readiness.status, ReviewReadinessStatus::UnresolvedComments);
+        assert_eq!(readiness.unresolved_thread_count, Some(3));
+        assert_eq!(readiness.feedback_awaiting_response_count, Some(2));
+        assert_eq!(mock.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn collector_follows_every_successful_pagination_connection() {
+        let readiness_page = |has_next_page: bool, thread_nodes: serde_json::Value| {
+            serde_json::json!({
+                "data": {
+                    "viewer": { "login": "factory" },
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": HEAD,
+                            "author": { "login": "author", "__typename": "User" },
+                            "reviewThreads": {
+                                "nodes": thread_nodes,
+                                "pageInfo": {
+                                    "hasNextPage": has_next_page,
+                                    "endCursor": has_next_page.then_some("threads-2")
+                                }
+                            },
+                            "commits": {
+                                "nodes": [{
+                                    "commit": {
+                                        "oid": HEAD,
+                                        "statusCheckRollup": {
+                                            "state": "SUCCESS",
+                                            "contexts": { "totalCount": 1 }
+                                        }
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+        let first_readiness_page = readiness_page(true, serde_json::json!([]));
+        let second_readiness_page = readiness_page(
+            false,
+            serde_json::json!([{
+                "id": "thread-1",
+                "isResolved": false,
+                "comments": {
+                    "nodes": [{
+                        "databaseId": 401,
+                        "body": "<!-- factory-feedback:inline:301 -->",
+                        "author": { "login": "factory", "__typename": "Bot" }
+                    }],
+                    "pageInfo": {
+                        "hasPreviousPage": true,
+                        "startCursor": "inline-previous"
+                    }
+                }
+            }]),
+        );
+        let previous_inline_page = serde_json::json!({
+            "data": {
+                "node": {
+                    "comments": {
+                        "nodes": [{
+                            "databaseId": 301,
+                            "body": "Inline concern.",
+                            "author": { "login": "reviewer", "__typename": "User" }
+                        }],
+                        "pageInfo": {
+                            "hasPreviousPage": false,
+                            "startCursor": null
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let latest_comment_page = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "comments": {
+                            "nodes": [{
+                                "databaseId": 501,
+                                "body": "<!-- factory-feedback:comment:101 -->",
+                                "author": { "login": "author", "__typename": "User" }
+                            }],
+                            "pageInfo": {
+                                "hasPreviousPage": true,
+                                "startCursor": "comment-previous"
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let previous_comment_page = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "comments": {
+                            "nodes": [{
+                                "databaseId": 101,
+                                "body": "Top-level concern.",
+                                "author": { "login": "reviewer", "__typename": "User" }
+                            }],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let latest_review_page = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "nodes": [{
+                                "databaseId": 601,
+                                "body": "<!-- factory-feedback:review:201 -->",
+                                "author": { "login": "factory", "__typename": "Bot" }
+                            }],
+                            "pageInfo": {
+                                "hasPreviousPage": true,
+                                "startCursor": "review-previous"
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let previous_review_page = serde_json::json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviews": {
+                            "nodes": [{
+                                "databaseId": 201,
+                                "body": "Review summary.",
+                                "author": { "login": "reviewer", "__typename": "User" }
+                            }],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let mock = MockHttpClient::new()
+            .on_once(HttpMethod::Post, "/graphql", 200, &first_readiness_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &second_readiness_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &previous_inline_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &latest_comment_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &previous_comment_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &latest_review_page)
+            .on_once(HttpMethod::Post, "/graphql", 200, &previous_review_page);
+
+        let readiness = collect_readiness(&mock, "secret", "", &pull_request())
+            .await
+            .expect("paginated review evidence should load");
+
+        assert_eq!(readiness.unresolved_thread_count, Some(1));
+        assert_eq!(readiness.feedback_awaiting_response_count, Some(0));
+        assert_eq!(mock.request_count(), 7);
+    }
+
+    fn comment(database_id: u64, login: &str, type_name: &str, body: &str) -> ReviewComment {
         ReviewComment {
-            id:     id.to_string(),
-            body:   body.to_string(),
-            state:  None,
+            database_id,
+            body: body.to_string(),
             author: Some(Actor {
-                id:        author_id.to_string(),
-                type_name: "User".to_string(),
+                login:     login.to_string(),
+                type_name: type_name.to_string(),
             }),
+        }
+    }
+
+    fn response_identities() -> ResponseIdentities {
+        ResponseIdentities {
+            pull_request_author_login: "author".to_string(),
+            factory_login:             "factory".to_string(),
         }
     }
 
     #[test]
     fn unrelated_author_comment_does_not_handle_top_level_feedback() {
         let comments = [
-            comment("reviewer-comment", "reviewer", "Please fix this."),
-            comment("author-note", "author-id", "I updated the README."),
+            comment(101, "reviewer", "User", "Please fix this."),
+            comment(201, "author", "User", "I updated the README."),
         ];
         let mut feedback = Vec::new();
         let mut handled = HashSet::new();
 
-        record_feedback_items(&comments, "author-id", &mut feedback, &mut handled);
+        record_feedback_items(
+            &comments,
+            &response_identities(),
+            FeedbackKind::Comment,
+            &mut feedback,
+            &mut handled,
+        );
 
-        feedback.retain(|id| !handled.contains(id));
-        assert_eq!(feedback, ["reviewer-comment"]);
+        feedback.retain(|key| !handled.contains(key));
+        assert_eq!(feedback, [FeedbackKey {
+            kind:        FeedbackKind::Comment,
+            database_id: 101,
+        }]);
     }
 
     #[test]
-    fn factory_marker_handles_only_its_exact_feedback_item() {
+    fn author_and_factory_markers_handle_only_exact_typed_feedback_items() {
         let comments = [
-            comment("first", "reviewer", "First concern."),
-            comment("second", "reviewer", "Second concern."),
+            comment(101, "reviewer", "User", "First concern."),
+            comment(102, "reviewer", "User", "Second concern."),
             comment(
-                "factory-reply",
-                "author-id",
-                "<!-- factory-feedback:top-level:first -->",
+                201,
+                "factory",
+                "Bot",
+                "<!-- factory-feedback:comment:101 -->",
+            ),
+            comment(
+                202,
+                "author",
+                "User",
+                "<!-- factory-feedback:review:102 -->",
             ),
         ];
         let mut feedback = Vec::new();
         let mut handled = HashSet::new();
 
-        record_feedback_items(&comments, "author-id", &mut feedback, &mut handled);
+        record_feedback_items(
+            &comments,
+            &response_identities(),
+            FeedbackKind::Comment,
+            &mut feedback,
+            &mut handled,
+        );
 
-        feedback.retain(|id| !handled.contains(id));
-        assert_eq!(feedback, ["second"]);
+        feedback.retain(|key| !handled.contains(key));
+        assert_eq!(feedback, [FeedbackKey {
+            kind:        FeedbackKind::Comment,
+            database_id: 102,
+        }]);
+        assert!(handled.contains(&FeedbackKey {
+            kind:        FeedbackKind::Review,
+            database_id: 102,
+        }));
+    }
+
+    #[test]
+    fn malformed_unknown_and_graphql_id_markers_are_ignored() {
+        let targets = factory_feedback_targets(
+            "<!-- factory-feedback:inline:501 --> \
+             <!-- factory-feedback:thread:502 --> \
+             <!-- factory-feedback:comment:MDExOlB1bGxSZXF1ZXN0 --> \
+             <!-- factory-feedback:review:0 --> \
+             <!-- factory-feedback:comment:503:extra -->",
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(targets, [FeedbackKey {
+            kind:        FeedbackKind::Inline,
+            database_id: 501,
+        }]);
+    }
+
+    #[test]
+    fn empty_reviews_and_self_or_bot_comments_are_not_feedback() {
+        let comments = [
+            comment(101, "reviewer", "User", ""),
+            comment(102, "author", "User", "self"),
+            comment(103, "factory", "Bot", "factory"),
+            comment(104, "dependabot", "Bot", "automated"),
+        ];
+        let mut feedback = Vec::new();
+        let mut handled = HashSet::new();
+
+        record_feedback_items(
+            &comments,
+            &response_identities(),
+            FeedbackKind::Review,
+            &mut feedback,
+            &mut handled,
+        );
+
+        assert!(feedback.is_empty());
+        assert!(handled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_thread_handles_feedback_without_a_marker() {
+        let thread = ReviewThread {
+            id:          "thread-1".to_string(),
+            is_resolved: true,
+            comments:    ReverseConnection {
+                nodes:     vec![comment(301, "reviewer", "User", "Please change this.")],
+                page_info: ReversePageInfo {
+                    has_previous_page: false,
+                    start_cursor:      None,
+                },
+            },
+        };
+
+        let awaits_response = thread_awaits_response(
+            &MockHttpClient::new(),
+            "secret",
+            "",
+            &thread,
+            &response_identities(),
+        )
+        .await
+        .expect("resolved thread should be handled");
+
+        assert!(!awaits_response);
+    }
+
+    #[tokio::test]
+    async fn reviewer_follow_up_after_factory_reply_awaits_another_response() {
+        let comments = vec![
+            comment(301, "reviewer", "User", "Please change this."),
+            comment(
+                401,
+                "factory",
+                "Bot",
+                "Done. <!-- factory-feedback:inline:301 -->",
+            ),
+        ];
+        let mut thread = ReviewThread {
+            id:          "thread-1".to_string(),
+            is_resolved: false,
+            comments:    ReverseConnection {
+                nodes:     comments,
+                page_info: ReversePageInfo {
+                    has_previous_page: false,
+                    start_cursor:      None,
+                },
+            },
+        };
+
+        let handled = thread_awaits_response(
+            &MockHttpClient::new(),
+            "secret",
+            "",
+            &thread,
+            &response_identities(),
+        )
+        .await
+        .expect("thread should load");
+        thread
+            .comments
+            .nodes
+            .push(comment(302, "reviewer", "User", "One more thing."));
+        let followed_up = thread_awaits_response(
+            &MockHttpClient::new(),
+            "secret",
+            "",
+            &thread,
+            &response_identities(),
+        )
+        .await
+        .expect("thread should load");
+
+        assert!(!handled);
+        assert!(followed_up);
     }
 }

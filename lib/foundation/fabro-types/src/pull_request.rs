@@ -41,8 +41,8 @@ pub struct ReviewReadiness {
     pub status: ReviewReadinessStatus,
     pub head_sha: Option<String>,
     pub unresolved_thread_count: Option<u64>,
-    /// Reviewer feedback whose latest meaningful comment has not yet received
-    /// a reply from the pull request author.
+    /// Reviewer feedback not handled by thread resolution or a marker-linked
+    /// response from the pull request author or authenticated Factory identity.
     pub feedback_awaiting_response_count: Option<u64>,
     pub checked_at: DateTime<Utc>,
 }
