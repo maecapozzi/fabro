@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640">
+  <rect width="1200" height="640" fill="#f8f8fa"/>
+  <text x="60" y="48" fill="#5c2d91" font-family="Arial, sans-serif" font-size="22" font-weight="700">OFFLINE REVIEW PREVIEW — NOT SENT TO SLACK</text>
+  <text x="60" y="82" fill="#555" font-family="Arial, sans-serif" font-size="16">Synthetic example only; no Slack API request and no real user data.</text>
+
+  <text x="60" y="136" fill="#1d1c1d" font-family="Arial, sans-serif" font-size="24" font-weight="700">Before: resolved cards remain visible</text>
+  <rect x="60" y="162" width="510" height="400" rx="10" fill="#fff" stroke="#d1d2d3"/>
+  <text x="90" y="205" fill="#1264a3" font-family="Arial, sans-serif" font-size="18" font-weight="700">Fabro</text>
+  <text x="90" y="236" fill="#1d1c1d" font-family="Arial, sans-serif" font-size="18">Example task needs approval</text>
+  <rect x="90" y="262" width="132" height="38" rx="5" fill="#e8f5fa" stroke="#1264a3"/>
+  <text x="111" y="287" fill="#1264a3" font-family="Arial, sans-serif" font-size="16" font-weight="700">Approved</text>
+  <text x="90" y="341" fill="#1264a3" font-family="Arial, sans-serif" font-size="18" font-weight="700">Fabro</text>
+  <text x="90" y="372" fill="#1d1c1d" font-family="Arial, sans-serif" font-size="18">Example question</text>
+  <rect x="90" y="398" width="128" height="38" rx="5" fill="#e8f5fa" stroke="#1264a3"/>
+  <text x="114" y="423" fill="#1264a3" font-family="Arial, sans-serif" font-size="16" font-weight="700">Answered</text>
+  <text x="90" y="505" fill="#a61b1b" font-family="Arial, sans-serif" font-size="16">Inert cards still occupy the channel.</text>
+
+  <path d="M605 360 H670" fill="none" stroke="#5c2d91" stroke-width="5"/>
+  <path d="M660 348 L682 360 L660 372" fill="none" stroke="#5c2d91" stroke-width="5"/>
+  <text x="594" y="326" fill="#5c2d91" font-family="Arial, sans-serif" font-size="15" font-weight="700">chat.delete</text>
+
+  <text x="720" y="136" fill="#1d1c1d" font-family="Arial, sans-serif" font-size="24" font-weight="700">After: no action remains</text>
+  <rect x="720" y="162" width="420" height="400" rx="10" fill="#fff" stroke="#d1d2d3"/>
+  <path d="M930 278 a48 48 0 1 0 0.1 0" fill="#e8f5fa"/>
+  <path d="M906 278 l17 17 l34 -39" fill="none" stroke="#1264a3" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="792" y="367" fill="#1d1c1d" font-family="Arial, sans-serif" font-size="20" font-weight="700">No action cards remain</text>
+  <text x="811" y="401" fill="#555" font-family="Arial, sans-serif" font-size="16">Resolved approval and interview cards</text>
+  <text x="867" y="426" fill="#555" font-family="Arial, sans-serif" font-size="16">are removed from the channel.</text>
+  <text x="779" y="505" fill="#166534" font-family="Arial, sans-serif" font-size="16">If deletion fails, controls are updated as fallback.</text>
+</svg>

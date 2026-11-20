@@ -123,6 +123,25 @@ impl SlackClient {
         check_ok(&json)?;
         Ok(())
     }
+
+    pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), SlackApiError> {
+        let body = build_delete_message_body(channel, ts);
+        let resp = self
+            .http
+            .post(format!("{}/chat.delete", self.api_base))
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SlackApiError::Http(e.to_string()))?;
+
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| SlackApiError::Http(e.to_string()))?;
+
+        check_ok(&json)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,6 +227,13 @@ fn build_update_message_body(
     })
 }
 
+fn build_delete_message_body(channel: &str, ts: &str) -> Value {
+    json!({
+        "channel": channel,
+        "ts": ts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +275,13 @@ mod tests {
         assert_eq!(body["ts"], "1234.5678");
         assert_eq!(body["text"], "Approved: Improve approval actions");
         assert_eq!(body["blocks"][0]["type"], "section");
+    }
+
+    #[test]
+    fn delete_message_request_body_format() {
+        let body = build_delete_message_body("#general", "1234.5678");
+        assert_eq!(body["channel"], "#general");
+        assert_eq!(body["ts"], "1234.5678");
     }
 
     #[test]
