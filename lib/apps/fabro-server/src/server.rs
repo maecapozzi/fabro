@@ -679,14 +679,15 @@ fn sanitize_integration_error(error: &str) -> String {
 
 #[derive(Clone)]
 struct SlackService {
-    client:           SlackClient,
-    app_token:        String,
-    default_channel:  Option<String>,
-    posted_messages:  Arc<Mutex<HashMap<(RunId, String), SlackPostedQuestion>>>,
-    posted_approvals: Arc<Mutex<HashMap<RunId, SlackPostedApproval>>>,
-    auth_identity:    Arc<Mutex<Option<SlackAuthIdentity>>>,
-    thread_registry:  Arc<ThreadRegistry>,
-    connection:       Arc<Mutex<SlackConnectionRuntimeState>>,
+    client:              SlackClient,
+    app_token:           String,
+    default_channel:     Option<String>,
+    posted_messages:     Arc<Mutex<HashMap<(RunId, String), SlackPostedQuestion>>>,
+    posted_approvals:    Arc<Mutex<HashMap<RunId, SlackPostedApproval>>>,
+    dismissed_approvals: Arc<Mutex<HashSet<RunId>>>,
+    auth_identity:       Arc<Mutex<Option<SlackAuthIdentity>>>,
+    thread_registry:     Arc<ThreadRegistry>,
+    connection:          Arc<Mutex<SlackConnectionRuntimeState>>,
 }
 
 impl SlackService {
@@ -697,6 +698,7 @@ impl SlackService {
             default_channel,
             posted_messages: Arc::new(Mutex::new(HashMap::new())),
             posted_approvals: Arc::new(Mutex::new(HashMap::new())),
+            dismissed_approvals: Arc::new(Mutex::new(HashSet::new())),
             auth_identity: Arc::new(Mutex::new(None)),
             thread_registry: Arc::new(ThreadRegistry::new()),
             connection: Arc::new(Mutex::new(SlackConnectionRuntimeState::default())),
@@ -1095,6 +1097,14 @@ impl SlackService {
         };
 
         self.thread_registry.remove(&posted.message.ts);
+        if self
+            .client
+            .delete_message(&posted.message.channel_id, &posted.message.ts)
+            .await
+            .is_ok()
+        {
+            return;
+        }
         let message = slack_blocks::answered_message(
             question_text,
             answer_text,
@@ -1220,6 +1230,14 @@ impl SlackService {
         decision: SlackApprovalDecision,
         actor: Option<&str>,
     ) {
+        if self
+            .dismissed_approvals
+            .lock()
+            .expect("slack dismissed approvals lock poisoned")
+            .contains(&run_id)
+        {
+            return;
+        }
         let cached = self
             .posted_approvals
             .lock()
@@ -1233,6 +1251,22 @@ impl SlackService {
         let Some(posted) = posted else {
             return;
         };
+        if self
+            .client
+            .delete_message(&posted.message.channel_id, &posted.message.ts)
+            .await
+            .is_ok()
+        {
+            self.dismissed_approvals
+                .lock()
+                .expect("slack dismissed approvals lock poisoned")
+                .insert(run_id);
+            self.posted_approvals
+                .lock()
+                .expect("slack posted approvals lock poisoned")
+                .remove(&run_id);
+            return;
+        }
         let message = slack_blocks::launch_approval_decided_message(
             slack_blocks::LaunchApprovalIdentity {
                 task:       &posted.task,
@@ -1253,6 +1287,10 @@ impl SlackService {
             .await
             .is_ok()
         {
+            self.dismissed_approvals
+                .lock()
+                .expect("slack dismissed approvals lock poisoned")
+                .insert(run_id);
             self.posted_approvals
                 .lock()
                 .expect("slack posted approvals lock poisoned")
