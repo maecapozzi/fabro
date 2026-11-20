@@ -94,6 +94,25 @@ fn scripted_model(version_id: &str) -> (lithos_llm::Client, Arc<ScriptedProvider
     ])
 }
 
+/// The scripted model saves one bounded event page, then closes the stage.
+fn scripted_events_model(run_id: RunId) -> (lithos_llm::Client, Arc<ScriptedProvider>) {
+    scripted_client(vec![
+        ScriptedCall::response(tool_call_response(
+            "fabro_run_events",
+            "events",
+            json!({
+                "action": "list",
+                "run_id": run_id,
+                "direction": "asc",
+                "first": 200,
+                "max_content_length": 262_144,
+                "output_path": ".fabro-observe/events-001.json",
+            }),
+        )),
+        ScriptedCall::response(text_response("Saved the event page.")),
+    ])
+}
+
 /// The runtime the worker would build for the run: the scripted model as
 /// the model client and `run_tools` as the run tools.
 fn runtime(
@@ -102,10 +121,11 @@ fn runtime(
     model_client: lithos_llm::Client,
     run_tools: Option<FabroRunToolServices>,
     store: &Arc<MemoryRunStore>,
+    retention: Retention,
 ) -> Runtime {
     let mut options = RunOptions::new(run_dir);
     options.grace = Duration::from_secs(2);
-    options.retention = Retention::Never;
+    options.retention = retention;
     options.echo = false;
     options.run_key = Some(RunKey::new(run_id));
     RuntimeSpec {
@@ -136,6 +156,72 @@ async fn run(rt: &Runtime, workflow: &Path) {
         report.state.errors(),
         report.state.history()
     );
+}
+
+/// The single host scope's workspace after a retained test run.
+async fn workspace(run_dir: &Path) -> PathBuf {
+    let mut entries = fs::read_dir(run_dir.join("scopes"))
+        .await
+        .expect("the run has scopes");
+    let scope = entries
+        .next_entry()
+        .await
+        .expect("the scopes directory reads")
+        .expect("the run has one scope");
+    assert!(
+        entries
+            .next_entry()
+            .await
+            .expect("the scopes directory reads")
+            .is_none(),
+        "the test run has one scope"
+    );
+    scope.path().join("work")
+}
+
+fn resolved_run_json(run_id: RunId) -> serde_json::Value {
+    json!({
+        "id": run_id,
+        "title": "native result test",
+        "goal": "save a native result",
+        "workflow": {
+            "slug": "native-result-test",
+            "name": "Native result test",
+            "graph_name": null
+        },
+        "repository": {
+            "name": "repo",
+            "origin_url": null,
+            "provider": "unknown"
+        },
+        "created_by": serde_json::to_value(types_support::test_principal())
+            .expect("the test principal serializes"),
+        "origin": {"kind": "api"},
+        "labels": {},
+        "lifecycle": {
+            "status": {"kind": "succeeded", "reason": "completed"},
+            "pending_control": null,
+            "queue_position": null,
+            "error": null,
+            "archived": false,
+            "archived_at": null
+        },
+        "models": [],
+        "source_directory": "/srv/repo",
+        "timestamps": {
+            "created_at": "2026-11-19T12:00:00Z",
+            "started_at": "2026-11-19T12:00:00Z",
+            "last_event_at": null,
+            "completed_at": null
+        },
+        "timing": null,
+        "usage": {"tokens": {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}},
+        "diff": null,
+        "pull_request": null,
+        "current_question": null,
+        "superseded_by": null,
+        "links": {"web": null}
+    })
 }
 
 /// The tools a request advertised, as `(name, description)`.
@@ -191,6 +277,7 @@ async fn a_petri_stage_calls_a_run_tool_bound_to_the_run() {
         client,
         Some(services),
         &store,
+        Retention::Never,
     );
 
     run(&rt, &workflow).await;
@@ -253,6 +340,7 @@ async fn the_projection_lists_the_stages_tools_and_marks_the_one_called() {
         client,
         Some(services(&server, run_id)),
         &store,
+        Retention::Never,
     );
 
     run(&rt, &workflow).await;
@@ -330,6 +418,106 @@ async fn the_projection_lists_the_stages_tools_and_marks_the_one_called() {
     );
 }
 
+/// The live Petri HostTools capability invokes the native adapter and saves
+/// its lossless envelope in that run's sandbox workspace.
+#[tokio::test]
+async fn a_petri_stage_saves_native_run_events_in_its_sandbox() {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let workflow = install_bundle(root.path()).await;
+    let run_id = RunId::new();
+    let server = MockServer::start_async().await;
+    let resolve = server
+        .mock_async(|when, then| {
+            when.method(Method::GET)
+                .path("/api/v1/runs/resolve")
+                .query_param("selector", run_id.to_string());
+            then.status(200).json_body(resolved_run_json(run_id));
+        })
+        .await;
+    let events = server
+        .mock_async(|when, then| {
+            when.method(Method::GET)
+                .path(format!("/api/v1/runs/{run_id}/events"));
+            then.status(200).json_body(json!({
+                "data": [{
+                    "run_id": run_id,
+                    "stream_seq": 1,
+                    "kind": "petri",
+                    "id": "coordinator/1/0",
+                    "recorded_at": 1_795_088_400_001_u64,
+                    "item": {
+                        "record": {
+                            "body": {
+                                "event": "stage.output",
+                                "content": "exact native event"
+                            }
+                        }
+                    }
+                }],
+                "meta": {"has_more": false, "total": null},
+                "event_contract_version": 3
+            }));
+        })
+        .await;
+    let (client, provider) = scripted_events_model(run_id);
+    let store = Arc::new(MemoryRunStore::new());
+    let run_dir = root.path().join("run");
+    let rt = runtime(
+        &run_dir,
+        &run_id.to_string(),
+        client,
+        Some(services(&server, run_id)),
+        &store,
+        Retention::Always,
+    );
+
+    run(&rt, &workflow).await;
+
+    events.assert_calls_async(1).await;
+    resolve.assert_calls_async(1).await;
+    let saved = fs::read_to_string(
+        workspace(&run_dir)
+            .await
+            .join(".fabro-observe/events-001.json"),
+    )
+    .await
+    .expect("the native result envelope is in the run sandbox");
+    let saved: serde_json::Value =
+        serde_json::from_str(&saved).expect("the native result envelope is JSON");
+    assert_eq!(saved["version"], 1);
+    assert_eq!(saved["tool_name"], "fabro_run_events");
+    assert_eq!(
+        saved["arguments"],
+        json!({
+            "action": "list",
+            "run_id": run_id,
+            "direction": "asc",
+            "first": 200,
+            "max_content_length": 262_144
+        })
+    );
+    assert_eq!(saved["response"]["run_id"], run_id.to_string());
+    assert_eq!(
+        saved["response"]["events"][0]["event"]["item"]["record"]["body"]["content"],
+        "exact native event"
+    );
+
+    let calls = recorded::tool_calls(store.as_ref(), &run_id.to_string(), "fabro_run_events")
+        .await
+        .expect("the record replays");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let tool_output = calls[0].payload["output"]
+        .as_str()
+        .expect("the tool completion has output");
+    assert!(tool_output.starts_with("saved Fabro run events\n"));
+    assert!(!tool_output.contains("exact native event"));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one tool call, one closing turn"
+    );
+}
+
 /// Services bound to another run give the stage no run tools: the model
 /// is not advertised them, and its call is refused as an unknown tool
 /// rather than parenting a child run to the wrong run.
@@ -354,6 +542,7 @@ async fn services_for_another_run_give_the_stage_no_run_tools() {
         client,
         Some(services),
         &store,
+        Retention::Never,
     );
 
     run(&rt, &workflow).await;

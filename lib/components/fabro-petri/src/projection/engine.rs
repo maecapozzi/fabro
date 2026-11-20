@@ -23,6 +23,28 @@ use super::sandbox::{provider_kind, sandbox_instance, sandbox_plan_of};
 use super::{FiringKey, RunView, StageRef, is_shown, node_meta_kind, stage_label, visit_of};
 
 impl RunView {
+    pub(super) fn set_invocation_branch(&mut self, invocation: u64, group: &StageId, index: u32) {
+        self.state.invocations.entry(invocation).or_default().branch = Some((group.clone(), index));
+
+        let stages: Vec<StageId> = self
+            .state
+            .stages
+            .iter()
+            .filter(|(key, stage)| {
+                stage.shown && self.state.executions.get(&key.execution) == Some(&invocation)
+            })
+            .map(|(_, stage)| stage.stage_id.clone())
+            .collect();
+        let Some(projection) = self.projection.as_mut() else {
+            return;
+        };
+        for stage_id in stages {
+            if let Some(stage) = projection.stage_mut(&stage_id) {
+                stage.parallel_branch_id = Some(ParallelBranchId::new(group.clone(), index));
+            }
+        }
+    }
+
     pub(super) fn fold_engine(&mut self, engine: &Event, event: &RunEvent, at: DateTime<Utc>) {
         let Some(execution) = event.context.execution else {
             return;

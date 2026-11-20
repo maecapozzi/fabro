@@ -53,6 +53,7 @@ impl RunView {
             }
             CoordinatorEvent::InvocationDeclared { invocation, .. } => {
                 let mut info = InvocationRef::default();
+                let mut branch = None;
                 if let Some(parent) = &event.context.parent {
                     info.parent = Some((parent.execution.raw(), parent.firing.raw()));
                     if let Some((fork_firing, index)) = branch_slot(&parent.slot) {
@@ -62,11 +63,14 @@ impl RunView {
                             .get(&FiringKey::new(parent.execution.raw(), fork_firing))
                             .map(|stage| stage.stage_id.clone());
                         if let Some(group) = group {
-                            info.branch = Some((group, index));
+                            branch = Some((group, index));
                         }
                     }
                 }
                 self.state.invocations.insert(invocation.raw(), info);
+                if let Some((group, index)) = branch {
+                    self.set_invocation_branch(invocation.raw(), &group, index);
+                }
             }
             CoordinatorEvent::ExecutionDeclared {
                 execution,

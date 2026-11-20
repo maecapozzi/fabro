@@ -46,12 +46,14 @@ chrono = { workspace = true, features = ["serde"] }
 dirs = "6"
 scopeguard = "1"
 hex.workspace = true
+sha2.workspace = true
 git2.workspace = true
 tracing.workspace = true
 tempfile = "3"
 toml.workspace = true
 fabro-vault = { path = "../../foundation/fabro-vault" }
 [dev-dependencies]
+fabro-api = { path = "../../foundation/fabro-api" }
 fabro-dump = { path = "../fabro-dump" }
 fabro-client = { path = "../../foundation/fabro-client" }
 fabro-workflow-version = { path = "../fabro-workflow-version" }

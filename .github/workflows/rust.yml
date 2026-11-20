@@ -50,7 +50,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
@@ -65,7 +65,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
@@ -95,7 +95,7 @@ jobs:
 
   rustdoc:
     name: Rustdoc
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
@@ -115,7 +115,7 @@ jobs:
 
   generated-docs:
     name: Generated Docs
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
@@ -132,7 +132,7 @@ jobs:
 
   test:
     name: Test (Linux)
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
@@ -169,7 +169,7 @@ jobs:
 
   sandbox-docker:
     name: Sandbox providers (Docker)
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     env:
@@ -224,7 +224,7 @@ jobs:
 
   process-title-musl:
     name: Process titles (musl)
-    runs-on: ubuntu-24.04-x86-32-cores
+    runs-on: ${{ github.repository == 'maecapozzi/fabro' && 'ubuntu-24.04' || 'ubuntu-24.04-x86-32-cores' }}
     permissions:
       contents: read
     steps:
