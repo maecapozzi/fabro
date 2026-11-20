@@ -59,7 +59,7 @@ use petri_execution::controls::{ControlService, LiveTurns};
 use petri_execution::{
     CoordinatorHandle, CoordinatorRecord, CoordinatorState, ExecutionId, ExecutionObserver,
 };
-use petri_frontend_attractor::kinds::AGENT_KIND;
+use petri_frontend_attractor::kinds::{AGENT_KIND, WAIT_KIND};
 use petri_runtime::driver::lifecycle::{
     AdmitAttempt, AttemptDecision, ExecutionHooks, HookContext, Note, PrepareError, PrepareResult,
     Prepared, Recorded, RunFinished, ScopeAcquired, ScopeAcquiredError, ScopeReleased, Transition,
@@ -89,6 +89,7 @@ struct SchedulerAdmissionState {
     readmission_requested: bool,
     live:                  LiveFirings,
     waiting:               BTreeSet<(ExecutionId, FiringId)>,
+    inactive:              BTreeSet<(ExecutionId, FiringId)>,
     active_subagents:      BTreeSet<(ExecutionId, FiringId, String, u64)>,
     pause_requested:       bool,
 }
@@ -135,12 +136,14 @@ impl SchedulerAdmission {
         if state.admitted
             && !state.release_reported
             && state.active_subagents.is_empty()
-            && ((state.waiting.is_empty() && state.pause_requested && state.live.is_empty())
-                || (!state.waiting.is_empty()
-                    && state
-                        .live
-                        .iter()
-                        .all(|firing| state.waiting.contains(firing))))
+            && ((state.waiting.is_empty()
+                && state.inactive.is_empty()
+                && state.pause_requested
+                && state.live.is_empty())
+                || (!(state.waiting.is_empty() && state.inactive.is_empty())
+                    && state.live.iter().all(|firing| {
+                        state.waiting.contains(firing) || state.inactive.contains(firing)
+                    })))
         {
             state.held = true;
             state.admitted = false;
@@ -171,11 +174,26 @@ impl SchedulerAdmission {
         self.state().live.insert((execution, firing));
     }
 
+    /// A native wait has no sandbox or agent work while its timer is pending.
+    /// It releases shared scheduler capacity, but retains the firing identity
+    /// so the next attempt must pass through `before_attempt` on completion.
+    fn inactive_started(&self, execution: ExecutionId, firing: FiringId) {
+        let released = {
+            let mut state = self.state();
+            state.inactive.insert((execution, firing));
+            self.report_release_if_quiescent(&mut state)
+        };
+        if released {
+            self.inner.released.notify_waiters();
+        }
+    }
+
     fn finished(&self, execution: ExecutionId, firing: FiringId) {
         let released = {
             let mut state = self.state();
             state.live.remove(&(execution, firing));
             state.waiting.remove(&(execution, firing));
+            state.inactive.remove(&(execution, firing));
             state
                 .active_subagents
                 .retain(|(active_execution, active_firing, _, _)| {
@@ -738,6 +756,11 @@ impl ExecutionObserver for RunControls {
                 else {
                     return;
                 };
+                if node.step.kind == WAIT_KIND {
+                    self.scheduler_admission
+                        .inactive_started(execution, *firing);
+                    return;
+                }
                 if node.step.kind != AGENT_KIND {
                     return;
                 }
@@ -872,6 +895,40 @@ mod tests {
 
         admission.grant();
         held.await.expect("admission task should finish");
+    }
+
+    #[tokio::test]
+    async fn native_timer_releases_capacity_and_requires_readmission_after_it_finishes() {
+        let controls = RunControls::new();
+        let admission = controls.scheduler_admission();
+        let mut events = controls
+            .take_scheduler_admission_events()
+            .expect("the test owns admission events");
+        let execution = ExecutionId::new(0);
+        let timer = FiringId::new(1);
+
+        admission.grant();
+        admission.started(execution, timer);
+        admission.inactive_started(execution, timer);
+        assert_eq!(events.recv().await, Some(SchedulerAdmissionEvent::Released));
+
+        // Completing a passive timer cannot reopen admission itself. The
+        // follow-up attempt asks the scheduler to readmit before active work.
+        admission.finished(execution, timer);
+        let held = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.before_attempt().await }
+        });
+        assert_eq!(
+            events.recv().await,
+            Some(SchedulerAdmissionEvent::ReadmissionRequested)
+        );
+        task::yield_now().await;
+        assert!(!held.is_finished());
+
+        admission.grant();
+        held.await
+            .expect("granted follow-up attempt should continue");
     }
 
     #[tokio::test]
