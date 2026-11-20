@@ -21,8 +21,16 @@ query ReviewReadiness(
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       headRefOid
+      author { id }
       reviewThreads(first: 100, after: $threadCursor) {
-        nodes { isResolved }
+        nodes {
+          id
+          isResolved
+          comments(last: 100) {
+            nodes { author { id isBot } }
+            pageInfo { hasPreviousPage startCursor }
+          }
+        }
         pageInfo { hasNextPage endCursor }
       }
       commits(last: 1) {
@@ -35,6 +43,37 @@ query ReviewReadiness(
             }
           }
         }
+      }
+    }
+  }
+}
+";
+
+const THREAD_COMMENTS_QUERY: &str = r"
+query ReviewThreadComments($threadId: ID!, $before: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(last: 100, before: $before) {
+        nodes { author { id isBot } }
+        pageInfo { hasPreviousPage startCursor }
+      }
+    }
+  }
+}
+";
+
+const TOP_LEVEL_COMMENTS_QUERY: &str = r"
+query PullRequestComments(
+  $owner: String!,
+  $repo: String!,
+  $number: Int!,
+  $before: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      comments(last: 100, before: $before) {
+        nodes { author { id isBot } }
+        pageInfo { hasPreviousPage startCursor }
       }
     }
   }
@@ -115,14 +154,151 @@ async fn collect_readiness(
             .context("GitHub did not return the pull request")?;
         let page = ReadinessPage::try_from(pull_request_data)?;
         accumulator.add_page(&page)?;
+        for thread in &page.threads.nodes {
+            if thread_awaits_response(client, token, base_url, thread, &page.author_id).await? {
+                accumulator.feedback_awaiting_response += 1;
+            }
+        }
 
         if !page.threads.page_info.has_next_page {
+            if top_level_discussion_awaits_response(
+                client,
+                token,
+                base_url,
+                pull_request,
+                &page.author_id,
+            )
+            .await?
+            {
+                accumulator.feedback_awaiting_response += 1;
+            }
             return accumulator.finish();
         }
         thread_cursor = next_cursor(&page.threads)?;
     }
 
     bail!("GitHub review-readiness pagination exceeded {MAX_PAGES} pages")
+}
+
+async fn thread_awaits_response(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    thread: &ReviewThread,
+    pull_request_author_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(latest_meaningful_author(
+        client,
+        token,
+        base_url,
+        &thread.comments,
+        pull_request_author_id,
+        |before| serde_json::json!({ "threadId": thread.id, "before": before }),
+        THREAD_COMMENTS_QUERY,
+    )
+    .await?
+    .is_some_and(|author_id| author_id != pull_request_author_id))
+}
+
+async fn top_level_discussion_awaits_response(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    pull_request: &AuthoredPullRequest,
+    pull_request_author_id: &str,
+) -> anyhow::Result<bool> {
+    let first_page =
+        pull_request_comments_page(client, token, base_url, pull_request, None).await?;
+    Ok(latest_meaningful_author(
+        client,
+        token,
+        base_url,
+        &first_page,
+        pull_request_author_id,
+        |before| {
+            serde_json::json!({
+                "owner": pull_request.owner,
+                "repo": pull_request.repo,
+                "number": pull_request.number.get(),
+                "before": before,
+            })
+        },
+        TOP_LEVEL_COMMENTS_QUERY,
+    )
+    .await?
+    .is_some_and(|author_id| author_id != pull_request_author_id))
+}
+
+async fn latest_meaningful_author(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    first_page: &ReverseConnection<ReviewComment>,
+    pull_request_author_id: &str,
+    variables: impl Fn(Option<String>) -> serde_json::Value,
+    query: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut page = first_page.clone();
+    for _ in 0..MAX_PAGES {
+        if let Some(author) = page
+            .nodes
+            .iter()
+            .rev()
+            .find_map(|comment| comment.meaningful_author(pull_request_author_id))
+        {
+            return Ok(Some(author.to_string()));
+        }
+        if !page.page_info.has_previous_page {
+            return Ok(None);
+        }
+        let before = previous_cursor(&page)?;
+        page = comments_page(client, token, base_url, query, variables(Some(before))).await?;
+    }
+    bail!("GitHub review-feedback pagination exceeded {MAX_PAGES} pages")
+}
+
+async fn pull_request_comments_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    pull_request: &AuthoredPullRequest,
+    before: Option<String>,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let variables = serde_json::json!({
+        "owner": pull_request.owner,
+        "repo": pull_request.repo,
+        "number": pull_request.number.get(),
+        "before": before,
+    });
+    comments_page(client, token, base_url, TOP_LEVEL_COMMENTS_QUERY, variables).await
+}
+
+async fn comments_page(
+    client: &impl HttpClient,
+    token: &str,
+    base_url: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> anyhow::Result<ReverseConnection<ReviewComment>> {
+    let response: GraphqlResponse<CommentsData> =
+        graphql(client, token, base_url, query, variables).await?;
+    let data = complete_data(response)?;
+    data.node
+        .and_then(|node| node.comments)
+        .or_else(|| {
+            data.repository
+                .and_then(|repository| repository.pull_request)
+                .map(|pull_request| pull_request.comments)
+        })
+        .context("GitHub did not return review comments")
+}
+
+fn previous_cursor<T>(connection: &ReverseConnection<T>) -> anyhow::Result<String> {
+    connection
+        .page_info
+        .start_cursor
+        .clone()
+        .context("GitHub pagination omitted a start cursor")
 }
 
 fn next_cursor<T>(connection: &Connection<T>) -> anyhow::Result<Option<String>> {
@@ -170,18 +346,21 @@ fn complete_data<T>(response: GraphqlResponse<T>) -> anyhow::Result<T> {
 
 fn unavailable() -> ReviewReadiness {
     ReviewReadiness {
-        status:                  ReviewReadinessStatus::Unavailable,
-        head_sha:                None,
+        status: ReviewReadinessStatus::Unavailable,
+        head_sha: None,
         unresolved_thread_count: None,
-        checked_at:              Utc::now(),
+        feedback_awaiting_response_count: None,
+        checked_at: Utc::now(),
     }
 }
 
 #[derive(Default)]
 struct ReadinessAccumulator {
-    head_sha:           Option<String>,
+    head_sha: Option<String>,
+    author_id: Option<String>,
     unresolved_threads: u64,
-    ci:                 Option<CiEvidence>,
+    feedback_awaiting_response: u64,
+    ci: Option<CiEvidence>,
 }
 
 impl ReadinessAccumulator {
@@ -196,7 +375,15 @@ impl ReadinessAccumulator {
         {
             bail!("Pull request head changed while readiness was loading")
         }
+        if self
+            .author_id
+            .as_ref()
+            .is_some_and(|author_id| author_id != &page.author_id)
+        {
+            bail!("Pull request author changed while readiness was loading")
+        }
         self.head_sha.get_or_insert_with(|| page.head_sha.clone());
+        self.author_id.get_or_insert_with(|| page.author_id.clone());
         self.ci = Some(page.ci.clone());
         self.unresolved_threads += page
             .threads
@@ -228,6 +415,7 @@ impl ReadinessAccumulator {
             status,
             head_sha: Some(head_sha),
             unresolved_thread_count: Some(self.unresolved_threads),
+            feedback_awaiting_response_count: Some(self.feedback_awaiting_response),
             checked_at: Utc::now(),
         })
     }
@@ -276,6 +464,7 @@ fn valid_sha(value: &str) -> bool {
 
 struct ReadinessPage {
     head_sha:   String,
+    author_id:  String,
     commit_sha: String,
     threads:    Connection<ReviewThread>,
     ci:         CiEvidence,
@@ -300,6 +489,7 @@ impl TryFrom<PullRequestData> for ReadinessPage {
             });
         Ok(Self {
             head_sha: pull_request.head_ref_oid,
+            author_id: pull_request.author.id,
             commit_sha: commit.oid,
             threads: pull_request.review_threads,
             ci,
@@ -328,6 +518,7 @@ struct RepositoryData {
 struct PullRequestData {
     #[serde(rename = "headRefOid")]
     head_ref_oid:   String,
+    author:         Actor,
     #[serde(rename = "reviewThreads")]
     review_threads: Connection<ReviewThread>,
     commits:        CommitConnection,
@@ -379,8 +570,67 @@ struct PageInfo {
 
 #[derive(Deserialize)]
 struct ReviewThread {
+    id:          String,
     #[serde(rename = "isResolved")]
     is_resolved: bool,
+    comments:    ReverseConnection<ReviewComment>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReviewComment {
+    author: Option<Actor>,
+}
+
+impl ReviewComment {
+    fn meaningful_author(&self, pull_request_author_id: &str) -> Option<&str> {
+        self.author.as_ref().and_then(|author| {
+            (!author.is_bot || author.id == pull_request_author_id).then_some(author.id.as_str())
+        })
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct Actor {
+    id:     String,
+    #[serde(default, rename = "isBot")]
+    is_bot: bool,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReverseConnection<T> {
+    nodes:     Vec<T>,
+    #[serde(rename = "pageInfo")]
+    page_info: ReversePageInfo,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReversePageInfo {
+    #[serde(rename = "hasPreviousPage")]
+    has_previous_page: bool,
+    #[serde(rename = "startCursor")]
+    start_cursor:      Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CommentsData {
+    node:       Option<CommentsNode>,
+    repository: Option<CommentsRepository>,
+}
+
+#[derive(Deserialize)]
+struct CommentsNode {
+    comments: Option<ReverseConnection<ReviewComment>>,
+}
+
+#[derive(Deserialize)]
+struct CommentsRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<CommentsPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct CommentsPullRequest {
+    comments: ReverseConnection<ReviewComment>,
 }
 
 #[cfg(test)]
@@ -427,11 +677,35 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": head,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": threads.iter()
-                                .map(|resolved| serde_json::json!({ "isResolved": resolved }))
+                                .enumerate()
+                                .map(|(index, resolved)| serde_json::json!({
+                                    "id": format!("thread-{index}"),
+                                    "isResolved": resolved,
+                                    "comments": {
+                                        "nodes": [{
+                                            "author": {
+                                                "id": "author-id",
+                                                "isBot": false
+                                            }
+                                        }],
+                                        "pageInfo": {
+                                            "hasPreviousPage": false,
+                                            "startCursor": null
+                                        }
+                                    }
+                                }))
                                 .collect::<Vec<_>>(),
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
+                        },
+                        "comments": {
+                            "nodes": [],
+                            "pageInfo": {
+                                "hasPreviousPage": false,
+                                "startCursor": null
+                            }
                         },
                         "commits": {
                             "nodes": [{
@@ -520,6 +794,7 @@ mod tests {
     fn changed_head_invalidates_collected_green_evidence() {
         let page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": HEAD,
+            "author": { "id": "author-id" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -543,6 +818,7 @@ mod tests {
 
         let changed_page_data: PullRequestData = serde_json::from_value(serde_json::json!({
             "headRefOid": NEXT_HEAD,
+            "author": { "id": "author-id" },
             "reviewThreads": {
                 "nodes": [],
                 "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -577,6 +853,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": null }
@@ -635,6 +912,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
@@ -682,6 +960,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": true, "endCursor": "threads-1" }
@@ -707,6 +986,7 @@ mod tests {
                 "repository": {
                     "pullRequest": {
                         "headRefOid": HEAD,
+                        "author": { "id": "author-id" },
                         "reviewThreads": {
                             "nodes": [],
                             "pageInfo": { "hasNextPage": false, "endCursor": null }
