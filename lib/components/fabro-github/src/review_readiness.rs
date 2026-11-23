@@ -755,18 +755,6 @@ impl ReviewComment {
 /// review feedback only when its content identifies a concrete code concern or
 /// asks for a change, rather than relying on the bot's name or exact phrasing.
 fn has_substantive_code_review_signal(body: &str) -> bool {
-    const ROUTINE_STATUS: &[&str] = &[
-        "no findings",
-        "no issues found",
-        "no problems found",
-        "all checks have passed",
-        "all checks passed",
-        "review completed",
-        "analysis completed",
-        "deployment status",
-        "deployment complete",
-        "deployment succeeded",
-    ];
     const CONCRETE_CONCERNS: &[&str] = &[
         "authentication",
         "authorization",
@@ -830,10 +818,90 @@ fn has_substantive_code_review_signal(body: &str) -> bool {
         return true;
     }
 
-    !ROUTINE_STATUS.iter().any(|status| text.contains(status))
-        && CONCRETE_CONCERNS
+    text.split(['\n', '.', ';'])
+        .map(strip_routine_status_prefix)
+        .any(|clause| {
+            CONCRETE_CONCERNS
+                .iter()
+                .any(|concern| clause.contains(concern))
+                && !is_routine_status_clause(clause)
+        })
+}
+
+fn strip_routine_status_prefix(mut clause: &str) -> &str {
+    const ROUTINE_PREFIXES: &[&str] = &[
+        "review completed",
+        "analysis completed",
+        "deployment status",
+        "deployment complete",
+        "deployment succeeded",
+    ];
+
+    loop {
+        let trimmed = clause.trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, ':' | '-' | '—')
+        });
+        let Some(prefix) = ROUTINE_PREFIXES
             .iter()
-            .any(|concern| text.contains(concern))
+            .find(|prefix| trimmed.starts_with(**prefix))
+        else {
+            return trimmed;
+        };
+        clause = &trimmed[prefix.len()..];
+    }
+}
+
+fn is_routine_status_clause(clause: &str) -> bool {
+    const NEGATED_RESULT_NOUNS: &[&str] = &[
+        "concern",
+        "concerns",
+        "finding",
+        "findings",
+        "issue",
+        "issues",
+        "problem",
+        "problems",
+        "vulnerabilities",
+        "vulnerability",
+    ];
+    const SUCCESS_OUTCOMES: &[&str] = &[
+        "complete",
+        "completed",
+        "passed",
+        "succeeded",
+        "success",
+        "successful",
+    ];
+    const STATUS_SUBJECT_PREFIXES: &[&str] = &[
+        "analysis",
+        "build",
+        "check",
+        "deployment",
+        "review",
+        "scan",
+        "test",
+        "workflow",
+    ];
+
+    let words = clause
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let reports_no_findings = words.iter().enumerate().any(|(index, word)| {
+        *word == "no"
+            && words[index + 1..]
+                .iter()
+                .take(3)
+                .any(|word| NEGATED_RESULT_NOUNS.contains(word))
+    });
+    let reports_success = words.iter().any(|word| SUCCESS_OUTCOMES.contains(word))
+        && words.iter().any(|word| {
+            STATUS_SUBJECT_PREFIXES
+                .iter()
+                .any(|subject| word.starts_with(subject))
+        });
+
+    reports_no_findings || reports_success
 }
 
 /// Hide machine metadata and URLs before classifying a review. GitHub bots
@@ -852,15 +920,30 @@ fn visible_review_text(body: &str) -> String {
     }
     visible.push_str(remaining);
 
-    visible
-        .split_whitespace()
-        .filter(|part| {
-            !part.starts_with("http://")
-                && !part.starts_with("https://")
-                && !part.starts_with("www.")
+    let mut outside_code = String::with_capacity(visible.len());
+    let mut in_code = false;
+    for character in visible.chars() {
+        if character == '`' {
+            in_code = !in_code;
+        } else if !in_code {
+            outside_code.push(character);
+        }
+    }
+
+    outside_code
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|part| {
+                    !part.contains("http://")
+                        && !part.contains("https://")
+                        && !part.contains("www.")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("\n")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2096,6 +2179,42 @@ mod tests {
                 "Bot",
                 "No findings in the previous run; deployment succeeded.",
             ),
+            comment(
+                110,
+                "review-bot",
+                "Bot",
+                "<!-- metadata --> Review completed: [P1] SQL injection in query construction.",
+            ),
+            comment(
+                111,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run; [P1] path traversal in archive extraction.",
+            ),
+            comment(
+                112,
+                "review-bot",
+                "Bot",
+                "<!-- metadata --> Review completed: security scan passed.",
+            ),
+            comment(
+                113,
+                "review-bot",
+                "Bot",
+                "No findings in this run; path traversal scan completed successfully.",
+            ),
+            comment(
+                114,
+                "review-bot",
+                "Bot",
+                "Analysis completed: no security vulnerabilities were found.",
+            ),
+            comment(
+                115,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run\n[P1] unsafe archive extraction.",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2113,7 +2232,7 @@ mod tests {
                 .iter()
                 .map(|item| item.key().database_id)
                 .collect::<Vec<_>>(),
-            [104, 105, 106, 107]
+            [104, 105, 106, 107, 110, 111, 115]
         );
     }
 
