@@ -71,10 +71,11 @@ async fn list_in_review_pull_requests(
                     .items
                     .iter()
                     .map(|_| fabro_types::ReviewReadiness {
-                        status:                  fabro_types::ReviewReadinessStatus::Unavailable,
-                        head_sha:                None,
+                        status: fabro_types::ReviewReadinessStatus::Unavailable,
+                        head_sha: None,
                         unresolved_thread_count: None,
-                        checked_at:              chrono::Utc::now(),
+                        feedback_awaiting_response_count: None,
+                        checked_at: chrono::Utc::now(),
                     })
                     .collect()
             }

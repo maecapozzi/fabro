@@ -73,6 +73,7 @@ pub(crate) async fn list_in_review_pull_requests(_auth: RequiredUser) -> Respons
                         "status": "ready",
                         "head_sha": "1111111111111111111111111111111111111111",
                         "unresolved_thread_count": 0,
+                        "feedback_awaiting_response_count": 0,
                         "checked_at": "2026-11-18T14:31:00Z"
                     }
                 },
@@ -89,6 +90,7 @@ pub(crate) async fn list_in_review_pull_requests(_auth: RequiredUser) -> Respons
                         "status": "ci_running",
                         "head_sha": "2222222222222222222222222222222222222222",
                         "unresolved_thread_count": 0,
+                        "feedback_awaiting_response_count": 1,
                         "checked_at": "2026-11-18T14:31:00Z"
                     }
                 },
@@ -105,6 +107,7 @@ pub(crate) async fn list_in_review_pull_requests(_auth: RequiredUser) -> Respons
                         "status": "unresolved_comments",
                         "head_sha": "3333333333333333333333333333333333333333",
                         "unresolved_thread_count": 2,
+                        "feedback_awaiting_response_count": 1,
                         "checked_at": "2026-11-18T14:31:00Z"
                     }
                 }

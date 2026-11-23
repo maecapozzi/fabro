@@ -9862,6 +9862,41 @@ async fn render_graph_from_manifest_accepts_fabro_dotted_attributes() {
             .unwrap(),
         "image/svg+xml"
     );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("SVG response body should be readable");
+    assert!(
+        body.starts_with(b"<?xml") || body.starts_with(b"<svg"),
+        "expected a valid SVG response"
+    );
+}
+
+#[tokio::test]
+async fn render_graph_bytes_uses_in_process_renderer_in_tests() {
+    let response = render_graph_bytes("digraph { start -> finish }").await;
+
+    let response = checked_response!(response, StatusCode::OK).await;
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("content-type header should be present"),
+        "image/svg+xml"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("SVG response body should be readable");
+    assert!(
+        body.starts_with(b"<?xml") || body.starts_with(b"<svg"),
+        "in-process renderer should preserve the SVG response protocol"
+    );
+}
+
+#[tokio::test]
+async fn render_graph_bytes_returns_bad_request_for_invalid_dot_in_tests() {
+    let response = render_graph_bytes("not valid dot {{{").await;
+
+    assert_status!(response, StatusCode::BAD_REQUEST).await;
 }
 
 #[cfg(unix)]
@@ -11847,6 +11882,139 @@ async fn demo_in_review_returns_ready_and_blocked_pull_requests() {
         data.iter()
             .any(|pull_request| pull_request["draft"] == true)
     );
+    assert!(data.iter().all(|pull_request| {
+        pull_request["review_readiness"]["unresolved_thread_count"].is_number()
+            && pull_request["review_readiness"]["feedback_awaiting_response_count"].is_number()
+    }));
+}
+
+#[tokio::test]
+async fn in_review_api_projects_native_review_feedback_counts() {
+    let github = MockServer::start_async().await;
+    let user = github
+        .mock_async(|when, then| {
+            when.method(GET).path("/user");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "login": "factory", "id": 123 }));
+        })
+        .await;
+    let search = github
+        .mock_async(|when, then| {
+            when.method(GET).path("/search/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "total_count": 1,
+                    "incomplete_results": false,
+                    "items": [{
+                        "repository_url": format!("{}/repos/acme/widgets", github.base_url()),
+                        "number": 42,
+                        "title": "Native feedback counts",
+                        "html_url": "https://github.com/acme/widgets/pull/42",
+                        "state": "open",
+                        "draft": true,
+                        "updated_at": "2026-11-20T12:00:00Z",
+                        "pull_request": { "merged_at": null }
+                    }]
+                }));
+        })
+        .await;
+    let graphql = github
+        .mock_async(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "data": {
+                        "viewer": { "login": "factory" },
+                        "repository": {
+                            "pullRequest": {
+                                "headRefOid": "1111111111111111111111111111111111111111",
+                                "author": {
+                                    "login": "factory",
+                                    "__typename": "Bot"
+                                },
+                                "reviewThreads": {
+                                    "nodes": [{
+                                        "id": "thread-1",
+                                        "isResolved": false,
+                                        "comments": {
+                                            "nodes": [{
+                                                "databaseId": 301,
+                                                "body": "Please change this.",
+                                                "createdAt": "2026-11-20T12:00:00Z",
+                                                "updatedAt": "2026-11-20T12:00:00Z",
+                                                "author": {
+                                                    "login": "reviewer",
+                                                    "__typename": "User"
+                                                }
+                                            }],
+                                            "pageInfo": {
+                                                "hasPreviousPage": false,
+                                                "startCursor": null
+                                            }
+                                        }
+                                    }],
+                                    "pageInfo": {
+                                        "hasNextPage": false,
+                                        "endCursor": null
+                                    }
+                                },
+                                "comments": {
+                                    "nodes": [],
+                                    "pageInfo": {
+                                        "hasPreviousPage": false,
+                                        "startCursor": null
+                                    }
+                                },
+                                "reviews": {
+                                    "nodes": [],
+                                    "pageInfo": {
+                                        "hasPreviousPage": false,
+                                        "startCursor": null
+                                    }
+                                },
+                                "commits": {
+                                    "nodes": [{
+                                        "commit": {
+                                            "oid": "1111111111111111111111111111111111111111",
+                                            "statusCheckRollup": {
+                                                "state": "SUCCESS",
+                                                "contexts": { "totalCount": 1 }
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                }));
+        })
+        .await;
+    let state = create_github_token_app_state(Some("ghu_test"), Some(github.base_url()));
+    let app = crate::test_support::build_test_router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri(api("/runs/in-review"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    assert_eq!(
+        body["data"][0]["review_readiness"]["unresolved_thread_count"],
+        1
+    );
+    assert_eq!(
+        body["data"][0]["review_readiness"]["feedback_awaiting_response_count"],
+        1
+    );
+    assert_eq!(body["meta"]["status"], "complete");
+    user.assert_calls_async(1).await;
+    search.assert_calls_async(1).await;
+    graphql.assert_calls_async(3).await;
 }
 
 #[tokio::test]
