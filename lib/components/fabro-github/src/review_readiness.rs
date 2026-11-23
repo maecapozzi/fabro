@@ -819,6 +819,7 @@ fn has_substantive_code_review_signal(body: &str) -> bool {
     }
 
     text.split(['\n', '.', ';'])
+        .flat_map(|clause| clause.split(" but "))
         .map(strip_routine_status_prefix)
         .any(|clause| {
             CONCRETE_CONCERNS
@@ -2215,6 +2216,30 @@ mod tests {
                 "Bot",
                 "No findings in the previous run\n[P1] unsafe archive extraction.",
             ),
+            comment(
+                116,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run, but [P1] SQL injection in query construction.",
+            ),
+            comment(
+                117,
+                "review-bot",
+                "Bot",
+                "Security scan passed, but [P1] path traversal remains in archive extraction.",
+            ),
+            comment(
+                118,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run, and deployment succeeded.",
+            ),
+            comment(
+                119,
+                "review-bot",
+                "Bot",
+                "Security scan passed, and deployment completed.",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2232,7 +2257,7 @@ mod tests {
                 .iter()
                 .map(|item| item.key().database_id)
                 .collect::<Vec<_>>(),
-            [104, 105, 106, 107, 110, 111, 115]
+            [104, 105, 106, 107, 110, 111, 115, 116, 117]
         );
     }
 
