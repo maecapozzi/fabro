@@ -44,7 +44,7 @@ describe("RedirectHome", () => {
   });
 
   afterEach(() => {
-    renderer?.unmount();
+    if (renderer) act(() => renderer?.unmount());
     teardownReactEnv?.();
     mock.restore();
   });

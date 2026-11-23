@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
 
+import { ApiError } from "../lib/api-client";
 import { setupReactTestEnv } from "../lib/test-utils";
 
 const retryAuthConfig = mock(() => Promise.resolve(undefined));
@@ -37,14 +38,19 @@ describe("AuthLogin", () => {
     teardownReactEnv = setupReactTestEnv();
     retryAuthConfig.mockClear();
     authConfig = {
-      error: new Error("backend_unavailable"),
+      error: new ApiError({
+        status:    503,
+        message:   "Invalid or missing FABRO_BACKEND_ORIGIN",
+        requestId: null,
+        body:      { error: "backend_unavailable" },
+      }),
       isLoading: false,
       mutate: retryAuthConfig,
     };
   });
 
   afterEach(() => {
-    renderer?.unmount();
+    if (renderer) act(() => renderer?.unmount());
     teardownReactEnv?.();
     mock.restore();
   });
