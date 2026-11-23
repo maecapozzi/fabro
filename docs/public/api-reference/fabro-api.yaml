@@ -7811,6 +7811,7 @@ components:
         - status
         - head_sha
         - unresolved_thread_count
+        - feedback_awaiting_response_count
         - checked_at
       properties:
         status:
@@ -7828,6 +7829,17 @@ components:
               minimum: 0
             - type: "null"
           description: Count of unresolved review threads, or null when thread data was unavailable.
+        feedback_awaiting_response_count:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 0
+            - type: "null"
+          description: >-
+            Count of unresolved review threads and top-level reviewer feedback
+            items that have neither been resolved nor received a marker-linked
+            response from the pull request author or authenticated Factory
+            identity, or null when complete feedback data was unavailable.
         checked_at:
           type: string
           format: date-time

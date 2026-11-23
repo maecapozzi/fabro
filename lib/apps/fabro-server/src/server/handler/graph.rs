@@ -99,21 +99,25 @@ fn render_graph_subprocess_exe(
 
         let current = std::env::current_exe()
             .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?;
-        let current_name = current.file_stem().and_then(|name| name.to_str());
-        if current_name == Some("fabro") {
-            return Ok(current);
-        }
-
-        let candidate = current
-            .parent()
-            .and_then(|parent| parent.parent())
-            .map(|parent| parent.join(if cfg!(windows) { "fabro.exe" } else { "fabro" }));
-        if let Some(candidate) = candidate.filter(|path| path.is_file()) {
-            return Ok(candidate);
-        }
-
-        Ok(current)
+        renderer_executable_from_current_exe(&current).ok_or_else(|| {
+            RenderSubprocessError::SpawnFailed(
+                "could not locate the fabro __render-graph executable".to_string(),
+            )
+        })
     }
+}
+
+fn renderer_executable_from_current_exe(current: &std::path::Path) -> Option<PathBuf> {
+    let current_name = current.file_stem().and_then(|name| name.to_str());
+    if current_name == Some("fabro") {
+        return Some(current.to_path_buf());
+    }
+
+    current
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(|parent| parent.join(if cfg!(windows) { "fabro.exe" } else { "fabro" }))
+        .filter(|candidate| candidate.is_file())
 }
 
 fn render_subprocess_failure(
@@ -230,7 +234,24 @@ async fn render_graph_response(
 }
 
 pub(crate) async fn render_graph_bytes(dot_source: &str) -> Response {
+    #[cfg(test)]
+    {
+        // Tests run inside a libtest executable, not the `fabro` CLI binary.
+        // Rendering in-process keeps the endpoint SVG contract independent of
+        // which Cargo artifacts happened to be built first.
+        return render_graph_in_process(dot_source);
+    }
+
+    #[cfg(not(test))]
     render_graph_response(dot_source, None).await
+}
+
+#[cfg(test)]
+fn render_graph_in_process(dot_source: &str) -> Response {
+    match fabro_graphviz::render::render_dot(dot_source) {
+        Ok(bytes) => (StatusCode::OK, [("content-type", "image/svg+xml")], bytes).into_response(),
+        Err(err) => ApiError::new(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +331,18 @@ async fn get_graph_source(
     match load_run_dot_source(&state, &id).await {
         Ok(dot) => (StatusCode::OK, [("content-type", "text/vnd.graphviz")], dot).into_response(),
         Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renderer_executable_from_current_exe;
+
+    #[test]
+    fn non_fabro_test_executable_is_not_accepted_as_a_renderer() {
+        let temp = tempfile::tempdir().expect("tempdir should be available");
+        let libtest = temp.path().join("deps/fabro_server-abc123");
+
+        assert_eq!(renderer_executable_from_current_exe(&libtest), None);
     }
 }
