@@ -12,12 +12,14 @@ flowchart LR
   Fabro --> State[workflow state and sandboxes]
 ```
 
-![Fabro setup screen rendered from the exported static UI fixture](fixture-ui.png)
+![Fabro disconnected-backend state rendered from the exported static UI fixture](fixture-ui.png)
 
-The screenshot is genuine browser evidence of the exported SPA's `/setup` route
-served from a local static fixture at `127.0.0.1`; it intentionally has no
-backend, login, user data, or credentials. It demonstrates asset packaging and
-SPA fallback only, not an authenticated Alto deployment.
+The screenshot is genuine browser evidence of the exported SPA's `/` route
+served from a local fixture at `127.0.0.1`. The fixture returns the same
+`503 backend_unavailable` response as an Alto preview without
+`FABRO_BACKEND_ORIGIN`; it uses no backend, login, user data, credentials, or
+live secrets. It demonstrates the disconnected state and packaged retry action,
+not an authenticated Alto deployment.
 
 The Worker forwards only `/api`, `/api/*`, `/auth`, `/auth/*`, and `/health`.
 It reads the fixed `FABRO_BACKEND_ORIGIN` secret at runtime, rejects any
