@@ -78,7 +78,8 @@ to either file.
 Before a host deploys this:
 
 1. Copy this complete package, including `alto.json`, into the platform app root
-   for the existing private, Mae-restricted `mae-fabro-ui-preview` app.
+   for the existing private, Mae-restricted `mae-fabro-ui-preview` app (app ID
+   `01M84KPEXJFZNYGDG93YRB6JJP`).
 2. After choosing the backend URL, set the declared `FABRO_BACKEND_ORIGIN`
    secret in that app's Alto infrastructure settings to the fixed public HTTPS
    Fabro origin. Do not add an environment binding or place the value in source
