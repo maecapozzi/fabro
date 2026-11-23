@@ -1,0 +1,18 @@
+{
+  "name": "fabro-alto-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/validate-assets.mjs",
+    "export-ui": "node scripts/export-ui.mjs",
+    "test": "node --test",
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "@workos/alto": "0.26.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.81.0"
+  }
+}
