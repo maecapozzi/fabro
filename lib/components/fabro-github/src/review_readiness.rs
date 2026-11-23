@@ -809,6 +809,7 @@ fn has_substantive_code_review_signal(body: &str) -> bool {
         "failed to ",
         "is missing",
         "are missing",
+        "permits ",
         "without validat",
         "without checking",
         "before it validat",
@@ -817,15 +818,20 @@ fn has_substantive_code_review_signal(body: &str) -> bool {
 
     let text = visible_review_text(body).to_ascii_lowercase();
     let text = text.trim();
-    if text.is_empty() || ROUTINE_STATUS.iter().any(|status| text.contains(status)) {
+    if text.is_empty() {
         return false;
     }
 
-    CONCRETE_CONCERNS
-        .iter()
-        .any(|concern| text.contains(concern))
-        || ACTION_REQUESTS.iter().any(|request| text.contains(request))
+    let requests_change = ACTION_REQUESTS.iter().any(|request| text.contains(request))
         || BEHAVIORAL_CONCERNS
+            .iter()
+            .any(|concern| text.contains(concern));
+    if requests_change {
+        return true;
+    }
+
+    !ROUTINE_STATUS.iter().any(|status| text.contains(status))
+        && CONCRETE_CONCERNS
             .iter()
             .any(|concern| text.contains(concern))
 }
@@ -2064,6 +2070,32 @@ mod tests {
                  ### Security finding\n\
                  The authorization check is missing before this request is processed.",
             ),
+            comment(
+                106,
+                "review-bot",
+                "Bot",
+                "<!-- review metadata: {\"status\":\"complete\"} -->\n\
+                 Review completed: [P1] the authorization check is missing.",
+            ),
+            comment(
+                107,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run; this change permits SQL injection.",
+            ),
+            comment(
+                108,
+                "review-bot",
+                "Bot",
+                "<!-- review metadata: {\"status\":\"complete\"} -->\n\
+                 Review completed: no findings.",
+            ),
+            comment(
+                109,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run; deployment succeeded.",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2081,7 +2113,7 @@ mod tests {
                 .iter()
                 .map(|item| item.key().database_id)
                 .collect::<Vec<_>>(),
-            [104, 105]
+            [104, 105, 106, 107]
         );
     }
 
