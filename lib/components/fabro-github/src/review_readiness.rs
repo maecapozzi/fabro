@@ -818,41 +818,14 @@ fn has_substantive_code_review_signal(body: &str) -> bool {
         return true;
     }
 
-    text.split(['\n', '.', ';'])
-        .flat_map(|clause| clause.split(" but "))
-        .map(strip_routine_status_prefix)
-        .any(|clause| {
-            CONCRETE_CONCERNS
-                .iter()
-                .any(|concern| clause.contains(concern))
-                && !is_routine_status_clause(clause)
+    CONCRETE_CONCERNS.iter().any(|concern| {
+        text.match_indices(concern).any(|(start, mention)| {
+            !is_routine_status_mention(text, start, start + mention.len())
         })
+    })
 }
 
-fn strip_routine_status_prefix(mut clause: &str) -> &str {
-    const ROUTINE_PREFIXES: &[&str] = &[
-        "review completed",
-        "analysis completed",
-        "deployment status",
-        "deployment complete",
-        "deployment succeeded",
-    ];
-
-    loop {
-        let trimmed = clause.trim_start_matches(|character: char| {
-            character.is_whitespace() || matches!(character, ':' | '-' | '—')
-        });
-        let Some(prefix) = ROUTINE_PREFIXES
-            .iter()
-            .find(|prefix| trimmed.starts_with(**prefix))
-        else {
-            return trimmed;
-        };
-        clause = &trimmed[prefix.len()..];
-    }
-}
-
-fn is_routine_status_clause(clause: &str) -> bool {
+fn is_routine_status_mention(text: &str, start: usize, end: usize) -> bool {
     const NEGATED_RESULT_NOUNS: &[&str] = &[
         "concern",
         "concerns",
@@ -884,25 +857,52 @@ fn is_routine_status_clause(clause: &str) -> bool {
         "workflow",
     ];
 
-    let words = clause
+    let words_before = text[..start]
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
-    let reports_no_findings = words.iter().enumerate().any(|(index, word)| {
-        *word == "no"
-            && words[index + 1..]
-                .iter()
-                .take(3)
-                .any(|word| NEGATED_RESULT_NOUNS.contains(word))
-    });
-    let reports_success = words.iter().any(|word| SUCCESS_OUTCOMES.contains(word))
-        && words.iter().any(|word| {
-            STATUS_SUBJECT_PREFIXES
-                .iter()
-                .any(|subject| word.starts_with(subject))
+    let words_after = text[start..]
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(8)
+        .collect::<Vec<_>>();
+
+    let reports_negative_result = words_before
+        .iter()
+        .rposition(|word| *word == "no")
+        .is_some_and(|no_index| {
+            let intervening = &words_before[no_index + 1..];
+            let directly_negated = intervening.len() <= 1
+                && !intervening
+                    .iter()
+                    .any(|word| NEGATED_RESULT_NOUNS.contains(word));
+            let nearby_result_noun = intervening.len() <= 4
+                && words_after
+                    .iter()
+                    .take(5)
+                    .any(|word| NEGATED_RESULT_NOUNS.contains(word));
+
+            directly_negated || nearby_result_noun
         });
 
-    reports_no_findings || reports_success
+    let status_subject = words_after.iter().take(4).position(|word| {
+        STATUS_SUBJECT_PREFIXES
+            .iter()
+            .any(|subject| word.starts_with(subject))
+    });
+    let successful_status = status_subject.is_some_and(|subject_index| {
+        words_after
+            .iter()
+            .skip(subject_index + 1)
+            .take(3)
+            .any(|word| SUCCESS_OUTCOMES.contains(word))
+    });
+
+    reports_negative_result
+        || successful_status
+        || ["was not found", "were not found"]
+            .iter()
+            .any(|outcome| text[end..].trim_start().starts_with(outcome))
 }
 
 /// Hide machine metadata and URLs before classifying a review. GitHub bots
@@ -2240,6 +2240,54 @@ mod tests {
                 "Bot",
                 "Security scan passed, and deployment completed.",
             ),
+            comment(
+                120,
+                "review-bot",
+                "Bot",
+                "Security scan passed: [P1] path traversal remains in archive extraction.",
+            ),
+            comment(
+                121,
+                "review-bot",
+                "Bot",
+                "No findings in the previous run, however SQL injection remains in query construction.",
+            ),
+            comment(
+                122,
+                "review-bot",
+                "Bot",
+                "Security scan passed, although path traversal remains in archive extraction.",
+            ),
+            comment(
+                123,
+                "review-bot",
+                "Bot",
+                "Security scan passed ([P1] SQL injection remains in query construction).",
+            ),
+            comment(
+                124,
+                "review-bot",
+                "Bot",
+                "Security scan passed\n- [P1] path traversal remains in archive extraction",
+            ),
+            comment(
+                125,
+                "review-bot",
+                "Bot",
+                "Security scan passed [P1] SQL injection remains in query construction",
+            ),
+            comment(
+                126,
+                "review-bot",
+                "Bot",
+                "No SQL injection vulnerabilities were found.",
+            ),
+            comment(
+                127,
+                "review-bot",
+                "Bot",
+                "Path traversal scan completed successfully.",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2257,7 +2305,9 @@ mod tests {
                 .iter()
                 .map(|item| item.key().database_id)
                 .collect::<Vec<_>>(),
-            [104, 105, 106, 107, 110, 111, 115, 116, 117]
+            [
+                104, 105, 106, 107, 110, 111, 115, 116, 117, 120, 121, 122, 123, 124, 125,
+            ]
         );
     }
 
