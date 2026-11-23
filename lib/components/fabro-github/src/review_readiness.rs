@@ -70,6 +70,11 @@ static ROUTINE_SUPPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("hardcoded routine support regex should compile")
 });
 
+static RAW_URL_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\A<?(?:https?://|www\.)[^\s<>]+>?[.,;:!?]?\z")
+        .expect("hardcoded raw URL token regex should compile")
+});
+
 const READINESS_QUERY: &str = r"
 query ReviewReadiness(
   $owner: String!,
@@ -863,9 +868,9 @@ fn classify_complete_routine_clause(clause: &str) -> Option<RoutineClause> {
     }
 }
 
-/// Hide machine metadata and URLs before classifying a review. GitHub bots
-/// commonly prepend HTML markers and link to dashboard status pages; neither
-/// should mask a visible finding or create one from URL path text.
+/// Remove hidden machine metadata and standalone raw URLs. Preserve every
+/// other token verbatim so visible code and Markdown link labels participate
+/// in whole-message classification.
 fn visible_review_text(body: &str) -> String {
     let mut visible = String::with_capacity(body.len());
     let mut remaining = body;
@@ -879,25 +884,11 @@ fn visible_review_text(body: &str) -> String {
     }
     visible.push_str(remaining);
 
-    let mut outside_code = String::with_capacity(visible.len());
-    let mut in_code = false;
-    for character in visible.chars() {
-        if character == '`' {
-            in_code = !in_code;
-        } else if !in_code {
-            outside_code.push(character);
-        }
-    }
-
-    outside_code
+    visible
         .lines()
         .map(|line| {
             line.split_whitespace()
-                .filter(|part| {
-                    !part.contains("http://")
-                        && !part.contains("https://")
-                        && !part.contains("www.")
-                })
+                .filter(|part| !RAW_URL_TOKEN_RE.is_match(part))
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -2258,6 +2249,19 @@ mod tests {
                 "Bot",
                 "Path traversal scan completed successfully.",
             ),
+            comment(
+                128,
+                "review-bot",
+                "Bot",
+                "No findings. `SQL injection vulnerability.`",
+            ),
+            comment(
+                129,
+                "review-bot",
+                "Bot",
+                "No findings. \
+                 [SQL-injection-vulnerability](https://scanner.example.test/result/42)",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2277,6 +2281,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 103, 104, 105, 106, 107, 110, 111, 115, 116, 117, 120, 121, 122, 123, 124, 125,
+                128, 129,
             ]
         );
     }
@@ -2314,6 +2319,8 @@ mod tests {
             "Security scan passed SQL injection vulnerability test passed.",
             "Security scan passed, however the authorization check is missing.",
             "Security scan passed. The path traversal vulnerability remains in archive extraction.",
+            "No findings. `SQL injection vulnerability.`",
+            "No findings. [SQL-injection-vulnerability](https://scanner.example.test/result/42)",
             "No findings in the previous run, and the retry loop drops the final error after \
              exhausting every attempt.",
         ] {
