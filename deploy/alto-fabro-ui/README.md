@@ -21,21 +21,22 @@ SPA fallback only, not an authenticated Alto deployment.
 
 The Worker forwards only `/api`, `/api/*`, `/auth`, `/auth/*`, and `/health`.
 It reads the fixed `FABRO_BACKEND_ORIGIN` secret at runtime, rejects any
-non-HTTPS or private/loopback origin, and never accepts a browser-selected
-upstream. Browser cookies, methods, queries, request bodies, redirects, and
-streaming responses (including SSE) are preserved. It removes Alto and
-Cloudflare identity/platform headers before forwarding. API and auth responses
-are left uncached; hashed UI assets are immutable while the HTML entry point and
-`build-id.json` revalidate.
+non-HTTPS, private/loopback, local, or IPv6-literal origin, and never accepts a
+browser-selected upstream. Browser cookies, methods, queries, request bodies,
+redirects, and streaming responses (including SSE) are preserved. It removes
+Alto and Cloudflare identity/platform headers before forwarding. API and auth
+responses are forced to `Cache-Control: no-store`; hashed UI assets are
+immutable while the HTML entry point and `build-id.json` revalidate.
 
 ## Terminal WebSocket passthrough
 
 This is native Worker hosting, not Alto external-origin routing. The Worker
-passes the browser's standard WebSocket upgrade through the fixed backend origin,
-preserving `Connection`, `Upgrade`, and `Sec-WebSocket-*` headers while still
-removing Alto and Cloudflare identity/platform headers. It returns the native
-upstream response without re-wrapping it, because re-wrapping would discard the
-Worker runtime's WebSocket endpoint.
+accepts a browser WebSocket upgrade only when its `Origin` matches the Worker's
+own origin. It translates that header to the fixed backend origin so Fabro's
+same-origin check still holds, preserves `Connection`, `Upgrade`, and
+`Sec-WebSocket-*` headers, and removes Alto and Cloudflare identity/platform
+headers. It returns the native upstream response without re-wrapping it, because
+re-wrapping would discard the Worker runtime's WebSocket endpoint.
 
 The published `@workos/alto` 0.26.0 wrapper's `altoFetch` implementation
 verifies identity and then calls the app handler without rejecting or changing
@@ -69,15 +70,19 @@ per file, and 32 MiB total.
 
 ## Alto configuration and review checklist
 
-`wrangler.jsonc` purposely contains only Worker code/assets settings. Do not add
-an account ID, deployment token, route, backend URL, or environment-secret
-binding to it.
+`alto.json` is the portable Alto manifest. `wrangler.jsonc` purposely contains
+only Worker code/assets settings. Do not add a slug, app ID, account ID,
+deployment token, route, backend URL, credential, or environment-secret binding
+to either file.
 
 Before a host deploys this:
 
-1. Create the private Alto application and restrict access to Mae.
-2. Declare `FABRO_BACKEND_ORIGIN` as a production secret in `alto.json`, with
-   no environment binding, then set it to the fixed public HTTPS Fabro origin.
+1. Copy this complete package, including `alto.json`, into the platform app root
+   for the existing private, Mae-restricted `mae-fabro-ui-preview` app.
+2. After choosing the backend URL, set the declared `FABRO_BACKEND_ORIGIN`
+   secret in that app's Alto infrastructure settings to the fixed public HTTPS
+   Fabro origin. Do not add an environment binding or place the value in source
+   or Wrangler config.
 3. Configure Alto egress as deny-by-default and approve exactly that backend
    hostname. Do not use a wildcard, a private address, or a user-provided URL.
 4. Register the browser's canonical Worker HTTPS origin with the Fabro server's
@@ -86,20 +91,23 @@ Before a host deploys this:
 5. Verify login, an authenticated API request, an SSE run stream, redirect and
    multiple-cookie behavior, and an authenticated browser terminal session.
 
-The exact `alto.json` declaration spelling must be filled from the host's
-current private Alto CLI/schema: that schema was not available to this checkout,
-and inventing a manifest shape would make this package less deployable. The
-runtime secret API is verified against published `@workos/alto` 0.26.0:
+The managed build validates the committed manifest, UI provenance, asset count,
+per-file size, and complete artifact size. The runtime secret API is verified
+against published `@workos/alto` 0.26.0:
 `ctx.alto.governance.secrets.get("FABRO_BACKEND_ORIGIN")`.
 
-For a release-candidate bundle only, after the host has configured the private
-app, run:
+After copying the package and configuring the private app, run the managed
+release-candidate checks in its app root:
 
 ```sh
+npm ci --ignore-scripts
+npm test
+npm run build
 npm run deploy:dry-run
 ```
 
-Do not run a live Wrangler deploy from this checkout.
+Review the dry-run output, then deploy through the Alto platform workflow. Do
+not run a live Wrangler deploy from this checkout.
 
 ## Rollback
 

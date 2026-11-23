@@ -24,6 +24,10 @@ test("only accepts a public HTTPS backend origin", () => {
     "https://127.0.0.1",
     "https://10.0.0.1",
     "https://localhost",
+    "https://[::1]",
+    "https://[fd00::1]",
+    "https://[fe80::1]",
+    "https://[::ffff:127.0.0.1]",
     "https://fabro.example/path",
     "https://user:password@fabro.example",
   ]) {
@@ -70,7 +74,22 @@ test("forwards method, query, body, cookies, and a streaming response without bu
   assert.equal(response.headers.get("location"), "/runs/run_1");
   assert.deepEqual(response.headers.getSetCookie(), ["one=1; Secure", "two=2; Secure"]);
   assert.equal(response.headers.get("content-type"), "text/event-stream");
+  assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(await response.text(), "first\nsecond\n");
+});
+
+test("overrides upstream cache policy on private backend responses", async () => {
+  const response = await forwardToBackend(
+    new Request("https://ui.example/api/v1/runs"),
+    new URL("https://backend.example"),
+    async () => Response.json(
+      { runs: [] },
+      { headers: { "cache-control": "public, max-age=3600" } },
+    ),
+  );
+
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { runs: [] });
 });
 
 test("does not serve a backend route as an SPA fallback and fails safely without settings", async () => {
@@ -104,7 +123,7 @@ test("uses index.html only for non-backend HTML navigations", async () => {
   assert.equal(await response.text(), "<html>Fabro</html>");
 });
 
-test("passes terminal WebSocket upgrades through without Alto identity headers", async () => {
+test("passes same-origin terminal WebSockets with a translated backend Origin", async () => {
   let upstreamRequest;
   const upstreamResponse = new Response(null, { status: 200, headers: { "x-upstream": "websocket" } });
   const response = await forwardToBackend(
@@ -112,6 +131,7 @@ test("passes terminal WebSocket upgrades through without Alto identity headers",
       headers: {
         connection: "Upgrade",
         upgrade: "websocket",
+        origin: "https://ui.example",
         "sec-websocket-key": "browser-key",
         "x-alto-user": "remove-me",
       },
@@ -125,7 +145,32 @@ test("passes terminal WebSocket upgrades through without Alto identity headers",
   assert.equal(upstreamRequest.request.href, "https://backend.example/api/v1/runs/run_1/terminal");
   assert.equal(upstreamRequest.init.headers.get("connection"), "Upgrade");
   assert.equal(upstreamRequest.init.headers.get("upgrade"), "websocket");
+  assert.equal(upstreamRequest.init.headers.get("origin"), "https://backend.example");
   assert.equal(upstreamRequest.init.headers.get("sec-websocket-key"), "browser-key");
   assert.equal(upstreamRequest.init.headers.get("x-alto-user"), null);
   assert.equal(response, upstreamResponse);
+});
+
+test("rejects a cross-origin terminal WebSocket before contacting the backend", async () => {
+  let fetchCalls = 0;
+  const response = await forwardToBackend(
+    new Request("https://ui.example/api/v1/runs/run_1/terminal", {
+      headers: {
+        connection: "Upgrade",
+        upgrade: "websocket",
+        origin: "https://hostile.example",
+        "sec-websocket-key": "browser-key",
+      },
+    }),
+    new URL("https://backend.example"),
+    async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 200 });
+    },
+  );
+
+  assert.equal(fetchCalls, 0);
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.match(await response.text(), /forbidden_websocket_origin/);
 });

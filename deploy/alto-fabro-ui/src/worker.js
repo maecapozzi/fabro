@@ -43,8 +43,11 @@ function hasPrivateAddress(hostname) {
     return true;
   }
 
+  // URL.hostname retains brackets around IPv6 literals in Worker and Node
+  // runtimes. Reject all literals rather than risk overlooking an alternate
+  // spelling of loopback, private, link-local, or IPv4-mapped space.
   if (lower.includes(":")) {
-    return lower === "::1" || lower.startsWith("fc") || lower.startsWith("fd") || lower.startsWith("fe8");
+    return true;
   }
 
   const octets = lower.split(".").map(Number);
@@ -76,7 +79,7 @@ export function parseBackendOrigin(value) {
     throw new Error("must be a bare HTTPS origin");
   }
   if (hasPrivateAddress(origin.hostname)) {
-    throw new Error("must not target a private, loopback, or local address");
+    throw new Error("must use a public DNS hostname or public IPv4 address");
   }
   return origin;
 }
@@ -97,6 +100,25 @@ function requestHeaders(request, { preserveWebSocketUpgrade = false } = {}) {
     headers.append(name, value);
   }
   return headers;
+}
+
+function hasSameOriginWebSocketOrigin(request, browserUrl) {
+  const value = request.headers.get("origin");
+  if (!value) return false;
+
+  try {
+    const origin = new URL(value);
+    return (
+      origin.origin === browserUrl.origin
+      && origin.pathname === "/"
+      && !origin.search
+      && !origin.hash
+      && !origin.username
+      && !origin.password
+    );
+  } catch {
+    return false;
+  }
 }
 
 function responseHeaders(upstream, browserOrigin, backendOrigin) {
@@ -125,6 +147,7 @@ function responseHeaders(upstream, browserOrigin, backendOrigin) {
   for (const cookie of cookies) {
     headers.append("set-cookie", cookie);
   }
+  headers.set("cache-control", "no-store");
   return headers;
 }
 
@@ -150,9 +173,17 @@ export async function forwardToBackend(request, backendOrigin, fetchImpl = fetch
   const browserUrl = new URL(request.url);
   const target = new URL(`${browserUrl.pathname}${browserUrl.search}`, backendOrigin);
   const websocketUpgrade = isWebSocketUpgrade(request);
+  if (websocketUpgrade && !hasSameOriginWebSocketOrigin(request, browserUrl)) {
+    return error(403, "forbidden_websocket_origin", "The WebSocket Origin must match the Worker origin.");
+  }
+
+  const headers = requestHeaders(request, { preserveWebSocketUpgrade: websocketUpgrade });
+  if (websocketUpgrade) {
+    headers.set("origin", backendOrigin.origin);
+  }
   const init = {
     method: request.method,
-    headers: requestHeaders(request, { preserveWebSocketUpgrade: websocketUpgrade }),
+    headers,
     redirect: "manual",
     signal: request.signal,
   };

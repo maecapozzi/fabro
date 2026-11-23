@@ -1,10 +1,21 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
-const root = resolve(import.meta.dirname, "..", "public");
+const packageRoot = resolve(import.meta.dirname, "..");
+const root = resolve(packageRoot, "public");
 const MAX_FILES = 2_000;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+const EXPECTED_ALTO_MANIFEST = {
+  name: "Fabro UI prototype",
+  surfaces: { "/": "web" },
+  governance: {
+    secrets: {
+      FABRO_BACKEND_ORIGIN: { scope: "all" },
+    },
+  },
+};
 
 async function files(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -16,6 +27,19 @@ async function files(directory) {
 }
 
 async function main() {
+  let altoManifest;
+  try {
+    altoManifest = JSON.parse(await readFile(resolve(packageRoot, "alto.json"), "utf8"));
+  } catch (cause) {
+    throw new Error(`alto.json is missing or invalid: ${cause.message}`);
+  }
+  if (!isDeepStrictEqual(altoManifest, EXPECTED_ALTO_MANIFEST)) {
+    throw new Error(
+      "alto.json must declare exactly the Fabro UI prototype root web surface and "
+      + "FABRO_BACKEND_ORIGIN secret with scope \"all\" and no environment binding.",
+    );
+  }
+
   const all = await files(root).catch(() => {
     throw new Error("public/ is missing. Run `npm run export-ui` after building apps/fabro-web.");
   });
