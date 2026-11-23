@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
 import { AuthLayout } from "../components/auth-layout";
+import { ErrorState, LoadingState } from "../components/state";
 import {
   ErrorMessage,
   INPUT_CLASS,
@@ -10,9 +11,9 @@ import { useLoginDevToken } from "../lib/mutations";
 import { useAuthConfig } from "../lib/queries";
 
 export default function AuthLogin() {
-  const { data: authConfig } = useAuthConfig();
+  const authConfig = useAuthConfig();
   const loginDevToken = useLoginDevToken();
-  const methods = authConfig?.methods ?? [];
+  const methods = authConfig.data?.methods ?? [];
   const hasDevToken = methods.includes("dev-token");
   const hasGitHub = methods.includes("github");
   const navigate = useNavigate();
@@ -29,6 +30,26 @@ export default function AuthLogin() {
     } catch {
       setError("Invalid dev token.");
     }
+  }
+
+  if (authConfig.error) {
+    return (
+      <AuthLayout>
+        <ErrorState
+          title="Backend not connected"
+          description="The Fabro backend is not connected, so live runs cannot load yet. Check the preview connection and try again."
+          onRetry={() => void authConfig.mutate()}
+        />
+      </AuthLayout>
+    );
+  }
+
+  if (authConfig.isLoading) {
+    return (
+      <AuthLayout>
+        <LoadingState label="Loading sign-in options…" />
+      </AuthLayout>
+    );
   }
 
   return (

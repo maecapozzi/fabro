@@ -14,8 +14,9 @@ import {
 import { Link, Outlet, useLocation, useMatches } from "react-router";
 import { ErrorState } from "../components/state";
 import { TooltipProvider } from "../components/ui";
+import { ApiError } from "../lib/api-client";
 import { DemoModeProvider } from "../lib/demo-mode";
-import { useAuthMe } from "../lib/queries";
+import { useAuthConfig, useAuthMe } from "../lib/queries";
 import { navigation } from "./navigation";
 
 function activeFor(item: (typeof navigation)[number], pathname: string): boolean {
@@ -27,9 +28,27 @@ function classNames(...classes: Array<string | false | null | undefined>) {
 }
 
 export default function AppShell() {
-  const { data: auth, error, isLoading } = useAuthMe();
+  const authMe = useAuthMe();
+  const { data: auth, error, isLoading } = authMe;
+  const authConfig = useAuthConfig();
   const { pathname } = useLocation();
   const matches = useMatches();
+
+  const backendUnavailable =
+    authConfig.error
+    || (error instanceof ApiError && error.status === 503);
+
+  if (backendUnavailable) {
+    return (
+      <div className="min-h-full bg-page py-12">
+        <ErrorState
+          title="Backend not connected"
+          description="The Fabro backend is not connected, so live runs cannot load yet. Check the preview connection and try again."
+          onRetry={() => void Promise.all([authMe.mutate(), authConfig.mutate()])}
+        />
+      </div>
+    );
+  }
 
   if (isLoading && !auth) {
     return <div className="min-h-full bg-page" />;
