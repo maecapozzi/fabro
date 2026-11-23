@@ -90,6 +90,7 @@ fn review_readiness_reuses_domain_types_and_openapi_shape() {
         "status": "ready",
         "head_sha": "0123456789abcdef0123456789abcdef01234567",
         "unresolved_thread_count": 0,
+        "feedback_awaiting_response_count": 0,
         "checked_at": "2026-11-18T12:00:00Z"
     });
     let readiness: ReviewReadiness =

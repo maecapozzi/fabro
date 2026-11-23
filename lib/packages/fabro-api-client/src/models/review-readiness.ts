@@ -24,5 +24,6 @@ export interface ReviewReadiness {
     'status': ReviewReadinessStatus;
     'head_sha': string | null;
     'unresolved_thread_count': number | null;
+    'feedback_awaiting_response_count': number | null;
     'checked_at': string;
 }
