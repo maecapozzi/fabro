@@ -1,7 +1,10 @@
+use std::sync::LazyLock;
+
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, Utc};
 use fabro_types::{ReviewReadiness, ReviewReadinessStatus};
 use futures::stream::{self, StreamExt as _};
+use regex::Regex;
 use serde::Deserialize;
 
 use super::{
@@ -10,6 +13,62 @@ use super::{
 
 const MAX_PAGES: usize = 100;
 const MAX_CONCURRENT_PULL_REQUESTS: usize = 8;
+
+static ROUTINE_CLAUSE_SEPARATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:\s+and\s+)|[.;,\n\r()]")
+        .expect("hardcoded routine clause separator regex should compile")
+});
+
+static ROUTINE_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \A \s* (?:✅\s*)? (?:
+            no \s+ findings
+                (?: \s+ found
+                  | \s+ in \s+ (?: this | the \s+ (?: current | latest | previous ) ) \s+ run
+                )?
+          | no \s+ (?: issues \s+ (?: were \s+ )? found
+                    | problems \s+ (?: were \s+ )? detected )
+          | no \s+ (?: security \s+ | sql \s+ injection \s+ | path \s+ traversal \s+ )?
+                (?: vulnerability \s+ was | vulnerabilities \s+ were )
+                \s+ (?: found | detected )
+          | (?: analysis
+              | automated \s+ analysis
+              | automated \s+ review
+              | build
+              | check
+              | checks
+              | all \s+ checks
+              | deployment
+              | review
+              | security \s+ scan
+              | path \s+ traversal \s+ scan
+              | test
+              | tests
+              | workflow )
+                \s+ (?: complete
+                      | completed
+                      | completed \s+ successfully
+                      | done
+                      | finished
+                      | passed
+                      | succeeded
+                      | successful
+                      | has \s+ passed
+                      | have \s+ passed
+                      | was \s+ successful
+                      | were \s+ successful )
+          | (?: deployment | review ) \s+ status \s* : \s*
+                (?: complete | completed | successful )
+        ) \s* \z",
+    )
+    .expect("hardcoded routine status regex should compile")
+});
+
+static ROUTINE_SUPPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?ix)\A\s*(?:see|details|full\s+report|report|results|logs)\s*:?\s*\z")
+        .expect("hardcoded routine support regex should compile")
+});
 
 const READINESS_QUERY: &str = r"
 query ReviewReadiness(
@@ -746,195 +805,62 @@ impl ReviewComment {
     fn is_routine_status_noise(&self) -> bool {
         let body = visible_review_text(&self.body);
         body.is_empty()
-            || (self.author.as_ref().is_some_and(Actor::is_bot)
-                && !has_substantive_code_review_signal(&body))
+            || (self.author.as_ref().is_some_and(Actor::is_bot) && is_routine_status_message(&body))
     }
-}
-
-/// Bots also emit routine progress and status messages. Treat a bot comment as
-/// review feedback only when its content identifies a concrete code concern or
-/// asks for a change, rather than relying on the bot's name or exact phrasing.
-fn has_substantive_code_review_signal(body: &str) -> bool {
-    const CONCRETE_CONCERNS: &[&str] = &[
-        "authentication",
-        "authorization",
-        "deadlock",
-        "injection",
-        "memory leak",
-        "null dereference",
-        "out of bounds",
-        "panic",
-        "path traversal",
-        "race condition",
-        "regression",
-        "security",
-        "sql injection",
-        "unsafe",
-        "use after free",
-        "vulnerab",
-        "xss",
-    ];
-    const ACTION_REQUESTS: &[&str] = &[
-        "please add ",
-        "please change ",
-        "please fix ",
-        "please handle ",
-        "please remove ",
-        "please use ",
-        "please validate ",
-        "should add ",
-        "should change ",
-        "should fix ",
-        "should handle ",
-        "should not ",
-        "should use ",
-        "should validate ",
-    ];
-    const BEHAVIORAL_CONCERNS: &[&str] = &[
-        "does not ",
-        "doesn't ",
-        "fails to ",
-        "failed to ",
-        "is missing",
-        "are missing",
-        "permits ",
-        "without validat",
-        "without checking",
-        "before it validat",
-        "before validating",
-    ];
-
-    let text = visible_review_text(body).to_ascii_lowercase();
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
-    }
-
-    let requests_change = ACTION_REQUESTS.iter().any(|request| text.contains(request))
-        || BEHAVIORAL_CONCERNS
-            .iter()
-            .any(|concern| text.contains(concern));
-    if requests_change {
-        return true;
-    }
-
-    !is_routine_status_message(text)
-        && CONCRETE_CONCERNS
-            .iter()
-            .any(|concern| text.contains(concern))
 }
 
 /// A bot's status is noise only when its *whole* visible message has the
-/// limited vocabulary of a successful check or explicit no-findings report.
-/// This deliberately keeps mixed messages: a status clause must never veto a
-/// concrete finding elsewhere in the same review.
+/// anchored grammar of a successful check or explicit no-findings report.
+/// Unknown and mixed messages remain feedback; a status clause must never
+/// veto a concrete finding elsewhere in the same review.
 fn is_routine_status_message(text: &str) -> bool {
-    const ROUTINE_STATUS_WORDS: &[&str] = &[
-        "a",
-        "all",
-        "analysis",
-        "and",
-        "an",
-        "build",
-        "check",
-        "checks",
-        "complete",
-        "completed",
-        "deployment",
-        "details",
-        "detected",
-        "done",
-        "failed",
-        "findings",
-        "finished",
-        "full",
-        "has",
-        "have",
-        "in",
-        "is",
-        "log",
-        "logs",
-        "no",
-        "of",
-        "on",
-        "passed",
-        "path",
-        "previous",
-        "report",
-        "results",
-        "review",
-        "run",
-        "scan",
-        "security",
-        "see",
-        "status",
-        "succeeded",
-        "success",
-        "successful",
-        "successfully",
-        "test",
-        "the",
-        "this",
-        "traversal",
-        "vulnerabilities",
-        "vulnerability",
-        "was",
-        "were",
-        "workflow",
-        "found",
-        "sql",
-        "injection",
-    ];
+    let clauses = ROUTINE_CLAUSE_SEPARATOR_RE
+        .split(text)
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(classify_routine_clause)
+        .collect::<Option<Vec<_>>>();
 
-    let words = text
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    if words.is_empty()
-        || words
-            .iter()
-            .any(|word| !ROUTINE_STATUS_WORDS.contains(word))
-    {
-        return false;
+    matches!(
+        clauses.as_deref(),
+        Some(clauses) if !clauses.is_empty() && clauses.contains(&RoutineClause::Status)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoutineClause {
+    Status,
+    Supporting,
+}
+
+fn classify_routine_clause(clause: &str) -> Option<RoutineClause> {
+    classify_complete_routine_clause(clause).or_else(|| {
+        let clauses = clause.split(':').map(str::trim).collect::<Vec<_>>();
+        if clauses.len() < 2 || clauses.iter().any(|clause| clause.is_empty()) {
+            return None;
+        }
+
+        let clauses = clauses
+            .into_iter()
+            .map(classify_complete_routine_clause)
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(if clauses.contains(&RoutineClause::Status) {
+            RoutineClause::Status
+        } else {
+            RoutineClause::Supporting
+        })
+    })
+}
+
+fn classify_complete_routine_clause(clause: &str) -> Option<RoutineClause> {
+    if ROUTINE_STATUS_RE.is_match(clause) {
+        Some(RoutineClause::Status)
+    } else if ROUTINE_SUPPORT_RE.is_match(clause) {
+        Some(RoutineClause::Supporting)
+    } else {
+        None
     }
-
-    let reports_no_findings = words.windows(2).any(|words| words == ["no", "findings"])
-        || (words.first() == Some(&"no")
-            && words
-                .last()
-                .is_some_and(|word| matches!(*word, "found" | "detected"))
-            && words
-                .iter()
-                .any(|word| matches!(*word, "vulnerability" | "vulnerabilities")));
-    let reports_success = words.iter().any(|word| {
-        matches!(
-            *word,
-            "complete"
-                | "completed"
-                | "done"
-                | "finished"
-                | "passed"
-                | "succeeded"
-                | "success"
-                | "successful"
-                | "successfully"
-        )
-    }) && words.iter().any(|word| {
-        matches!(
-            *word,
-            "analysis"
-                | "build"
-                | "check"
-                | "checks"
-                | "deployment"
-                | "review"
-                | "scan"
-                | "test"
-                | "workflow"
-        )
-    });
-
-    reports_no_findings || reports_success
 }
 
 /// Hide machine metadata and URLs before classifying a review. GitHub bots
@@ -1666,7 +1592,7 @@ mod tests {
                                     "comments": {
                                         "nodes": [{
                                             "databaseId": 304,
-                                            "body": "Automated note.",
+                                            "body": "Automated review completed.",
                                             "createdAt": "2026-11-20T12:00:00Z",
                                             "updatedAt": "2026-11-20T12:00:00Z",
                                             "author": {
@@ -2124,9 +2050,9 @@ mod tests {
     }
 
     #[test]
-    fn generic_bot_status_is_noise_but_source_specific_bot_feedback_counts() {
+    fn routine_bot_status_is_noise_but_other_bot_feedback_counts() {
         let comments = [
-            comment(101, "dependabot", "Bot", "Automated note."),
+            comment(101, "dependabot", "Bot", "Automated review completed."),
             comment(
                 102,
                 "code-review-bot",
@@ -2134,6 +2060,12 @@ mod tests {
                 "src/auth.rs accepts the token before it validates its signature.",
             ),
             comment(103, "ci-bot", "Bot", "Deployment status: complete."),
+            comment(
+                104,
+                "code-review-bot",
+                "Bot",
+                "The retry loop drops the final error.",
+            ),
         ];
         let mut history = FeedbackHistory::default();
 
@@ -2145,8 +2077,14 @@ mod tests {
         )
         .expect("bot activity should classify");
 
-        assert_eq!(history.feedback_items.len(), 1);
-        assert_eq!(history.feedback_items[0].key().database_id, 102);
+        assert_eq!(
+            history
+                .feedback_items
+                .iter()
+                .map(|item| item.key().database_id)
+                .collect::<Vec<_>>(),
+            [102, 104]
+        );
     }
 
     #[test]
@@ -2338,7 +2276,7 @@ mod tests {
                 .map(|item| item.key().database_id)
                 .collect::<Vec<_>>(),
             [
-                104, 105, 106, 107, 110, 111, 115, 116, 117, 120, 121, 122, 123, 124, 125,
+                103, 104, 105, 106, 107, 110, 111, 115, 116, 117, 120, 121, 122, 123, 124, 125,
             ]
         );
     }
@@ -2348,6 +2286,8 @@ mod tests {
         for routine_status in [
             "No findings.",
             "No findings. Full report: https://review.example.test/pull/42",
+            "No issues found.",
+            "No vulnerabilities were found.",
             "No SQL injection vulnerabilities were found.",
             "Analysis completed: no security vulnerabilities were found.",
             "Path traversal scan completed successfully.",
@@ -2362,18 +2302,28 @@ mod tests {
         }
 
         for finding in [
+            "No findings. SQL injection vulnerability.",
+            "No findings SQL injection vulnerability",
+            "No findings and SQL injection vulnerability.",
+            "No findings however SQL injection vulnerabilities were found.",
+            "No findings SQL injection vulnerabilities were found.",
             "No findings however SQL injection vulnerability remains in query construction.",
             "No findings SQL injection vulnerability remains in query construction.",
             "No findings, but [P1] SQL injection vulnerability remains in query construction.",
+            "Security scan passed. SQL injection vulnerability detected.",
+            "Security scan passed SQL injection vulnerability test passed.",
             "Security scan passed, however the authorization check is missing.",
             "Security scan passed. The path traversal vulnerability remains in archive extraction.",
+            "No findings in the previous run, and the retry loop drops the final error after \
+             exhausting every attempt.",
         ] {
             assert!(
                 !is_routine_status_message(&visible_review_text(finding).to_ascii_lowercase()),
                 "{finding:?} must remain visible as review feedback"
             );
             assert!(
-                has_substantive_code_review_signal(finding),
+                comment(999, "review-bot", "Bot", finding)
+                    .is_reviewer_feedback(&response_identities()),
                 "{finding:?} should count as review feedback"
             );
         }

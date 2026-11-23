@@ -28,6 +28,7 @@ fabro-types = { path = "../../foundation/fabro-types" }
 futures.workspace = true
 jsonwebtoken.workspace = true
 chrono.workspace = true
+regex.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 base64.workspace = true

@@ -2324,6 +2324,7 @@ dependencies = [
  "fabro-types",
  "futures",
  "jsonwebtoken",
+ "regex",
  "serde",
  "serde_json",
  "strum 0.28.0",
