@@ -15,7 +15,7 @@ import { Link, Outlet, useLocation, useMatches } from "react-router";
 import { ErrorState } from "../components/state";
 import { TooltipProvider } from "../components/ui";
 import { DemoModeProvider } from "../lib/demo-mode";
-import { useAuthMe } from "../lib/queries";
+import { useAuthConfig, useAuthMe } from "../lib/queries";
 import { navigation } from "./navigation";
 
 function activeFor(item: (typeof navigation)[number], pathname: string): boolean {
@@ -28,6 +28,7 @@ function classNames(...classes: Array<string | false | null | undefined>) {
 
 export default function AppShell() {
   const { data: auth, error, isLoading } = useAuthMe();
+  const authConfig = useAuthConfig();
   const { pathname } = useLocation();
   const matches = useMatches();
 
@@ -41,6 +42,18 @@ export default function AppShell() {
         <ErrorState
           title="Couldn't load your session"
           description="Refresh the page or sign in again."
+        />
+      </div>
+    );
+  }
+
+  if (authConfig.error) {
+    return (
+      <div className="min-h-full bg-page py-12">
+        <ErrorState
+          title="Backend not connected"
+          description="The Fabro backend is not connected, so live runs cannot load yet. Check the preview connection and try again."
+          onRetry={() => void authConfig.mutate()}
         />
       </div>
     );
