@@ -697,7 +697,8 @@ function InReviewCard({ pullRequest }: { pullRequest: InReviewPullRequest }) {
 
 function ReviewReadinessMarker({ pullRequest }: { pullRequest: InReviewPullRequest }) {
   const readiness = pullRequest.review_readiness;
-  const unresolved = readiness.unresolved_thread_count ?? 0;
+  const unresolved = readiness.unresolved_thread_count;
+  const awaitingResponse = readiness.feedback_awaiting_response_count;
   const marker = {
     ready: {
       Icon: CheckCircleIcon,
@@ -733,12 +734,21 @@ function ReviewReadinessMarker({ pullRequest }: { pullRequest: InReviewPullReque
   const Icon = marker.Icon;
 
   return (
-    <div
-      className={`mt-3 inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium ${marker.className}`}
-      data-review-readiness={readiness.status}
-    >
-      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-      <span>{marker.copy}</span>
+    <div className="mt-3 space-y-1.5" data-review-readiness={readiness.status}>
+      <div
+        className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium ${marker.className}`}
+      >
+        <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+        <span>{marker.copy}</span>
+      </div>
+      {unresolved === null || awaitingResponse === null ? (
+        <p className="text-[11px] text-fg-muted">Review feedback counts unavailable</p>
+      ) : (
+        <p className="text-[11px] text-fg-muted">
+          {unresolved} unresolved {unresolved === 1 ? "thread" : "threads"} · {awaitingResponse} awaiting{" "}
+          response
+        </p>
+      )}
     </div>
   );
 }
